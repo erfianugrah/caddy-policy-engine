@@ -111,7 +111,8 @@ type compiledCondition struct {
 	suffix    string
 	contains  string
 	regex     *regexp.Regexp
-	ipNets    []net.IPNet
+	ipNets    []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
+	ipSet     map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
 	stringSet map[string]bool
 	negate    bool
 	isExists  bool // true for "exists" operator (field presence check)
@@ -422,21 +423,89 @@ func evalOperator(cc compiledCondition, target string) bool {
 		}
 		return false
 	case "ip_match", "not_ip_match":
-		ip := net.ParseIP(target)
-		if ip == nil {
-			return false
+		return evalIPMatch(cc, target)
+	case "in", "in_list":
+		// in_list with ip kind uses IP-aware matching.
+		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
+			return evalIPMatch(cc, target)
 		}
-		for _, n := range cc.ipNets {
-			if n.Contains(ip) {
-				return true
-			}
+		return cc.stringSet[target]
+	case "not_in_list":
+		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
+			return evalIPMatch(cc, target)
 		}
-		return false
-	case "in":
 		return cc.stringSet[target]
 	default:
 		return false
 	}
+}
+
+// evalIPMatch checks if target IP is in the compiled IP set or CIDR ranges.
+// Uses O(1) hash set for single IPs (ipSet), falls back to linear scan for CIDRs.
+func evalIPMatch(cc compiledCondition, target string) bool {
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return false
+	}
+	// O(1) hash lookup for single IPs.
+	if cc.ipSet != nil {
+		var key [16]byte
+		copy(key[:], ip.To16())
+		if cc.ipSet[key] {
+			return true
+		}
+	}
+	// Linear scan for CIDR ranges (typically small count even in large lists).
+	for _, n := range cc.ipNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipTo16Key normalizes an IP to a 16-byte array key for hash set storage.
+func ipTo16Key(ip net.IP) [16]byte {
+	var key [16]byte
+	copy(key[:], ip.To16())
+	return key
+}
+
+// compileIPList compiles a list of IP/CIDR strings into an ipSet (for single IPs)
+// and ipNets (for CIDR ranges). Single IPs go into the O(1) hash set;
+// CIDRs that aren't /32 or /128 go into the linear-scan slice.
+func compileIPList(items []string) (map[[16]byte]bool, []net.IPNet, error) {
+	ipSet := make(map[[16]byte]bool, len(items))
+	var nets []net.IPNet
+
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if strings.Contains(item, "/") {
+			_, ipNet, err := net.ParseCIDR(item)
+			if err != nil {
+				return nil, nil, fmt.Errorf("parsing CIDR %q: %w", item, err)
+			}
+			// Check if this is a single-host CIDR (/32 or /128).
+			ones, bits := ipNet.Mask.Size()
+			if ones == bits {
+				// Single host — put in hash set.
+				ipSet[ipTo16Key(ipNet.IP)] = true
+			} else {
+				nets = append(nets, *ipNet)
+			}
+		} else {
+			ip := net.ParseIP(item)
+			if ip == nil {
+				return nil, nil, fmt.Errorf("parsing IP %q: invalid address", item)
+			}
+			ipSet[ipTo16Key(ip)] = true
+		}
+	}
+
+	return ipSet, nets, nil
 }
 
 // ─── JSON Helpers ───────────────────────────────────────────────────
@@ -577,7 +646,7 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 
 	// Handle negate operators.
 	switch cond.Operator {
-	case "neq", "not_ip_match":
+	case "neq", "not_ip_match", "not_in_list":
 		cc.negate = true
 	}
 
@@ -617,6 +686,25 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		normalized := strings.ReplaceAll(value, "|", " ")
 		for _, item := range strings.Fields(normalized) {
 			cc.stringSet[item] = true
+		}
+
+	case "in_list", "not_in_list":
+		// Managed list operators — items are pre-resolved by wafctl into ListItems.
+		// ListKind determines how to compile: "ip" → ipSet + ipNets, everything else → stringSet.
+		if cond.ListKind == "ip" {
+			ipSet, nets, err := compileIPList(cond.ListItems)
+			if err != nil {
+				return cc, fmt.Errorf("compiling IP list: %w", err)
+			}
+			cc.ipSet = ipSet
+			cc.ipNets = nets
+		} else {
+			cc.stringSet = make(map[string]bool, len(cond.ListItems))
+			for _, item := range cond.ListItems {
+				if item != "" {
+					cc.stringSet[item] = true
+				}
+			}
 		}
 
 	case "exists":

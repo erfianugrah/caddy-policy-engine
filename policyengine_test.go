@@ -3,6 +3,7 @@ package policyengine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1382,6 +1383,372 @@ func TestMissingFile_StartsEmpty(t *testing.T) {
 
 	if count != 0 {
 		t.Errorf("expected 0 rules for missing file, got %d", count)
+	}
+}
+
+// ─── in_list / not_in_list Operators ────────────────────────────────
+
+func TestCondition_InList_StringKind(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "country", Operator: "in_list", Value: "",
+		ListItems: []string{"CN", "RU", "KP", "IR"},
+		ListKind:  "string",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !evalOperator(cc, "CN") {
+		t.Error("expected CN to match")
+	}
+	if !evalOperator(cc, "RU") {
+		t.Error("expected RU to match")
+	}
+	if evalOperator(cc, "US") {
+		t.Error("expected US NOT to match")
+	}
+	if evalOperator(cc, "C") {
+		t.Error("expected partial match 'C' NOT to match (exact only)")
+	}
+}
+
+func TestCondition_InList_IPKind_SingleIPs(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: []string{"10.0.0.1", "192.168.1.5", "172.16.0.1"},
+		ListKind:  "ip",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !evalOperator(cc, "10.0.0.1") {
+		t.Error("expected 10.0.0.1 to match")
+	}
+	if !evalOperator(cc, "192.168.1.5") {
+		t.Error("expected 192.168.1.5 to match")
+	}
+	if evalOperator(cc, "10.0.0.2") {
+		t.Error("expected 10.0.0.2 NOT to match")
+	}
+}
+
+func TestCondition_InList_IPKind_CIDRs(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: []string{"10.0.0.0/8", "192.168.1.0/24"},
+		ListKind:  "ip",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !evalOperator(cc, "10.255.0.1") {
+		t.Error("expected 10.255.0.1 to match /8")
+	}
+	if !evalOperator(cc, "192.168.1.100") {
+		t.Error("expected 192.168.1.100 to match /24")
+	}
+	if evalOperator(cc, "192.168.2.1") {
+		t.Error("expected 192.168.2.1 NOT to match")
+	}
+}
+
+func TestCondition_InList_IPKind_Mixed(t *testing.T) {
+	// Mix of single IPs and CIDRs — single IPs go in hash set, CIDRs in linear scan.
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: []string{"10.0.0.1", "192.168.0.0/16", "172.16.5.5"},
+		ListKind:  "ip",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Hash set hits.
+	if !evalOperator(cc, "10.0.0.1") {
+		t.Error("expected 10.0.0.1 (hash set)")
+	}
+	if !evalOperator(cc, "172.16.5.5") {
+		t.Error("expected 172.16.5.5 (hash set)")
+	}
+	// CIDR hit.
+	if !evalOperator(cc, "192.168.100.200") {
+		t.Error("expected 192.168.100.200 (CIDR)")
+	}
+	// Miss.
+	if evalOperator(cc, "8.8.8.8") {
+		t.Error("expected 8.8.8.8 NOT to match")
+	}
+}
+
+func TestCondition_NotInList_String(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "country", Operator: "not_in_list", Value: "",
+		ListItems: []string{"CN", "RU"},
+		ListKind:  "string",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !cc.negate {
+		t.Error("expected negate=true for not_in_list")
+	}
+	// evalOperator returns the raw match; negate is applied by matchCondition.
+	if !evalOperator(cc, "CN") {
+		t.Error("expected raw match for CN (negate applied externally)")
+	}
+	if evalOperator(cc, "US") {
+		t.Error("expected no raw match for US")
+	}
+}
+
+func TestCondition_NotInList_IP(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "not_in_list", Value: "",
+		ListItems: []string{"10.0.0.1", "192.168.1.0/24"},
+		ListKind:  "ip",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !cc.negate {
+		t.Error("expected negate=true for not_in_list")
+	}
+}
+
+func TestCondition_InList_HostnameKind(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "host", Operator: "in_list", Value: "",
+		ListItems: []string{"evil.example.com", "bad.example.org"},
+		ListKind:  "hostname",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !evalOperator(cc, "evil.example.com") {
+		t.Error("expected evil.example.com to match")
+	}
+	if evalOperator(cc, "evil.example.com.attacker.io") {
+		t.Error("expected subdomain NOT to match (exact only)")
+	}
+}
+
+func TestCondition_InList_EmptyList(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "country", Operator: "in_list", Value: "",
+		ListItems: []string{},
+		ListKind:  "string",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if evalOperator(cc, "US") {
+		t.Error("expected nothing to match empty list")
+	}
+}
+
+func TestCondition_InList_InvalidIP(t *testing.T) {
+	_, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: []string{"not-an-ip"},
+		ListKind:  "ip",
+	})
+	if err == nil {
+		t.Error("expected compile error for invalid IP in list")
+	}
+}
+
+// ─── in_list Large Scale Tests ──────────────────────────────────────
+
+func generateTestIPs(n int) []string {
+	ips := make([]string, n)
+	for i := 0; i < n; i++ {
+		a := (i / 65536) % 256
+		b := (i / 256) % 256
+		c := (i % 256) + 1
+		if c > 254 {
+			c = 254
+		}
+		ips[i] = fmt.Sprintf("10.%d.%d.%d", a, b, c)
+	}
+	return ips
+}
+
+func TestCondition_InList_200K_IPs_Compile(t *testing.T) {
+	const n = 200_000
+	ips := generateTestIPs(n)
+	start := time.Now()
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: ips,
+		ListKind:  "ip",
+	})
+	compileDur := time.Since(start)
+	if err != nil {
+		t.Fatalf("compile 200K IPs: %v", err)
+	}
+	t.Logf("compile 200K IPs: %v, ipSet=%d, ipNets=%d", compileDur, len(cc.ipSet), len(cc.ipNets))
+
+	// All should be in hash set (single IPs), none in CIDR nets.
+	if len(cc.ipSet) == 0 {
+		t.Error("expected ipSet to be populated")
+	}
+	if len(cc.ipNets) != 0 {
+		t.Errorf("expected 0 ipNets for single IPs, got %d", len(cc.ipNets))
+	}
+
+	// Spot-check: first IP should match.
+	if !evalOperator(cc, "10.0.0.1") {
+		t.Error("expected first IP to match")
+	}
+	// An IP NOT in the list should not match.
+	if evalOperator(cc, "8.8.8.8") {
+		t.Error("expected 8.8.8.8 NOT to match")
+	}
+}
+
+func TestCondition_InList_200K_IPs_Match(t *testing.T) {
+	const n = 200_000
+	ips := generateTestIPs(n)
+	cc, err := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: ips,
+		ListKind:  "ip",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Match 1000 random IPs from the list — should all hit.
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		idx := (i * 137) % n // pseudo-random scatter
+		if !evalOperator(cc, ips[idx]) {
+			t.Fatalf("expected %s to match", ips[idx])
+		}
+	}
+	matchDur := time.Since(start)
+	t.Logf("1000 lookups in 200K IP set: %v (%v per lookup)", matchDur, matchDur/1000)
+
+	// Match 1000 IPs NOT in the list — should all miss.
+	for i := 0; i < 1000; i++ {
+		missIP := fmt.Sprintf("8.8.%d.%d", i/256, i%256)
+		if evalOperator(cc, missIP) {
+			t.Fatalf("expected %s NOT to match", missIP)
+		}
+	}
+}
+
+func TestCondition_InList_200K_Strings_Match(t *testing.T) {
+	const n = 200_000
+	items := make([]string, n)
+	for i := range items {
+		items[i] = fmt.Sprintf("item-%06d", i)
+	}
+	cc, err := compileCondition(PolicyCondition{
+		Field: "path", Operator: "in_list", Value: "",
+		ListItems: items,
+		ListKind:  "string",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Match hits.
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		idx := (i * 137) % n
+		if !evalOperator(cc, items[idx]) {
+			t.Fatalf("expected %s to match", items[idx])
+		}
+	}
+	matchDur := time.Since(start)
+	t.Logf("1000 lookups in 200K string set: %v (%v per lookup)", matchDur, matchDur/1000)
+
+	// Match misses.
+	if evalOperator(cc, "not-in-list") {
+		t.Error("expected miss for 'not-in-list'")
+	}
+}
+
+// ─── Benchmarks ─────────────────────────────────────────────────────
+
+func BenchmarkIPMatch_Linear_100(b *testing.B) {
+	// Baseline: ip_match with 100 CIDRs (linear scan).
+	cidrs := make([]string, 100)
+	for i := range cidrs {
+		cidrs[i] = fmt.Sprintf("10.%d.%d.0/24", i/256, i%256)
+	}
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "ip_match", Value: strings.Join(cidrs, " "),
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "8.8.8.8") // worst case: miss, scans all
+	}
+}
+
+func BenchmarkInList_IP_200K_Hit(b *testing.B) {
+	ips := generateTestIPs(200_000)
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: ips, ListKind: "ip",
+	})
+	target := ips[100_000] // middle of list
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, target)
+	}
+}
+
+func BenchmarkInList_IP_200K_Miss(b *testing.B) {
+	ips := generateTestIPs(200_000)
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "ip", Operator: "in_list", Value: "",
+		ListItems: ips, ListKind: "ip",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "8.8.8.8")
+	}
+}
+
+func BenchmarkInList_String_200K_Hit(b *testing.B) {
+	items := make([]string, 200_000)
+	for i := range items {
+		items[i] = fmt.Sprintf("/path-%06d", i)
+	}
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "path", Operator: "in_list", Value: "",
+		ListItems: items, ListKind: "string",
+	})
+	target := items[100_000]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, target)
+	}
+}
+
+func BenchmarkInList_String_200K_Miss(b *testing.B) {
+	items := make([]string, 200_000)
+	for i := range items {
+		items[i] = fmt.Sprintf("/path-%06d", i)
+	}
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "path", Operator: "in_list", Value: "",
+		ListItems: items, ListKind: "string",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "/not-in-list")
+	}
+}
+
+func BenchmarkInList_IP_Compile_200K(b *testing.B) {
+	ips := generateTestIPs(200_000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		compileCondition(PolicyCondition{
+			Field: "ip", Operator: "in_list", Value: "",
+			ListItems: ips, ListKind: "ip",
+		})
 	}
 }
 
