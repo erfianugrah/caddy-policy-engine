@@ -80,6 +80,7 @@ type PolicyRule struct {
 	Type       string            `json:"type"` // "allow", "block", "honeypot"
 	Conditions []PolicyCondition `json:"conditions"`
 	GroupOp    string            `json:"group_op"` // "and" or "or"
+	Tags       []string          `json:"tags,omitempty"`
 	Enabled    bool              `json:"enabled"`
 	Priority   int               `json:"priority"`
 }
@@ -230,9 +231,13 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "allow")
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+			if len(cr.rule.Tags) > 0 {
+				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+			}
 			pe.logger.Info("policy allow",
 				zap.String("rule_id", cr.rule.ID),
 				zap.String("rule_name", cr.rule.Name),
+				zap.Strings("tags", cr.rule.Tags),
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 			return next.ServeHTTP(w, r)
@@ -240,10 +245,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		case "block", "honeypot":
 			w.Header().Set("X-Blocked-By", "policy-engine")
 			w.Header().Set("X-Blocked-Rule", cr.rule.Name)
+			if len(cr.rule.Tags) > 0 {
+				w.Header().Set("X-Policy-Tags", strings.Join(cr.rule.Tags, ","))
+			}
 			pe.logger.Info("policy block",
 				zap.String("rule_id", cr.rule.ID),
 				zap.String("rule_name", cr.rule.Name),
 				zap.String("type", cr.rule.Type),
+				zap.Strings("tags", cr.rule.Tags),
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 			return caddyhttp.Error(http.StatusForbidden, nil)

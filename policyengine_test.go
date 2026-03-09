@@ -1088,6 +1088,126 @@ func TestAction_Allow(t *testing.T) {
 	}
 }
 
+// ─── Tags ───────────────────────────────────────────────────────────
+
+func TestAction_Block_WithTags(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "t1", Name: "Scanner Block", Type: "block", Enabled: true,
+				Priority: 200,
+				Tags:     []string{"scanner", "bot-detection"},
+				Conditions: []PolicyCondition{
+					{Field: "user_agent", Operator: "contains", Value: "sqlmap"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/", "1.2.3.4:1234")
+	r.Header.Set("User-Agent", "sqlmap/1.0")
+	w := httptest.NewRecorder()
+
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for blocked request")
+	}
+	// X-Policy-Tags header should contain comma-joined tags.
+	tags := w.Header().Get("X-Policy-Tags")
+	if tags != "scanner,bot-detection" {
+		t.Errorf("X-Policy-Tags = %q, want %q", tags, "scanner,bot-detection")
+	}
+}
+
+func TestAction_Block_NoTags(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "t2", Name: "Simple Block", Type: "block", Enabled: true,
+				Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/bad"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/bad", "1.2.3.4:1234")
+	w := httptest.NewRecorder()
+
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for blocked request")
+	}
+	// No X-Policy-Tags header when rule has no tags.
+	tags := w.Header().Get("X-Policy-Tags")
+	if tags != "" {
+		t.Errorf("X-Policy-Tags = %q, want empty", tags)
+	}
+}
+
+func TestAction_Allow_WithTags(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "t3", Name: "Trusted API", Type: "allow", Enabled: true,
+				Priority: 300,
+				Tags:     []string{"trusted", "internal"},
+				Conditions: []PolicyCondition{
+					{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called for allow")
+	}
+	tagsVar, _ := caddyhttp.GetVar(r.Context(), "policy_engine.tags").(string)
+	if tagsVar != "trusted,internal" {
+		t.Errorf("policy_engine.tags = %q, want %q", tagsVar, "trusted,internal")
+	}
+}
+
+func TestAction_Honeypot_WithTags(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "t4", Name: "Trap Paths", Type: "honeypot", Enabled: true,
+				Priority: 100,
+				Tags:     []string{"honeypot", "trap"},
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "in", Value: "/wp-login.php|/xmlrpc.php"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/wp-login.php", "1.2.3.4:1234")
+	w := httptest.NewRecorder()
+
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for honeypot block")
+	}
+	tags := w.Header().Get("X-Policy-Tags")
+	if tags != "honeypot,trap" {
+		t.Errorf("X-Policy-Tags = %q, want %q", tags, "honeypot,trap")
+	}
+}
+
 // ─── No Match: pass through ─────────────────────────────────────────
 
 func TestNoMatch_PassThrough(t *testing.T) {
