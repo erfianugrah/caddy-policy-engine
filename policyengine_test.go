@@ -291,6 +291,26 @@ func TestCondition_In_ExactMatch(t *testing.T) {
 	}
 }
 
+func TestCondition_In_PipeDelimited(t *testing.T) {
+	// The wafctl frontend stores "in" values with pipe delimiters (PipeTagInput).
+	// The plugin must accept both pipes and spaces.
+	cc, err := compileCondition(PolicyCondition{Field: "path", Operator: "in", Value: "/trap|/honeypot|/wp-login.php"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/trap", "/honeypot", "/wp-login.php"} {
+		r := makeRequest("GET", path, "10.0.0.1:1234")
+		if !matchCondition(cc, r) {
+			t.Errorf("expected pipe-delimited %s to match in operator", path)
+		}
+	}
+	// Must not match substrings.
+	r := makeRequest("GET", "/trap-extended", "10.0.0.1:1234")
+	if matchCondition(cc, r) {
+		t.Error("SECURITY: /trap-extended should NOT match pipe-delimited 'in /trap|/honeypot|/wp-login.php'")
+	}
+}
+
 func TestCondition_In_NotSubstring(t *testing.T) {
 	// This is THE critical test — the core security fix.
 	// @pm /admin would match /administrator (substring). Our in operator must NOT.

@@ -436,9 +436,12 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		cc.ipNets = nets
 
 	case "in":
-		// Split on spaces — the wafctl generator uses space-separated values.
+		// Accept both pipe-separated ("a|b|c") and space-separated ("a b c") values.
+		// The wafctl frontend stores "in" values with pipes (PipeTagInput convention),
+		// while some seeded rules use spaces. Normalize pipes to spaces, then split.
 		cc.stringSet = make(map[string]bool)
-		for _, item := range strings.Fields(value) {
+		normalized := strings.ReplaceAll(value, "|", " ")
+		for _, item := range strings.Fields(normalized) {
 			cc.stringSet[item] = true
 		}
 
