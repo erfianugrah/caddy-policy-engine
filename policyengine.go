@@ -11,13 +11,17 @@
 package policyengine
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +32,9 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
+
+// defaultBodyMaxSize matches the Coraza WAF request_body_limit (13 MiB).
+const defaultBodyMaxSize = 13 * 1024 * 1024
 
 func init() {
 	caddy.RegisterModule(PolicyEngine{})
@@ -46,6 +53,10 @@ type PolicyEngine struct {
 
 	// ReloadInterval is how often to check RulesFile for changes. Default 5s.
 	ReloadInterval caddy.Duration `json:"reload_interval,omitempty"`
+
+	// BodyMaxSize is the maximum bytes to buffer for body field matching.
+	// Default 13 MiB (matching Coraza WAF request_body_limit).
+	BodyMaxSize int64 `json:"body_max_size,omitempty"`
 
 	// compiled state (not serialized)
 	rules    []compiledRule
@@ -88,12 +99,13 @@ type PolicyCondition struct {
 type compiledRule struct {
 	rule       PolicyRule
 	conditions []compiledCondition
+	needsBody  bool // true if any condition uses body/body_json/body_form
 }
 
 type compiledCondition struct {
 	field     string
 	operator  string
-	name      string // for named fields (header, cookie, args, etc.)
+	name      string // for named fields (header, cookie, args, body_json, body_form, etc.)
 	exactVal  string
 	prefix    string
 	suffix    string
@@ -102,6 +114,14 @@ type compiledCondition struct {
 	ipNets    []net.IPNet
 	stringSet map[string]bool
 	negate    bool
+	isExists  bool // true for "exists" operator (field presence check)
+}
+
+// bodyFields lists condition fields that require reading the request body.
+var bodyFields = map[string]bool{
+	"body":      true,
+	"body_json": true,
+	"body_form": true,
 }
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
@@ -119,6 +139,9 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 
 	if pe.ReloadInterval == 0 {
 		pe.ReloadInterval = caddy.Duration(5 * time.Second)
+	}
+	if pe.BodyMaxSize == 0 {
+		pe.BodyMaxSize = defaultBodyMaxSize
 	}
 
 	// Load rules from file or inline config.
@@ -176,12 +199,27 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	rules := pe.rules
 	pe.mu.RUnlock()
 
+	var bodyBuf []byte
+	var bodyRead bool
+
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
 			continue
 		}
 
-		if !matchRule(cr, r) {
+		// Lazy body read: only when a rule needs body fields and we haven't read yet.
+		if cr.needsBody && !bodyRead {
+			if r.Body != nil && r.Body != http.NoBody {
+				var err error
+				bodyBuf, err = readBody(r, pe.BodyMaxSize)
+				if err != nil {
+					pe.logger.Debug("failed to read request body", zap.Error(err))
+				}
+			}
+			bodyRead = true
+		}
+
+		if !matchRule(cr, r, bodyBuf) {
 			continue
 		}
 
@@ -215,9 +253,36 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	return next.ServeHTTP(w, r)
 }
 
+// ─── Body Reading ───────────────────────────────────────────────────
+
+// readBody reads up to maxSize bytes from r.Body and re-wraps the body
+// so downstream handlers still see the full content.
+// Pattern borrowed from github.com/erfianugrah/caddy-body-matcher.
+func readBody(r *http.Request, maxSize int64) ([]byte, error) {
+	lr := io.LimitReader(r.Body, maxSize+1)
+	buf, err := io.ReadAll(lr)
+	if err != nil {
+		// Re-wrap partial data + remaining original body.
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), r.Body))
+		return nil, err
+	}
+
+	if int64(len(buf)) > maxSize {
+		// Body exceeds limit — re-assemble full body for downstream,
+		// but only use first maxSize bytes for matching.
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), r.Body))
+		buf = buf[:maxSize]
+	} else {
+		// Body fully consumed — replace with buffered copy.
+		r.Body = io.NopCloser(bytes.NewReader(buf))
+	}
+
+	return buf, nil
+}
+
 // ─── Rule Matching ──────────────────────────────────────────────────
 
-func matchRule(cr compiledRule, r *http.Request) bool {
+func matchRule(cr compiledRule, r *http.Request, bodyBuf []byte) bool {
 	if len(cr.conditions) == 0 {
 		// No conditions = matches all requests.
 		return true
@@ -225,7 +290,7 @@ func matchRule(cr compiledRule, r *http.Request) bool {
 
 	if cr.rule.GroupOp == "or" {
 		for _, cc := range cr.conditions {
-			if matchCondition(cc, r) {
+			if matchCondition(cc, r, bodyBuf) {
 				return true
 			}
 		}
@@ -234,15 +299,25 @@ func matchRule(cr compiledRule, r *http.Request) bool {
 
 	// Default: AND — all conditions must match.
 	for _, cc := range cr.conditions {
-		if !matchCondition(cc, r) {
+		if !matchCondition(cc, r, bodyBuf) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchCondition(cc compiledCondition, r *http.Request) bool {
-	target := extractField(cc, r)
+func matchCondition(cc compiledCondition, r *http.Request, bodyBuf []byte) bool {
+	// Special handling for "exists" operator on body_json — checks field presence,
+	// not string comparison.
+	if cc.isExists {
+		result := extractFieldExists(cc, bodyBuf)
+		if cc.negate {
+			return !result
+		}
+		return result
+	}
+
+	target := extractField(cc, r, bodyBuf)
 	result := evalOperator(cc, target)
 	if cc.negate {
 		return !result
@@ -251,7 +326,7 @@ func matchCondition(cc compiledCondition, r *http.Request) bool {
 }
 
 // extractField gets the request value for a condition's field.
-func extractField(cc compiledCondition, r *http.Request) string {
+func extractField(cc compiledCondition, r *http.Request, bodyBuf []byte) string {
 	switch cc.field {
 	case "ip":
 		return clientIP(r)
@@ -290,9 +365,40 @@ func extractField(cc compiledCondition, r *http.Request) string {
 			return r.URL.Query().Get(cc.name)
 		}
 		return ""
+	case "body":
+		return string(bodyBuf)
+	case "body_json":
+		if cc.name != "" && len(bodyBuf) > 0 {
+			val, ok := resolveJSONPath(bodyBuf, cc.name)
+			if !ok {
+				return ""
+			}
+			return jsonValueToString(val)
+		}
+		return string(bodyBuf)
+	case "body_form":
+		if cc.name != "" && len(bodyBuf) > 0 {
+			values, err := url.ParseQuery(string(bodyBuf))
+			if err != nil {
+				return ""
+			}
+			if fv, ok := values[cc.name]; ok && len(fv) > 0 {
+				return fv[0]
+			}
+		}
+		return ""
 	default:
 		return ""
 	}
+}
+
+// extractFieldExists checks whether a body_json field exists (for the "exists" operator).
+func extractFieldExists(cc compiledCondition, bodyBuf []byte) bool {
+	if cc.field != "body_json" || cc.name == "" || len(bodyBuf) == 0 {
+		return false
+	}
+	_, found := resolveJSONPath(bodyBuf, cc.name)
+	return found
 }
 
 // evalOperator evaluates the operator against the extracted target value.
@@ -332,6 +438,71 @@ func evalOperator(cc compiledCondition, target string) bool {
 		return false
 	}
 }
+
+// ─── JSON Helpers ───────────────────────────────────────────────────
+
+// resolveJSONPath walks a dot-path like ".user.roles.0" through parsed JSON.
+// Leading dot is optional. Returns (value, found).
+func resolveJSONPath(body []byte, dotPath string) (interface{}, bool) {
+	var root interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false
+	}
+
+	dotPath = strings.TrimPrefix(dotPath, ".")
+	if dotPath == "" {
+		return root, true
+	}
+
+	parts := strings.Split(dotPath, ".")
+	current := root
+
+	for _, part := range parts {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			val, ok := v[part]
+			if !ok {
+				return nil, false
+			}
+			current = val
+		case []interface{}:
+			idx, err := strconv.Atoi(part)
+			if err != nil || idx < 0 || idx >= len(v) {
+				return nil, false
+			}
+			current = v[idx]
+		default:
+			return nil, false
+		}
+	}
+
+	return current, true
+}
+
+// jsonValueToString converts a JSON value to its string representation.
+func jsonValueToString(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case float64:
+		if val == float64(int64(val)) {
+			return strconv.FormatInt(int64(val), 10)
+		}
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(val)
+	case nil:
+		return "null"
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Sprintf("%v", val)
+		}
+		return string(b)
+	}
+}
+
+// ─── Client IP ──────────────────────────────────────────────────────
 
 // clientIP extracts the client IP from the request, stripping the port.
 func clientIP(r *http.Request) string {
@@ -375,6 +546,9 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 			return cr, fmt.Errorf("condition %s %s: %w", cond.Field, cond.Operator, err)
 		}
 		cr.conditions = append(cr.conditions, cc)
+		if bodyFields[cond.Field] {
+			cr.needsBody = true
+		}
 	}
 
 	return cr, nil
@@ -389,7 +563,7 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 	// Parse named fields: "Name:value" format.
 	value := cond.Value
 	switch cond.Field {
-	case "header", "cookie", "args", "body_form", "response_header":
+	case "header", "cookie", "args", "body_form":
 		if idx := strings.IndexByte(value, ':'); idx >= 0 {
 			cc.name = value[:idx]
 			value = value[idx+1:]
@@ -444,6 +618,11 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		for _, item := range strings.Fields(normalized) {
 			cc.stringSet[item] = true
 		}
+
+	case "exists":
+		// "exists" checks for field presence (body_json dot-path).
+		// No value comparison needed.
+		cc.isExists = true
 
 	default:
 		return cc, fmt.Errorf("unsupported operator %q", cond.Operator)
@@ -588,6 +767,16 @@ func (pe *PolicyEngine) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			pe.ReloadInterval = caddy.Duration(dur)
 
+		case "body_max_size":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			size, err := parseSize(d.Val())
+			if err != nil {
+				return d.Errf("invalid body_max_size: %v", err)
+			}
+			pe.BodyMaxSize = size
+
 		case "rule":
 			rule, err := parseInlineRule(d)
 			if err != nil {
@@ -655,6 +844,29 @@ func parseInlineRule(d *caddyfile.Dispenser) (PolicyRule, error) {
 	}
 
 	return rule, nil
+}
+
+// parseSize parses a human-readable size string like "13mb", "1024kb", "5gb".
+// Supports kb, mb, gb suffixes (case-insensitive). Plain numbers are bytes.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(s, "gb"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "gb")
+	case strings.HasSuffix(s, "mb"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "mb")
+	case strings.HasSuffix(s, "kb"):
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "kb")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	return n * multiplier, nil
 }
 
 func parseCaddyfilePolicyEngine(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
