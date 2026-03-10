@@ -1015,6 +1015,20 @@ func TestAction_Block(t *testing.T) {
 	if w.Header().Get("X-Blocked-Rule") != "Block Admin" {
 		t.Errorf("X-Blocked-Rule = %q, want Block Admin", w.Header().Get("X-Blocked-Rule"))
 	}
+	// Caddy vars should also be set for block actions (reliable detection
+	// via log_append, unlike response headers which may be lowercased by HTTP/2).
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "block" {
+		t.Errorf("policy_engine.action = %q, want block", action)
+	}
+	ruleID, _ := caddyhttp.GetVar(r.Context(), "policy_engine.rule_id").(string)
+	if ruleID != "b1" {
+		t.Errorf("policy_engine.rule_id = %q, want b1", ruleID)
+	}
+	ruleName, _ := caddyhttp.GetVar(r.Context(), "policy_engine.rule_name").(string)
+	if ruleName != "Block Admin" {
+		t.Errorf("policy_engine.rule_name = %q, want Block Admin", ruleName)
+	}
 }
 
 // ─── Action: honeypot (same as block) ───────────────────────────────
@@ -1043,6 +1057,15 @@ func TestAction_Honeypot(t *testing.T) {
 	}
 	if next.called {
 		t.Error("next handler should NOT be called for honeypot")
+	}
+	// Caddy vars should be set for honeypot actions too.
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "honeypot" {
+		t.Errorf("policy_engine.action = %q, want honeypot", action)
+	}
+	ruleName, _ := caddyhttp.GetVar(r.Context(), "policy_engine.rule_name").(string)
+	if ruleName != "Honeypot WP" {
+		t.Errorf("policy_engine.rule_name = %q, want Honeypot WP", ruleName)
 	}
 }
 
@@ -1117,6 +1140,11 @@ func TestAction_Block_WithTags(t *testing.T) {
 	tags := w.Header().Get("X-Policy-Tags")
 	if tags != "scanner,bot-detection" {
 		t.Errorf("X-Policy-Tags = %q, want %q", tags, "scanner,bot-detection")
+	}
+	// Tags var should also be set.
+	tagsVar, _ := caddyhttp.GetVar(r.Context(), "policy_engine.tags").(string)
+	if tagsVar != "scanner,bot-detection" {
+		t.Errorf("policy_engine.tags = %q, want %q", tagsVar, "scanner,bot-detection")
 	}
 }
 

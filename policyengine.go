@@ -243,6 +243,15 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			return next.ServeHTTP(w, r)
 
 		case "block", "honeypot":
+			// Set Caddy variables so log_append captures them reliably
+			// (response headers may be lowercased by HTTP/2 and lost through handle_errors).
+			caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+			if len(cr.rule.Tags) > 0 {
+				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+			}
+			// Also set response headers for downstream visibility (error pages, debugging).
 			w.Header().Set("X-Blocked-By", "policy-engine")
 			w.Header().Set("X-Blocked-Rule", cr.rule.Name)
 			if len(cr.rule.Tags) > 0 {
