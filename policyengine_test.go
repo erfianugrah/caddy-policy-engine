@@ -1302,7 +1302,10 @@ func TestDisabledRule_Skipped(t *testing.T) {
 
 // ─── Priority Ordering: first match wins ────────────────────────────
 
-func TestPriority_FirstMatchWins(t *testing.T) {
+func TestPriority_BlockAlwaysWins(t *testing.T) {
+	// In the 3-pass evaluation model, block/honeypot rules always terminate
+	// even if an allow rule matched earlier. Blocks are the "deny list" —
+	// they cannot be overridden by allows.
 	pe := &PolicyEngine{
 		Rules: []PolicyRule{
 			// Allow has lower priority number (100) — evaluated first.
@@ -1323,21 +1326,123 @@ func TestPriority_FirstMatchWins(t *testing.T) {
 	}
 	mustProvision(t, pe)
 
-	// Request matches both rules — allow should win (lower priority number).
+	// Request matches both rules — block should win (blocks always terminate).
 	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
 	w := httptest.NewRecorder()
 	next := &nextHandler{}
 
 	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected error from block rule")
+	}
+	httpErr, ok := err.(caddyhttp.HandlerError)
+	if !ok || httpErr.StatusCode != 403 {
+		t.Errorf("want 403 from block rule, got %v", err)
+	}
+	if next.called {
+		t.Error("next handler should NOT be called when block fires")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "block" {
+		t.Errorf("expected block action, got %q", action)
+	}
+}
+
+func TestPriority_AllowDoesNotShortCircuitRateLimit(t *testing.T) {
+	// Allow rules set the WAF-bypass flag but do not prevent rate limit
+	// evaluation. If a rate limit is exceeded, 429 takes precedence.
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "a1", Name: "Allow Office", Type: "allow", Enabled: true,
+			Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+			},
+		},
+		{
+			ID: "rl1", Name: "Global RL", Type: "rate_limit", Enabled: true,
+			Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key:    "client_ip",
+				Events: 1,
+				Window: "1m",
+				Action: "deny",
+			},
+		},
+	})
+
+	// First request — allow matches, RL counter ticks (1/1), passes through.
+	r1 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	next1 := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, next1)
+	if err != nil {
+		t.Fatalf("first request: unexpected error: %v", err)
+	}
+	if !next1.called {
+		t.Error("first request: next handler should be called (allow + under RL limit)")
+	}
+	action1, _ := caddyhttp.GetVar(r1.Context(), "policy_engine.action").(string)
+	if action1 != "allow" {
+		t.Errorf("first request: action = %q, want allow", action1)
+	}
+
+	// Second request — same IP, rate limit exceeded. 429 overrides allow.
+	r2 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err == nil {
+		t.Fatal("second request: expected 429 error")
+	}
+	httpErr, ok := err.(caddyhttp.HandlerError)
+	if !ok || httpErr.StatusCode != 429 {
+		t.Errorf("second request: want 429, got %v", err)
+	}
+	if next2.called {
+		t.Error("second request: next handler should NOT be called when rate limited")
+	}
+	// The final action should be rate_limit (overrides earlier allow).
+	action2, _ := caddyhttp.GetVar(r2.Context(), "policy_engine.action").(string)
+	if action2 != "rate_limit" {
+		t.Errorf("second request: action = %q, want rate_limit", action2)
+	}
+}
+
+func TestPriority_AllowPassesThroughWhenUnderRateLimit(t *testing.T) {
+	// When an allow matches and rate limit is under the threshold,
+	// the request passes through with action=allow (WAF bypass).
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "a1", Name: "Allow Health", Type: "allow", Enabled: true,
+			Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/health"},
+			},
+		},
+		{
+			ID: "rl1", Name: "Global RL", Type: "rate_limit", Enabled: true,
+			Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key:    "client_ip",
+				Events: 100,
+				Window: "1m",
+				Action: "deny",
+			},
+		},
+	})
+
+	r := makeRequest("GET", "/health", "10.0.0.1:1234")
+	next := &nextHandler{}
+
+	err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !next.called {
-		t.Error("allow rule should fire first (lower priority), passing to next handler")
+		t.Error("next handler should be called (allow + under RL limit)")
 	}
 	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
 	if action != "allow" {
-		t.Errorf("expected allow action, got %q", action)
+		t.Errorf("action = %q, want allow (RL under limit shouldn't override)", action)
 	}
 }
 

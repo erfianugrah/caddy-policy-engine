@@ -281,8 +281,21 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	globalCfg := pe.rlGlobalConfig
 	pe.mu.RUnlock()
 
+	// ── 3-pass evaluation ──────────────────────────────────────────
+	//
+	// Pass 1 — Deny list: block/honeypot rules terminate immediately (403).
+	// Pass 2 — Allow: first allow match sets the "skip WAF" flag but does NOT
+	//          terminate — evaluation continues to pass 3.
+	// Pass 3 — Rate limit: always evaluates regardless of allow. Counters
+	//          always tick. Exceeded deny-action → 429.
+	//
+	// Rules are sorted by priority (block < allow < rate_limit), so a single
+	// loop handles all three passes in order. The key difference from the old
+	// model: allow no longer short-circuits — rate limits apply independently.
+
 	var pb *parsedBody
 	var bodyRead bool
+	var allowMatched bool
 
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
@@ -291,6 +304,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		// Rate limit rules require service matching before condition evaluation.
 		if cr.rule.Type == "rate_limit" && !matchService(cr.rule.Service, r) {
+			continue
+		}
+
+		// If an allow already matched, skip evaluating further allow rules
+		// (first-allow-wins within the allow pass). Block rules at this point
+		// have already been evaluated (lower priority), and rate limit rules
+		// must still be evaluated.
+		if allowMatched && (cr.rule.Type == "allow") {
 			continue
 		}
 
@@ -315,6 +336,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// Rule matched — take action.
 		switch cr.rule.Type {
 		case "allow":
+			// Pass 2: set allow flag and Caddy vars, but do NOT return.
+			// Rate limit rules (pass 3) still need to be evaluated.
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "allow")
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -327,9 +350,11 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.Strings("tags", cr.rule.Tags),
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
-			return next.ServeHTTP(w, r)
+			allowMatched = true
+			// Continue — don't return. Rate limits still apply.
 
 		case "block", "honeypot":
+			// Pass 1: deny list — hard terminate.
 			// Set Caddy variables so log_append captures them reliably
 			// (response headers may be lowercased by HTTP/2 and lost through handle_errors).
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
@@ -357,6 +382,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			return caddyhttp.Error(http.StatusForbidden, nil)
 
 		case "rate_limit":
+			// Pass 3: rate limit — always evaluated, even if allow matched.
 			if cr.rlConfig == nil || pe.rlState == nil {
 				continue
 			}
@@ -391,6 +417,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 			if !allowed {
 				// Rate exceeded — return 429.
+				// This overrides a prior allow action — rate limits take precedence
+				// over WAF bypass when the rate is exceeded.
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -432,7 +460,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 
-	// No rule matched — pass through.
+	// Pass through to next handler. If allowMatched is true, the Caddyfile
+	// @needs_waf matcher will see policy_engine.action=allow and skip WAF.
 	return next.ServeHTTP(w, r)
 }
 
