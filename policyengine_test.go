@@ -16,6 +16,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -3678,5 +3679,528 @@ func TestNeedsBodyField(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("needsBodyField(%q) = %v, want %v", tt.field, got, tt.want)
 		}
+	}
+}
+
+// ─── Default Rules Merge Tests ──────────────────────────────────────
+
+func TestMergeDefaultAndUserRules(t *testing.T) {
+	t.Run("no defaults", func(t *testing.T) {
+		user := []PolicyRule{{ID: "u1", Name: "user1", Type: "block"}}
+		result := mergeDefaultAndUserRules(nil, user, nil)
+		if len(result) != 1 || result[0].ID != "u1" {
+			t.Fatalf("expected 1 user rule, got %d", len(result))
+		}
+	})
+
+	t.Run("defaults only", func(t *testing.T) {
+		defaults := []PolicyRule{
+			{ID: "d1", Name: "default1", Type: "detect"},
+			{ID: "d2", Name: "default2", Type: "detect"},
+		}
+		result := mergeDefaultAndUserRules(defaults, nil, nil)
+		if len(result) != 2 {
+			t.Fatalf("expected 2 default rules, got %d", len(result))
+		}
+	})
+
+	t.Run("user overrides default by ID", func(t *testing.T) {
+		defaults := []PolicyRule{
+			{ID: "r1", Name: "default-version", Type: "detect", Priority: 400},
+		}
+		user := []PolicyRule{
+			{ID: "r1", Name: "user-version", Type: "block", Priority: 100},
+		}
+		result := mergeDefaultAndUserRules(defaults, user, nil)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 rule (user override), got %d", len(result))
+		}
+		if result[0].Name != "user-version" {
+			t.Errorf("expected user version, got %q", result[0].Name)
+		}
+	})
+
+	t.Run("disabled default filtered out", func(t *testing.T) {
+		defaults := []PolicyRule{
+			{ID: "d1", Name: "keep", Type: "detect"},
+			{ID: "d2", Name: "disable-me", Type: "detect"},
+		}
+		result := mergeDefaultAndUserRules(defaults, nil, []string{"d2"})
+		if len(result) != 1 {
+			t.Fatalf("expected 1 rule after disabling d2, got %d", len(result))
+		}
+		if result[0].ID != "d1" {
+			t.Errorf("expected d1, got %q", result[0].ID)
+		}
+	})
+
+	t.Run("mixed defaults, user, and disabled", func(t *testing.T) {
+		defaults := []PolicyRule{
+			{ID: "d1", Name: "default1"},
+			{ID: "d2", Name: "default2"},
+			{ID: "d3", Name: "default3"},
+		}
+		user := []PolicyRule{
+			{ID: "d2", Name: "user-override-d2"},
+			{ID: "u1", Name: "user-new"},
+		}
+		disabled := []string{"d3"}
+		result := mergeDefaultAndUserRules(defaults, user, disabled)
+		// d1 (kept) + d2 (overridden by user, so default skipped) + d3 (disabled) = d1 from defaults
+		// user: d2 (override) + u1 (new) = 2 user rules
+		// total: 1 + 2 = 3
+		if len(result) != 3 {
+			t.Fatalf("expected 3 rules, got %d", len(result))
+		}
+		// Defaults come first, then user rules.
+		if result[0].ID != "d1" {
+			t.Errorf("result[0] should be d1, got %q", result[0].ID)
+		}
+		if result[1].ID != "d2" || result[1].Name != "user-override-d2" {
+			t.Errorf("result[1] should be user d2, got %q %q", result[1].ID, result[1].Name)
+		}
+		if result[2].ID != "u1" {
+			t.Errorf("result[2] should be u1, got %q", result[2].ID)
+		}
+	})
+
+	t.Run("empty disabled list has no effect", func(t *testing.T) {
+		defaults := []PolicyRule{{ID: "d1"}, {ID: "d2"}}
+		result := mergeDefaultAndUserRules(defaults, nil, []string{})
+		if len(result) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(result))
+		}
+	})
+}
+
+func TestLoadDefaultRulesFile(t *testing.T) {
+	t.Run("file not found returns nil", func(t *testing.T) {
+		rules, mod, err := loadDefaultRulesFile("/nonexistent/path.json")
+		if err != nil {
+			t.Fatalf("expected nil error for missing file, got %v", err)
+		}
+		if rules != nil {
+			t.Errorf("expected nil rules, got %v", rules)
+		}
+		if !mod.IsZero() {
+			t.Errorf("expected zero time, got %v", mod)
+		}
+	})
+
+	t.Run("valid file loads rules", func(t *testing.T) {
+		content := `{
+			"rules": [
+				{"id": "PE-001", "name": "test default", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "header", "operator": "eq", "value": "Accept:"}], "group_op": "and"}
+			],
+			"version": 1
+		}`
+		tmpFile := filepath.Join(t.TempDir(), "defaults.json")
+		if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		rules, mod, err := loadDefaultRulesFile(tmpFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(rules))
+		}
+		if rules[0].ID != "PE-001" {
+			t.Errorf("expected PE-001, got %q", rules[0].ID)
+		}
+		if mod.IsZero() {
+			t.Error("expected non-zero mod time")
+		}
+	})
+
+	t.Run("invalid JSON returns error", func(t *testing.T) {
+		tmpFile := filepath.Join(t.TempDir(), "bad.json")
+		if err := os.WriteFile(tmpFile, []byte("{invalid"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := loadDefaultRulesFile(tmpFile)
+		if err == nil {
+			t.Fatal("expected error for invalid JSON")
+		}
+	})
+}
+
+func TestDefaultRulesFileLoading(t *testing.T) {
+	// Test that loadFromFile merges default rules with user rules.
+	dir := t.TempDir()
+	defaultFile := filepath.Join(dir, "defaults.json")
+	userFile := filepath.Join(dir, "rules.json")
+
+	// Write default rules.
+	defaultContent := `{
+		"rules": [
+			{"id": "PE-001", "name": "default detect", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 450, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
+			{"id": "PE-002", "name": "default detect 2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 451, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
+		],
+		"version": 1
+	}`
+	if err := os.WriteFile(defaultFile, []byte(defaultContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("defaults merged with user rules", func(t *testing.T) {
+		userContent := `{
+			"rules": [
+				{"id": "u1", "name": "user block", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/blocked"}], "group_op": "and"}
+			],
+			"generated": "2026-01-01T00:00:00Z",
+			"version": 1
+		}`
+		if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		pe := &PolicyEngine{
+			RulesFile:        userFile,
+			DefaultRulesFile: defaultFile,
+			mu:               &sync.RWMutex{},
+			rlState:          newRateLimitState(),
+			logger:           zap.NewNop(),
+		}
+		if err := pe.loadFromFile(); err != nil {
+			t.Fatalf("loadFromFile: %v", err)
+		}
+		// Should have 3 rules: 2 defaults + 1 user.
+		if len(pe.rules) != 3 {
+			t.Fatalf("expected 3 compiled rules, got %d", len(pe.rules))
+		}
+	})
+
+	t.Run("user overrides default by ID", func(t *testing.T) {
+		userContent := `{
+			"rules": [
+				{"id": "PE-001", "name": "user override", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/override"}], "group_op": "and"}
+			],
+			"generated": "2026-01-01T00:00:00Z",
+			"version": 1
+		}`
+		if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		pe := &PolicyEngine{
+			RulesFile:        userFile,
+			DefaultRulesFile: defaultFile,
+			mu:               &sync.RWMutex{},
+			rlState:          newRateLimitState(),
+			logger:           zap.NewNop(),
+		}
+		if err := pe.loadFromFile(); err != nil {
+			t.Fatalf("loadFromFile: %v", err)
+		}
+		// PE-001 overridden + PE-002 default = 2 rules.
+		if len(pe.rules) != 2 {
+			t.Fatalf("expected 2 compiled rules, got %d", len(pe.rules))
+		}
+		// The user override should be present (block type, priority 100 = first).
+		found := false
+		for _, r := range pe.rules {
+			if r.rule.ID == "PE-001" && r.rule.Name == "user override" {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("user override for PE-001 not found")
+		}
+	})
+
+	t.Run("disabled defaults filtered", func(t *testing.T) {
+		userContent := `{
+			"rules": [],
+			"disabled_default_rules": ["PE-002"],
+			"generated": "2026-01-01T00:00:00Z",
+			"version": 1
+		}`
+		if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		pe := &PolicyEngine{
+			RulesFile:        userFile,
+			DefaultRulesFile: defaultFile,
+			mu:               &sync.RWMutex{},
+			rlState:          newRateLimitState(),
+			logger:           zap.NewNop(),
+		}
+		if err := pe.loadFromFile(); err != nil {
+			t.Fatalf("loadFromFile: %v", err)
+		}
+		// PE-001 kept, PE-002 disabled = 1 rule.
+		if len(pe.rules) != 1 {
+			t.Fatalf("expected 1 compiled rule, got %d", len(pe.rules))
+		}
+		if pe.rules[0].rule.ID != "PE-001" {
+			t.Errorf("expected PE-001, got %q", pe.rules[0].rule.ID)
+		}
+	})
+
+	t.Run("missing default file is not fatal", func(t *testing.T) {
+		userContent := `{
+			"rules": [
+				{"id": "u1", "name": "user", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/x"}], "group_op": "and"}
+			],
+			"generated": "2026-01-01T00:00:00Z",
+			"version": 1
+		}`
+		if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		pe := &PolicyEngine{
+			RulesFile:        userFile,
+			DefaultRulesFile: filepath.Join(dir, "nonexistent.json"),
+			mu:               &sync.RWMutex{},
+			rlState:          newRateLimitState(),
+			logger:           zap.NewNop(),
+		}
+		if err := pe.loadFromFile(); err != nil {
+			t.Fatalf("loadFromFile should not fail for missing default file: %v", err)
+		}
+		if len(pe.rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(pe.rules))
+		}
+	})
+
+	t.Run("no default file configured", func(t *testing.T) {
+		userContent := `{
+			"rules": [
+				{"id": "u1", "name": "user", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/x"}], "group_op": "and"}
+			],
+			"generated": "2026-01-01T00:00:00Z",
+			"version": 1
+		}`
+		if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		pe := &PolicyEngine{
+			RulesFile: userFile,
+			mu:        &sync.RWMutex{},
+			rlState:   newRateLimitState(),
+			logger:    zap.NewNop(),
+		}
+		if err := pe.loadFromFile(); err != nil {
+			t.Fatalf("loadFromFile: %v", err)
+		}
+		if len(pe.rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(pe.rules))
+		}
+	})
+}
+
+func TestDefaultRulesInlineProvision(t *testing.T) {
+	// Test that inline DefaultRules merge with inline Rules in Provision.
+	pe := &PolicyEngine{
+		DefaultRules: []PolicyRule{
+			{ID: "d1", Name: "inline default", Type: "block", Enabled: true, Priority: 100,
+				Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/trap"}}, GroupOp: "and"},
+		},
+		Rules: []PolicyRule{
+			{ID: "u1", Name: "inline user", Type: "block", Enabled: true, Priority: 101,
+				Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/user"}}, GroupOp: "and"},
+		},
+	}
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := pe.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer pe.Cleanup()
+
+	if len(pe.rules) != 2 {
+		t.Fatalf("expected 2 rules (1 default + 1 user), got %d", len(pe.rules))
+	}
+}
+
+func TestDefaultRulesServeHTTP(t *testing.T) {
+	// End-to-end: default detect rule fires and contributes to anomaly score.
+	dir := t.TempDir()
+	defaultFile := filepath.Join(dir, "defaults.json")
+	userFile := filepath.Join(dir, "rules.json")
+
+	// Default rule: detect DELETE requests with CRITICAL severity (score 5).
+	defaultContent := `{
+		"rules": [
+			{"id": "PE-TEST-001", "name": "block DELETE", "type": "detect", "severity": "CRITICAL", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
+		],
+		"version": 1
+	}`
+	if err := os.WriteFile(defaultFile, []byte(defaultContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// User rules file with low threshold so the detect rule triggers a block.
+	userContent := `{
+		"rules": [],
+		"waf_config": {"paranoia_level": 1, "inbound_threshold": 3, "outbound_threshold": 10},
+		"generated": "2026-01-01T00:00:00Z",
+		"version": 1
+	}`
+	if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pe := &PolicyEngine{
+		RulesFile:        userFile,
+		DefaultRulesFile: defaultFile,
+	}
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := pe.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer pe.Cleanup()
+
+	// DELETE request should trigger the default detect rule → anomaly block.
+	req := httptest.NewRequest("DELETE", "http://example.com/resource", nil)
+	w := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(200)
+		return nil
+	})
+
+	err := pe.ServeHTTP(w, req, next)
+	if err == nil {
+		t.Fatal("expected error (anomaly block) from detect rule")
+	}
+	httpErr, ok := err.(caddyhttp.HandlerError)
+	if !ok {
+		t.Fatalf("expected HandlerError, got %T: %v", err, err)
+	}
+	if httpErr.StatusCode != 403 {
+		t.Errorf("expected 403, got %d", httpErr.StatusCode)
+	}
+}
+
+func TestDefaultRulesHotReload(t *testing.T) {
+	dir := t.TempDir()
+	defaultFile := filepath.Join(dir, "defaults.json")
+	userFile := filepath.Join(dir, "rules.json")
+
+	// Start with one default rule.
+	defaultContent := `{"rules": [{"id": "PE-HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"}], "version": 1}`
+	if err := os.WriteFile(defaultFile, []byte(defaultContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	userContent := `{"rules": [], "generated": "2026-01-01T00:00:00Z", "version": 1}`
+	if err := os.WriteFile(userFile, []byte(userContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pe := &PolicyEngine{
+		RulesFile:        userFile,
+		DefaultRulesFile: defaultFile,
+		mu:               &sync.RWMutex{},
+		rlState:          newRateLimitState(),
+		logger:           zap.NewNop(),
+	}
+	if err := pe.loadFromFile(); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	if len(pe.rules) != 1 {
+		t.Fatalf("expected 1 rule initially, got %d", len(pe.rules))
+	}
+
+	// Update default rules file — add a second rule.
+	time.Sleep(10 * time.Millisecond) // Ensure mtime differs.
+	defaultContent2 := `{"rules": [
+		{"id": "PE-HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
+		{"id": "PE-HR-002", "name": "hot-default-2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 401, "conditions": [{"field": "method", "operator": "eq", "value": "PUT"}], "group_op": "and"}
+	], "version": 1}`
+	if err := os.WriteFile(defaultFile, []byte(defaultContent2), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate hot-reload check — default file mtime changed.
+	if err := pe.loadFromFile(); err != nil {
+		t.Fatalf("hot reload: %v", err)
+	}
+	if len(pe.rules) != 2 {
+		t.Fatalf("expected 2 rules after hot reload, got %d", len(pe.rules))
+	}
+
+	// Now disable one default via user rules file.
+	time.Sleep(10 * time.Millisecond)
+	userContent2 := `{"rules": [], "disabled_default_rules": ["PE-HR-002"], "generated": "2026-01-01T00:01:00Z", "version": 1}`
+	if err := os.WriteFile(userFile, []byte(userContent2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pe.loadFromFile(); err != nil {
+		t.Fatalf("reload with disabled: %v", err)
+	}
+	if len(pe.rules) != 1 {
+		t.Fatalf("expected 1 rule after disabling PE-HR-002, got %d", len(pe.rules))
+	}
+	if pe.rules[0].rule.ID != "PE-HR-001" {
+		t.Errorf("expected PE-HR-001, got %q", pe.rules[0].rule.ID)
+	}
+}
+
+func TestDefaultRulesFileJSONConfig(t *testing.T) {
+	// Verify JSON config deserializes DefaultRulesFile field.
+	jsonCfg := `{
+		"rules_file": "/data/rules.json",
+		"default_rules_file": "/etc/caddy/default-rules.json"
+	}`
+	var pe PolicyEngine
+	if err := json.Unmarshal([]byte(jsonCfg), &pe); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if pe.RulesFile != "/data/rules.json" {
+		t.Errorf("RulesFile = %q, want /data/rules.json", pe.RulesFile)
+	}
+	if pe.DefaultRulesFile != "/etc/caddy/default-rules.json" {
+		t.Errorf("DefaultRulesFile = %q, want /etc/caddy/default-rules.json", pe.DefaultRulesFile)
+	}
+}
+
+func TestDisabledDefaultRulesDeserialization(t *testing.T) {
+	// Verify PolicyRulesFile properly deserializes disabled_default_rules.
+	jsonFile := `{
+		"rules": [],
+		"disabled_default_rules": ["PE-001", "PE-002"],
+		"generated": "2026-01-01T00:00:00Z",
+		"version": 1
+	}`
+	var file PolicyRulesFile
+	if err := json.Unmarshal([]byte(jsonFile), &file); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(file.DisabledDefaultRules) != 2 {
+		t.Fatalf("expected 2 disabled defaults, got %d", len(file.DisabledDefaultRules))
+	}
+	if file.DisabledDefaultRules[0] != "PE-001" || file.DisabledDefaultRules[1] != "PE-002" {
+		t.Errorf("unexpected disabled IDs: %v", file.DisabledDefaultRules)
+	}
+}
+
+func TestDefaultRulesFileSerialization(t *testing.T) {
+	// Verify DefaultRulesFile round-trips through JSON.
+	file := DefaultRulesFile{
+		Rules: []PolicyRule{
+			{ID: "PE-001", Name: "test", Type: "detect", Severity: "WARNING",
+				ParanoiaLevel: 1, Enabled: true, Priority: 400,
+				Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/x"}},
+				GroupOp:    "and"},
+		},
+		Version: 1,
+	}
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded DefaultRulesFile
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Rules) != 1 || decoded.Rules[0].ID != "PE-001" {
+		t.Errorf("round-trip failed: %+v", decoded)
 	}
 }
