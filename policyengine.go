@@ -155,9 +155,10 @@ type PolicyRule struct {
 
 // PolicyCondition is a single match condition.
 type PolicyCondition struct {
-	Field    string `json:"field"`
-	Operator string `json:"operator"`
-	Value    string `json:"value"`
+	Field      string   `json:"field"`
+	Operator   string   `json:"operator"`
+	Value      string   `json:"value"`
+	Transforms []string `json:"transforms,omitempty"` // ordered transform chain applied before operator
 	// Phase 2: managed list support
 	ListItems []string `json:"list_items,omitempty"`
 	ListKind  string   `json:"list_kind,omitempty"`
@@ -174,19 +175,20 @@ type compiledRule struct {
 }
 
 type compiledCondition struct {
-	field     string
-	operator  string
-	name      string // for named fields (header, cookie, args, body_json, body_form, etc.)
-	exactVal  string
-	prefix    string
-	suffix    string
-	contains  string
-	regex     *regexp.Regexp
-	ipNets    []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
-	ipSet     map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
-	stringSet map[string]bool
-	negate    bool
-	isExists  bool // true for "exists" operator (field presence check)
+	field      string
+	operator   string
+	name       string // for named fields (header, cookie, args, body_json, body_form, etc.)
+	exactVal   string
+	prefix     string
+	suffix     string
+	contains   string
+	regex      *regexp.Regexp
+	ipNets     []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
+	ipSet      map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
+	stringSet  map[string]bool
+	negate     bool
+	isExists   bool            // true for "exists" operator (field presence check)
+	transforms []transformFunc // ordered transform chain applied before operator evaluation
 }
 
 // bodyFields lists condition fields that require reading the request body.
@@ -637,6 +639,12 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 	}
 
 	target := extractField(cc, r, pb)
+
+	// Apply transforms before operator evaluation.
+	if len(cc.transforms) > 0 {
+		target = applyTransforms(target, cc.transforms)
+	}
+
 	result := evalOperator(cc, target)
 	if cc.negate {
 		return !result
@@ -1201,6 +1209,15 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 
 	default:
 		return cc, fmt.Errorf("unsupported operator %q", cond.Operator)
+	}
+
+	// Resolve transform chain.
+	for _, name := range cond.Transforms {
+		fn, ok := transformRegistry[name]
+		if !ok {
+			return cc, fmt.Errorf("unknown transform %q (valid: %v)", name, validTransformNames())
+		}
+		cc.transforms = append(cc.transforms, fn)
 	}
 
 	return cc, nil
