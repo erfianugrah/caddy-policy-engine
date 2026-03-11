@@ -79,6 +79,7 @@ type PolicyEngine struct {
 	rlState        *rateLimitState
 	rlGlobalConfig *parsedRLGlobalConfig
 	respHeaders    *compiledResponseHeaders // CSP + security headers
+	wafConfig      *compiledWafConfig       // anomaly scoring thresholds
 	stopSweep      chan struct{}
 }
 
@@ -87,22 +88,69 @@ type PolicyRulesFile struct {
 	Rules           []PolicyRule           `json:"rules"`
 	RateLimitConfig *RateLimitGlobalConfig `json:"rate_limit_config,omitempty"`
 	ResponseHeaders *ResponseHeaderConfig  `json:"response_headers,omitempty"`
+	WafConfig       *WafConfig             `json:"waf_config,omitempty"`
 	Generated       string                 `json:"generated"`
 	Version         int                    `json:"version"`
+}
+
+// WafConfig controls the anomaly scoring engine's behavior.
+type WafConfig struct {
+	ParanoiaLevel     int                         `json:"paranoia_level"`
+	InboundThreshold  int                         `json:"inbound_threshold"`
+	OutboundThreshold int                         `json:"outbound_threshold"`
+	PerService        map[string]WafServiceConfig `json:"per_service,omitempty"`
+}
+
+// WafServiceConfig allows per-service threshold and PL overrides.
+type WafServiceConfig struct {
+	ParanoiaLevel     int `json:"paranoia_level,omitempty"`
+	InboundThreshold  int `json:"inbound_threshold,omitempty"`
+	OutboundThreshold int `json:"outbound_threshold,omitempty"`
+}
+
+// compiledWafConfig is the pre-compiled WAF config for O(1) per-request lookup.
+type compiledWafConfig struct {
+	defaultPL           int
+	defaultInThreshold  int
+	defaultOutThreshold int
+	services            map[string]compiledWafServiceConfig
+}
+
+type compiledWafServiceConfig struct {
+	paranoiaLevel    int
+	inboundThreshold int
+}
+
+// scoreAccumulator tracks per-request anomaly scores during detect rule evaluation.
+type scoreAccumulator struct {
+	inbound int
+	matched []matchedRule
+}
+
+// matchedRule records a detect rule that fired for audit logging.
+type matchedRule struct {
+	ruleID   string
+	ruleName string
+	severity string
+	score    int
 }
 
 // PolicyRule is a single policy rule.
 type PolicyRule struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
-	Type       string            `json:"type"`              // "allow", "block", "honeypot", "rate_limit"
-	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit rules only)
+	Type       string            `json:"type"`              // "allow", "block", "honeypot", "rate_limit", "detect"
+	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit and detect rules)
 	Conditions []PolicyCondition `json:"conditions"`
 	GroupOp    string            `json:"group_op"` // "and" or "or"
 	RateLimit  *RateLimitConfig  `json:"rate_limit,omitempty"`
 	Tags       []string          `json:"tags,omitempty"`
 	Enabled    bool              `json:"enabled"`
 	Priority   int               `json:"priority"`
+
+	// Detect rule fields (anomaly scoring)
+	Severity      string `json:"severity,omitempty"`       // CRITICAL(5), ERROR(4), WARNING(3), NOTICE(2)
+	ParanoiaLevel int    `json:"paranoia_level,omitempty"` // 1-4; rule only evaluates if configured PL >= this
 }
 
 // PolicyCondition is a single match condition.
@@ -122,6 +170,7 @@ type compiledRule struct {
 	conditions []compiledCondition
 	needsBody  bool              // true if any condition or RL key uses body/body_json/body_form
 	rlConfig   *compiledRLConfig // non-nil for rate_limit rules
+	score      int               // severity-derived score for detect rules (0 for non-detect)
 }
 
 type compiledCondition struct {
@@ -284,37 +333,52 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	respHeaders := pe.respHeaders
 	pe.mu.RUnlock()
 
-	// ── 3-pass evaluation ──────────────────────────────────────────
+	// ── 4-pass evaluation ──────────────────────────────────────────
 	//
 	// Pass 1 — Deny list: block/honeypot rules terminate immediately (403).
 	// Pass 2 — Allow: first allow match sets the "skip WAF" flag but does NOT
-	//          terminate — evaluation continues to pass 3.
-	// Pass 3 — Rate limit: always evaluates regardless of allow. Counters
+	//          terminate — evaluation continues to passes 3 & 4.
+	// Pass 3 — Detect: accumulate anomaly scores. Skipped if allow matched.
+	// Pass 4 — Rate limit: always evaluates regardless of allow. Counters
 	//          always tick. Exceeded deny-action → 429.
 	//
-	// Rules are sorted by priority (block < allow < rate_limit), so a single
-	// loop handles all three passes in order. The key difference from the old
-	// model: allow no longer short-circuits — rate limits apply independently.
+	// Rules are sorted by priority (block < detect < allow < rate_limit), so a
+	// single loop handles all four passes in order. Allow skips further detect
+	// rules (allowed traffic isn't scored). Rate limits apply independently.
+	//
+	// After the loop: if accumulated score > threshold → 403 (detect_block).
+
+	pe.mu.RLock()
+	wafCfg := pe.wafConfig
+	pe.mu.RUnlock()
 
 	var pb *parsedBody
 	var bodyRead bool
 	var allowMatched bool
+	var scorer scoreAccumulator
+
+	// Resolve per-service WAF config for this request.
+	host := stripPort(r.Host)
+	servicePL, serviceThreshold := resolveWafConfig(wafCfg, host)
 
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
 			continue
 		}
 
-		// Rate limit rules require service matching before condition evaluation.
-		if cr.rule.Type == "rate_limit" && !matchService(cr.rule.Service, r) {
+		// Rate limit and detect rules may have service matching.
+		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect") && !matchService(cr.rule.Service, r) {
 			continue
 		}
 
-		// If an allow already matched, skip evaluating further allow rules
-		// (first-allow-wins within the allow pass). Block rules at this point
-		// have already been evaluated (lower priority), and rate limit rules
-		// must still be evaluated.
-		if allowMatched && (cr.rule.Type == "allow") {
+		// If an allow already matched, skip further allow AND detect rules.
+		// Allowed traffic bypasses scoring entirely.
+		if allowMatched && (cr.rule.Type == "allow" || cr.rule.Type == "detect") {
+			continue
+		}
+
+		// Detect rules: skip if paranoia level is too high for this service.
+		if cr.rule.Type == "detect" && cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
 			continue
 		}
 
@@ -340,7 +404,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		switch cr.rule.Type {
 		case "allow":
 			// Pass 2: set allow flag and Caddy vars, but do NOT return.
-			// Rate limit rules (pass 3) still need to be evaluated.
+			// Rate limit rules (pass 4) still need to be evaluated.
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "allow")
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -358,16 +422,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		case "block", "honeypot":
 			// Pass 1: deny list — hard terminate.
-			// Set Caddy variables so log_append captures them reliably
-			// (response headers may be lowercased by HTTP/2 and lost through handle_errors).
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
 			if len(cr.rule.Tags) > 0 {
 				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 			}
-			// Also set response headers for downstream visibility (error pages, debugging).
-			// Suppressed when HideHeaders is true to avoid exposing rule internals.
 			if !pe.HideHeaders {
 				w.Header().Set("X-Blocked-By", "policy-engine")
 				w.Header().Set("X-Blocked-Rule", cr.rule.Name)
@@ -384,8 +444,26 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("uri", r.RequestURI))
 			return caddyhttp.Error(http.StatusForbidden, nil)
 
+		case "detect":
+			// Pass 3: anomaly scoring — accumulate score, don't terminate.
+			scorer.inbound += cr.score
+			scorer.matched = append(scorer.matched, matchedRule{
+				ruleID:   cr.rule.ID,
+				ruleName: cr.rule.Name,
+				severity: cr.rule.Severity,
+				score:    cr.score,
+			})
+			pe.logger.Debug("detect rule matched",
+				zap.String("rule_id", cr.rule.ID),
+				zap.String("rule_name", cr.rule.Name),
+				zap.String("severity", cr.rule.Severity),
+				zap.Int("score", cr.score),
+				zap.Int("cumulative", scorer.inbound),
+				zap.String("client_ip", clientIP(r)),
+				zap.String("uri", r.RequestURI))
+
 		case "rate_limit":
-			// Pass 3: rate limit — always evaluated, even if allow matched.
+			// Pass 4: rate limit — always evaluated, even if allow matched.
 			if cr.rlConfig == nil || pe.rlState == nil {
 				continue
 			}
@@ -395,10 +473,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				continue
 			}
 
-			// Resolve the rate limit key from the request.
 			key := resolveRateLimitKey(cr.rlConfig.Key, r, pb)
 			if key == "" {
-				// Empty key (e.g., missing header) — skip this rule.
 				continue
 			}
 
@@ -406,7 +482,6 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			remaining := limit - int(count)
 
 			if cr.rlConfig.Action == "log_only" {
-				// Monitor mode: set headers but don't block.
 				if !pe.HideHeaders {
 					setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
 					w.Header().Set("X-RateLimit-Monitor", cr.rule.Name)
@@ -414,24 +489,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit_monitor")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
-				// Don't return — continue to next rule (monitoring doesn't short-circuit).
 				continue
 			}
 
 			if !allowed {
-				// Rate exceeded — return 429.
-				// This overrides a prior allow action — rate limits take precedence
-				// over WAF bypass when the rate is exceeded.
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
 				if len(cr.rule.Tags) > 0 {
 					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 				}
-				// Numeric rate limit headers (Limit, Remaining, Reset) and
-				// Retry-After are functional — clients need them for backoff.
-				// Only suppress the rule name in X-RateLimit-Policy when
-				// HideHeaders is true.
 				rlHeaderName := cr.rule.Name
 				if pe.HideHeaders {
 					rlHeaderName = ""
@@ -456,10 +523,41 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				return caddyhttp.Error(http.StatusTooManyRequests, nil)
 			}
 
-			// Under limit — set informational headers and continue.
 			if !pe.HideHeaders {
 				setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
 			}
+		}
+	}
+
+	// ── Post-loop: anomaly threshold check ─────────────────────────
+	// If detect rules fired and the accumulated score exceeds the threshold,
+	// block the request. This happens after all rules (including rate limits)
+	// have been evaluated, so rate limit counters are always ticked.
+	if scorer.inbound > 0 && !allowMatched {
+		// Set score variables regardless of whether threshold is exceeded.
+		caddyhttp.SetVar(r.Context(), "policy_engine.anomaly_score", strconv.Itoa(scorer.inbound))
+		caddyhttp.SetVar(r.Context(), "policy_engine.anomaly_threshold", strconv.Itoa(serviceThreshold))
+		caddyhttp.SetVar(r.Context(), "policy_engine.matched_rules", strconv.Itoa(len(scorer.matched)))
+
+		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
+			caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_block")
+			// Build matched rule names for logging.
+			ruleNames := make([]string, len(scorer.matched))
+			for i, m := range scorer.matched {
+				ruleNames[i] = m.ruleID
+			}
+			if !pe.HideHeaders {
+				w.Header().Set("X-Blocked-By", "policy-engine")
+				w.Header().Set("X-Anomaly-Score", strconv.Itoa(scorer.inbound))
+			}
+			pe.logger.Info("anomaly threshold exceeded",
+				zap.Int("score", scorer.inbound),
+				zap.Int("threshold", serviceThreshold),
+				zap.Int("rules_matched", len(scorer.matched)),
+				zap.Strings("rule_ids", ruleNames),
+				zap.String("client_ip", clientIP(r)),
+				zap.String("uri", r.RequestURI))
+			return caddyhttp.Error(http.StatusForbidden, nil)
 		}
 	}
 
@@ -880,6 +978,16 @@ var validRuleTypes = map[string]bool{
 	"block":      true,
 	"honeypot":   true,
 	"rate_limit": true,
+	"detect":     true,
+}
+
+// severityScores maps severity strings to anomaly score points.
+// Matches the CRS scoring model exactly.
+var severityScores = map[string]int{
+	"CRITICAL": 5,
+	"ERROR":    4,
+	"WARNING":  3,
+	"NOTICE":   2,
 }
 
 func compileRule(rule PolicyRule) (compiledRule, error) {
@@ -888,7 +996,7 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 	// Validate rule type early — unknown types would silently match
 	// conditions but take no action in ServeHTTP.
 	if !validRuleTypes[rule.Type] {
-		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, or rate_limit)", rule.Type)
+		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, rate_limit, or detect)", rule.Type)
 	}
 
 	for _, cond := range rule.Conditions {
@@ -914,7 +1022,89 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		}
 	}
 
+	// Validate and compile detect rule severity → score.
+	if rule.Type == "detect" {
+		if rule.Severity == "" {
+			return cr, fmt.Errorf("detect rules must have a severity (CRITICAL, ERROR, WARNING, NOTICE)")
+		}
+		score, ok := severityScores[rule.Severity]
+		if !ok {
+			return cr, fmt.Errorf("unknown severity %q (must be CRITICAL, ERROR, WARNING, or NOTICE)", rule.Severity)
+		}
+		cr.score = score
+		if rule.ParanoiaLevel < 0 || rule.ParanoiaLevel > 4 {
+			return cr, fmt.Errorf("paranoia_level must be 0-4, got %d", rule.ParanoiaLevel)
+		}
+	}
+
 	return cr, nil
+}
+
+// ─── WAF Config Compilation ─────────────────────────────────────────
+
+// compileWafConfig pre-compiles the WAF config for O(1) per-request lookup.
+// Returns nil if no config is provided (anomaly scoring disabled).
+func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := &compiledWafConfig{
+		defaultPL:           cfg.ParanoiaLevel,
+		defaultInThreshold:  cfg.InboundThreshold,
+		defaultOutThreshold: cfg.OutboundThreshold,
+	}
+	// Sensible defaults.
+	if c.defaultPL == 0 {
+		c.defaultPL = 1
+	}
+	if c.defaultInThreshold == 0 {
+		c.defaultInThreshold = 10
+	}
+	if c.defaultOutThreshold == 0 {
+		c.defaultOutThreshold = 10
+	}
+	if len(cfg.PerService) > 0 {
+		c.services = make(map[string]compiledWafServiceConfig, len(cfg.PerService))
+		for host, svc := range cfg.PerService {
+			cs := compiledWafServiceConfig{
+				paranoiaLevel:    svc.ParanoiaLevel,
+				inboundThreshold: svc.InboundThreshold,
+			}
+			// Zero means "inherit from defaults".
+			if cs.paranoiaLevel == 0 {
+				cs.paranoiaLevel = c.defaultPL
+			}
+			if cs.inboundThreshold == 0 {
+				cs.inboundThreshold = c.defaultInThreshold
+			}
+			c.services[strings.ToLower(host)] = cs
+		}
+	}
+	return c
+}
+
+// resolveWafConfig returns the effective paranoia level and inbound threshold
+// for a given host. Falls back to defaults if no per-service override exists.
+// Returns (1, 0) if wafConfig is nil (scoring disabled — PL 1, threshold 0
+// meaning no blocking).
+func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inboundThreshold int) {
+	if cfg == nil {
+		return 1, 0
+	}
+	if cfg.services != nil {
+		if svc, ok := cfg.services[strings.ToLower(host)]; ok {
+			return svc.paranoiaLevel, svc.inboundThreshold
+		}
+	}
+	return cfg.defaultPL, cfg.defaultInThreshold
+}
+
+// stripPort removes the port from a host:port string.
+func stripPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
 
 func compileCondition(cond PolicyCondition) (compiledCondition, error) {
@@ -1129,6 +1319,9 @@ func (pe *PolicyEngine) loadFromFile() error {
 	// Compile response headers (CSP + security) for O(1) per-request lookup.
 	respHeaders := compileResponseHeaders(file.ResponseHeaders)
 
+	// Compile WAF config (anomaly scoring thresholds + paranoia levels).
+	wafCfg := compileWafConfig(file.WafConfig)
+
 	// Check if sweep interval changed (need to restart sweep goroutine).
 	oldSweepInterval := pe.sweepInterval()
 
@@ -1136,6 +1329,7 @@ func (pe *PolicyEngine) loadFromFile() error {
 	pe.rules = compiled
 	pe.rlGlobalConfig = globalCfg
 	pe.respHeaders = respHeaders
+	pe.wafConfig = wafCfg
 	pe.lastMod = info.ModTime()
 	pe.mu.Unlock()
 
@@ -1155,12 +1349,16 @@ func (pe *PolicyEngine) loadFromFile() error {
 
 	enabledCount := 0
 	rlCount := 0
+	detectCount := 0
 	for _, r := range compiled {
 		if r.rule.Enabled {
 			enabledCount++
 		}
 		if r.rule.Type == "rate_limit" {
 			rlCount++
+		}
+		if r.rule.Type == "detect" {
+			detectCount++
 		}
 	}
 	hasCSP := respHeaders != nil && respHeaders.csp != nil && respHeaders.csp.enabled
@@ -1169,6 +1367,7 @@ func (pe *PolicyEngine) loadFromFile() error {
 		zap.Int("total", len(compiled)),
 		zap.Int("enabled", enabledCount),
 		zap.Int("rate_limit_zones", rlCount),
+		zap.Int("detect_rules", detectCount),
 		zap.Bool("csp_enabled", hasCSP),
 		zap.Bool("security_headers_enabled", hasSec),
 		zap.String("generated", file.Generated))

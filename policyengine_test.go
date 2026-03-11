@@ -2356,3 +2356,709 @@ func TestClientIP_IPBlockWithCaddyVar(t *testing.T) {
 		t.Error("block rule should NOT match when Caddy var has a different IP")
 	}
 }
+
+// ─── Detect Rule & Anomaly Scoring Tests ────────────────────────────
+
+// writeTempRulesFileWithConfig writes a rules file that includes waf_config.
+func writeTempRulesFileWithConfig(t *testing.T, rules []PolicyRule, wafCfg *WafConfig) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy-rules.json")
+	file := PolicyRulesFile{
+		Rules:     rules,
+		WafConfig: wafCfg,
+		Generated: time.Now().UTC().Format(time.RFC3339),
+		Version:   1,
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestDetect_SingleRule_ScoresCorrectly(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "d1", Name: "Missing Accept", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "NOTICE", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "header", Operator: "eq", Value: "Accept:"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	// Request without Accept header → condition matches (header equals empty).
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Fatal("next handler should be called (score below threshold)")
+	}
+	// Check anomaly_score is set.
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "2" {
+		t.Errorf("expected anomaly_score=2 (NOTICE), got %q", score)
+	}
+}
+
+func TestDetect_MultipleRules_Cumulative(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "d1", Name: "NOTICE rule", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "NOTICE", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+			{
+				ID: "d2", Name: "WARNING rule", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "WARNING", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "method", Operator: "eq", Value: "GET"},
+				},
+			},
+			{
+				ID: "d3", Name: "CRITICAL rule", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	_ = pe.ServeHTTP(w, r, next)
+
+	// NOTICE(2) + WARNING(3) + CRITICAL(5) = 10
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "10" {
+		t.Errorf("expected cumulative score=10, got %q", score)
+	}
+	matched, _ := caddyhttp.GetVar(r.Context(), "policy_engine.matched_rules").(string)
+	if matched != "3" {
+		t.Errorf("expected 3 matched rules, got %q", matched)
+	}
+}
+
+func TestDetect_ThresholdExceeded_Blocks(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/bad"},
+			},
+		},
+		{
+			ID: "d2", Name: "ERROR detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "ERROR", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/bad"},
+			},
+		},
+		{
+			ID: "d3", Name: "WARNING detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "WARNING", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/bad"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 10,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Score: CRITICAL(5) + ERROR(4) + WARNING(3) = 12 > threshold 10.
+	r := makeRequest("GET", "/bad-path", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected error for detect_block (score exceeded threshold)")
+	}
+	if next.called {
+		t.Error("next handler should NOT be called when score exceeds threshold")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "detect_block" {
+		t.Errorf("expected action=detect_block, got %q", action)
+	}
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "12" {
+		t.Errorf("expected anomaly_score=12, got %q", score)
+	}
+}
+
+func TestDetect_BelowThreshold_Passes(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "NOTICE detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "NOTICE", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 10,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Score: NOTICE(2) < threshold 10.
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called (score below threshold)")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action == "detect_block" {
+		t.Error("should not block when below threshold")
+	}
+}
+
+func TestDetect_ParanoiaLevel_Filtering(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "PL1 rule", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+		{
+			ID: "d2", Name: "PL3 rule", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 3,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2, // Only PL1 and PL2 rules should fire.
+		InboundThreshold: 20,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	_ = pe.ServeHTTP(w, r, next)
+
+	// Only PL1 rule (CRITICAL=5) should fire. PL3 rule is filtered out.
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "5" {
+		t.Errorf("expected score=5 (only PL1 rule), got %q", score)
+	}
+	matched, _ := caddyhttp.GetVar(r.Context(), "policy_engine.matched_rules").(string)
+	if matched != "1" {
+		t.Errorf("expected 1 matched rule, got %q", matched)
+	}
+}
+
+func TestDetect_PerServiceThreshold(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3, // Default: score 5 > threshold 3 → block.
+		PerService: map[string]WafServiceConfig{
+			"relaxed.example.com": {InboundThreshold: 20}, // Override: 5 < 20 → pass.
+		},
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Request to default host → should block (5 >= 3).
+	r1 := makeRequest("GET", "/test", "10.0.0.1:1234")
+	r1.Host = "strict.example.com"
+	w1 := httptest.NewRecorder()
+	next1 := &nextHandler{}
+	err := pe.ServeHTTP(w1, r1, next1)
+	if err == nil {
+		t.Fatal("expected block on strict host")
+	}
+
+	// Request to relaxed host → should pass (5 < 20).
+	r2 := makeRequest("GET", "/test", "10.0.0.1:1234")
+	r2.Host = "relaxed.example.com"
+	w2 := httptest.NewRecorder()
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(w2, r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error on relaxed host: %v", err)
+	}
+	if !next2.called {
+		t.Error("next handler should be called for relaxed host")
+	}
+}
+
+func TestDetect_AllowBypassesScoring(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "a1", Name: "Allow all", Type: "allow", Enabled: true,
+				Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+			{
+				ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Allow rule matched → detect rules should be skipped.
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "allow" {
+		t.Errorf("expected action=allow, got %q", action)
+	}
+	// No score should be set since detect was skipped.
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "" {
+		t.Errorf("expected no anomaly_score (detect skipped by allow), got %q", score)
+	}
+}
+
+func TestDetect_BlockTakesPrecedenceOverDetect(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "b1", Name: "Block path", Type: "block", Enabled: true,
+				Priority: 100,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/blocked"},
+				},
+			},
+			{
+				ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/blocked"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/blocked", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for block action")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "block" {
+		t.Errorf("expected action=block (not detect_block), got %q", action)
+	}
+}
+
+func TestDetect_NoWafConfig_NoBlocking(t *testing.T) {
+	// Without waf_config, threshold is 0 meaning no threshold-based blocking.
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called (no waf_config = no threshold blocking)")
+	}
+	// Score should still be set for observability.
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "5" {
+		t.Errorf("expected anomaly_score=5 even without config, got %q", score)
+	}
+}
+
+func TestDetect_SeverityMapping(t *testing.T) {
+	tests := []struct {
+		severity string
+		score    int
+	}{
+		{"CRITICAL", 5},
+		{"ERROR", 4},
+		{"WARNING", 3},
+		{"NOTICE", 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.severity, func(t *testing.T) {
+			rule := PolicyRule{
+				ID: "d1", Name: "test", Type: "detect", Enabled: true,
+				Priority: 150, Severity: tt.severity, ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/"},
+				},
+			}
+			cr, err := compileRule(rule)
+			if err != nil {
+				t.Fatalf("compile error: %v", err)
+			}
+			if cr.score != tt.score {
+				t.Errorf("expected score=%d for %s, got %d", tt.score, tt.severity, cr.score)
+			}
+		})
+	}
+}
+
+func TestDetect_InvalidSeverity_Rejected(t *testing.T) {
+	rule := PolicyRule{
+		ID: "d1", Name: "test", Type: "detect", Enabled: true,
+		Priority: 150, Severity: "UNKNOWN", ParanoiaLevel: 1,
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "eq", Value: "/"},
+		},
+	}
+	_, err := compileRule(rule)
+	if err == nil {
+		t.Fatal("expected error for invalid severity")
+	}
+	if !strings.Contains(err.Error(), "unknown severity") {
+		t.Errorf("expected 'unknown severity' error, got: %v", err)
+	}
+}
+
+func TestDetect_MissingSeverity_Rejected(t *testing.T) {
+	rule := PolicyRule{
+		ID: "d1", Name: "test", Type: "detect", Enabled: true,
+		Priority: 150, ParanoiaLevel: 1,
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "eq", Value: "/"},
+		},
+	}
+	_, err := compileRule(rule)
+	if err == nil {
+		t.Fatal("expected error for missing severity")
+	}
+	if !strings.Contains(err.Error(), "must have a severity") {
+		t.Errorf("expected 'must have a severity' error, got: %v", err)
+	}
+}
+
+func TestDetect_InvalidParanoiaLevel_Rejected(t *testing.T) {
+	rule := PolicyRule{
+		ID: "d1", Name: "test", Type: "detect", Enabled: true,
+		Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 5,
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "eq", Value: "/"},
+		},
+	}
+	_, err := compileRule(rule)
+	if err == nil {
+		t.Fatal("expected error for paranoia_level > 4")
+	}
+}
+
+func TestCompileWafConfig_Nil(t *testing.T) {
+	c := compileWafConfig(nil)
+	if c != nil {
+		t.Error("expected nil for nil config")
+	}
+}
+
+func TestCompileWafConfig_Defaults(t *testing.T) {
+	c := compileWafConfig(&WafConfig{})
+	if c == nil {
+		t.Fatal("expected non-nil compiled config")
+	}
+	if c.defaultPL != 1 {
+		t.Errorf("expected defaultPL=1, got %d", c.defaultPL)
+	}
+	if c.defaultInThreshold != 10 {
+		t.Errorf("expected defaultInThreshold=10, got %d", c.defaultInThreshold)
+	}
+}
+
+func TestCompileWafConfig_PerService(t *testing.T) {
+	c := compileWafConfig(&WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 10,
+		PerService: map[string]WafServiceConfig{
+			"strict.example.com":  {ParanoiaLevel: 1, InboundThreshold: 5},
+			"relaxed.example.com": {InboundThreshold: 20}, // PL inherits from default.
+		},
+	})
+	if c == nil {
+		t.Fatal("expected non-nil")
+	}
+	// Default lookup.
+	pl, th := resolveWafConfig(c, "unknown.example.com")
+	if pl != 2 || th != 10 {
+		t.Errorf("default: expected PL=2 threshold=10, got PL=%d threshold=%d", pl, th)
+	}
+	// Strict override.
+	pl, th = resolveWafConfig(c, "strict.example.com")
+	if pl != 1 || th != 5 {
+		t.Errorf("strict: expected PL=1 threshold=5, got PL=%d threshold=%d", pl, th)
+	}
+	// Relaxed override (PL inherits, threshold overridden).
+	pl, th = resolveWafConfig(c, "relaxed.example.com")
+	if pl != 2 || th != 20 {
+		t.Errorf("relaxed: expected PL=2 threshold=20, got PL=%d threshold=%d", pl, th)
+	}
+}
+
+func TestResolveWafConfig_Nil(t *testing.T) {
+	pl, th := resolveWafConfig(nil, "example.com")
+	if pl != 1 || th != 0 {
+		t.Errorf("nil config: expected PL=1 threshold=0, got PL=%d threshold=%d", pl, th)
+	}
+}
+
+func TestDetect_ServiceMatching(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "Service-specific detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Service: "target.example.com",
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Request to matching service → should score and block.
+	r1 := makeRequest("GET", "/test", "10.0.0.1:1234")
+	r1.Host = "target.example.com"
+	w1 := httptest.NewRecorder()
+	err := pe.ServeHTTP(w1, r1, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected block on matching service")
+	}
+
+	// Request to different service → detect rule skipped, no scoring.
+	r2 := makeRequest("GET", "/test", "10.0.0.1:1234")
+	r2.Host = "other.example.com"
+	w2 := httptest.NewRecorder()
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(w2, r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error on non-matching service: %v", err)
+	}
+	if !next2.called {
+		t.Error("next handler should be called for non-matching service")
+	}
+}
+
+func TestDetect_AnomalyScoreHeader(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/bad"},
+			},
+		},
+		{
+			ID: "d2", Name: "CRITICAL detect 2", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/bad"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 5,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/bad", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	_ = pe.ServeHTTP(w, r, &nextHandler{})
+
+	// Should have X-Anomaly-Score header (score=10 exceeds threshold=5).
+	if w.Header().Get("X-Anomaly-Score") != "10" {
+		t.Errorf("expected X-Anomaly-Score=10, got %q", w.Header().Get("X-Anomaly-Score"))
+	}
+	if w.Header().Get("X-Blocked-By") != "policy-engine" {
+		t.Errorf("expected X-Blocked-By=policy-engine, got %q", w.Header().Get("X-Blocked-By"))
+	}
+}
+
+func TestDetect_DisabledRulesSkipped(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "d1", Name: "Disabled detect", Type: "detect", Enabled: false,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called (disabled rule)")
+	}
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "" {
+		t.Errorf("expected no score for disabled rule, got %q", score)
+	}
+}
+
+func TestStripPort(t *testing.T) {
+	tests := []struct {
+		input, expected string
+	}{
+		{"example.com:8080", "example.com"},
+		{"example.com", "example.com"},
+		{"[::1]:8080", "::1"},
+		{"::1", "::1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := stripPort(tt.input)
+			if got != tt.expected {
+				t.Errorf("stripPort(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDetect_HotReload_WafConfig(t *testing.T) {
+	// Start with threshold=20 (no block for score=5).
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 20,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Should pass (5 < 20).
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("should pass with threshold=20")
+	}
+
+	// Update file to lower threshold to 3.
+	time.Sleep(50 * time.Millisecond)
+	file := PolicyRulesFile{
+		Rules: []PolicyRule{
+			{
+				ID: "d1", Name: "CRITICAL detect", Type: "detect", Enabled: true,
+				Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "contains", Value: "/test"},
+				},
+			},
+		},
+		WafConfig: &WafConfig{
+			ParanoiaLevel:    2,
+			InboundThreshold: 3,
+		},
+		Generated: time.Now().UTC().Format(time.RFC3339),
+		Version:   1,
+	}
+	data, _ := json.MarshalIndent(file, "", "  ")
+	os.WriteFile(path, data, 0644)
+
+	// Force reload.
+	if err := pe.loadFromFile(); err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+
+	// Now should block (5 >= 3).
+	r2 := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w2 := httptest.NewRecorder()
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(w2, r2, next2)
+	if err == nil {
+		t.Fatal("expected block after threshold lowered")
+	}
+	action, _ := caddyhttp.GetVar(r2.Context(), "policy_engine.action").(string)
+	if action != "detect_block" {
+		t.Errorf("expected action=detect_block, got %q", action)
+	}
+}
