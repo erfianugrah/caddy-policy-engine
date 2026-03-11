@@ -823,7 +823,18 @@ func jsonValueToString(v interface{}) string {
 
 // clientIP extracts the client IP from the request, stripping the port.
 func clientIP(r *http.Request) string {
-	// Caddy sets r.RemoteAddr to the real client IP (after trusted_proxies resolution).
+	// Read the real client IP from Caddy's trusted_proxies-resolved variable.
+	// This is set by Caddy's server layer before any handlers run, accounting
+	// for X-Forwarded-For / CF-Connecting-IP headers from trusted proxies.
+	// Falls back to r.RemoteAddr if the variable is not set (e.g., in tests).
+	if val, ok := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string); ok && val != "" {
+		host, _, err := net.SplitHostPort(val)
+		if err != nil {
+			return val // no port
+		}
+		return host
+	}
+	// Fallback for non-Caddy contexts (unit tests, etc.).
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

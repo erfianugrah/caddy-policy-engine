@@ -2245,3 +2245,114 @@ func TestParsedBody_NilAndEmpty(t *testing.T) {
 		t.Error("empty raw getJSON should return false")
 	}
 }
+
+// ─── clientIP Tests ─────────────────────────────────────────────────
+
+func TestClientIP_CaddyVar(t *testing.T) {
+	// When Caddy's ClientIPVarKey is set, clientIP should return that IP,
+	// NOT r.RemoteAddr (which is the TCP peer — e.g., a CF proxy IP).
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "172.71.98.44:12345" // CF proxy IP
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "93.123.109.246:54321",
+	})
+	r = r.WithContext(ctx)
+
+	got := clientIP(r)
+	if got != "93.123.109.246" {
+		t.Errorf("clientIP = %q, want %q (should use Caddy var, not RemoteAddr)", got, "93.123.109.246")
+	}
+}
+
+func TestClientIP_CaddyVarNoPort(t *testing.T) {
+	// ClientIPVarKey may not include a port.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "172.71.98.44:12345"
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "93.123.109.246",
+	})
+	r = r.WithContext(ctx)
+
+	got := clientIP(r)
+	if got != "93.123.109.246" {
+		t.Errorf("clientIP = %q, want %q", got, "93.123.109.246")
+	}
+}
+
+func TestClientIP_FallbackToRemoteAddr(t *testing.T) {
+	// Without Caddy vars context (e.g., unit tests), falls back to r.RemoteAddr.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:12345"
+
+	got := clientIP(r)
+	if got != "10.0.0.1" {
+		t.Errorf("clientIP = %q, want %q", got, "10.0.0.1")
+	}
+}
+
+func TestClientIP_EmptyCaddyVar(t *testing.T) {
+	// If Caddy var is set but empty, fall back to RemoteAddr.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:12345"
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "",
+	})
+	r = r.WithContext(ctx)
+
+	got := clientIP(r)
+	if got != "10.0.0.1" {
+		t.Errorf("clientIP = %q, want %q (should fall back to RemoteAddr)", got, "10.0.0.1")
+	}
+}
+
+func TestClientIP_IPv6CaddyVar(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "172.71.98.44:12345"
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "[2001:db8::1]:54321",
+	})
+	r = r.WithContext(ctx)
+
+	got := clientIP(r)
+	if got != "2001:db8::1" {
+		t.Errorf("clientIP = %q, want %q", got, "2001:db8::1")
+	}
+}
+
+func TestClientIP_IPBlockWithCaddyVar(t *testing.T) {
+	// Integration test: verify that a block rule with ip condition
+	// matches the Caddy-resolved IP, not the TCP peer.
+	rule := PolicyRule{
+		ID:      "test-block-ip",
+		Name:    "Block bad IP",
+		Type:    "block",
+		Enabled: true,
+		Conditions: []PolicyCondition{
+			{Field: "ip", Operator: "eq", Value: "93.123.109.246"},
+		},
+	}
+	cr, err := compileRule(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.RemoteAddr = "172.71.98.44:12345" // CF proxy
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "93.123.109.246:54321",
+	})
+	r = r.WithContext(ctx)
+
+	if !matchRule(cr, r, nil) {
+		t.Error("block rule should match when Caddy var has the target IP")
+	}
+
+	// Same request but with a different real IP — should NOT match.
+	ctx2 := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "1.2.3.4:54321",
+	})
+	r2 := r.WithContext(ctx2)
+	if matchRule(cr, r2, nil) {
+		t.Error("block rule should NOT match when Caddy var has a different IP")
+	}
+}
