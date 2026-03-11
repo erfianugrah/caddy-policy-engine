@@ -18,7 +18,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,17 +240,33 @@ func (rls *rateLimitState) sweepAll(now time.Time) int {
 // sweepInterval is the default interval for sweeping expired counters.
 var defaultSweepInterval = 30 * time.Second
 
+// sweepInterval returns the effective sweep interval from the global config.
+func (pe *PolicyEngine) sweepInterval() time.Duration {
+	pe.mu.RLock()
+	cfg := pe.rlGlobalConfig
+	pe.mu.RUnlock()
+	if cfg != nil && cfg.parsedSweep > 0 {
+		return cfg.parsedSweep
+	}
+	return defaultSweepInterval
+}
+
 // startSweep starts the background goroutine that periodically evicts
-// expired counters. Uses atomic pointer to allow interval changes.
+// expired counters.
 func (pe *PolicyEngine) startSweep() {
 	if pe.rlState == nil {
 		return
 	}
 	pe.stopSweep = make(chan struct{})
-	interval := defaultSweepInterval
-	if pe.rlGlobalConfig != nil && pe.rlGlobalConfig.parsedSweep > 0 {
-		interval = pe.rlGlobalConfig.parsedSweep
-	}
+	interval := pe.sweepInterval()
+
+	// Capture stop channel and rlState in local variables so the goroutine
+	// doesn't read pe.stopSweep via closure on each select iteration.
+	// Without this, restartSweep could overwrite pe.stopSweep with a new
+	// channel before the old goroutine reads the closed old channel,
+	// causing the old goroutine to block on the new (open) channel forever.
+	stop := pe.stopSweep
+	rls := pe.rlState
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -259,10 +274,10 @@ func (pe *PolicyEngine) startSweep() {
 
 		for {
 			select {
-			case <-pe.stopSweep:
+			case <-stop:
 				return
 			case <-ticker.C:
-				swept := pe.rlState.sweepAll(time.Now())
+				swept := rls.sweepAll(time.Now())
 				if swept > 0 && pe.logger != nil {
 					pe.logger.Debug("rate limit sweep",
 						zap.Int("expired", swept))
@@ -272,12 +287,22 @@ func (pe *PolicyEngine) startSweep() {
 	}()
 }
 
+// restartSweep stops the current sweep goroutine and starts a new one.
+// Called during hot-reload when the global rate limit config changes.
+func (pe *PolicyEngine) restartSweep() {
+	if pe.stopSweep != nil {
+		close(pe.stopSweep)
+	}
+	pe.startSweep()
+}
+
 // ─── Key Resolution ─────────────────────────────────────────────────
 
 // resolveRateLimitKey extracts the rate limit bucket key from the request.
 // Unlike the Caddyfile generator (which outputs Caddy placeholders), this
 // resolves directly from the http.Request — no placeholder indirection.
-func resolveRateLimitKey(keySpec string, r *http.Request, bodyBuf []byte) string {
+// Uses the pre-parsed body (parsedBody) to avoid re-parsing JSON/form data.
+func resolveRateLimitKey(keySpec string, r *http.Request, pb *parsedBody) string {
 	switch keySpec {
 	case "client_ip", "":
 		return clientIP(r)
@@ -305,22 +330,26 @@ func resolveRateLimitKey(keySpec string, r *http.Request, bodyBuf []byte) string
 	}
 	if strings.HasPrefix(keySpec, "body_json:") {
 		dotPath := strings.TrimPrefix(keySpec, "body_json:")
-		if len(bodyBuf) == 0 {
+		if pb == nil || len(pb.raw) == 0 {
 			return ""
 		}
-		val, ok := resolveJSONPath(bodyBuf, dotPath)
+		root, ok := pb.getJSON()
 		if !ok {
+			return ""
+		}
+		val, found := resolveJSONPathParsed(root, dotPath)
+		if !found {
 			return ""
 		}
 		return jsonValueToString(val)
 	}
 	if strings.HasPrefix(keySpec, "body_form:") {
 		field := strings.TrimPrefix(keySpec, "body_form:")
-		if len(bodyBuf) == 0 {
+		if pb == nil || len(pb.raw) == 0 {
 			return ""
 		}
-		values, err := url.ParseQuery(string(bodyBuf))
-		if err != nil {
+		values := pb.getForm()
+		if values == nil {
 			return ""
 		}
 		return values.Get(field)

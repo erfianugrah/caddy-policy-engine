@@ -250,7 +250,7 @@ func TestResolveRateLimitKey_Cookie(t *testing.T) {
 func TestResolveRateLimitKey_BodyJSON(t *testing.T) {
 	r := httptest.NewRequest("POST", "/", nil)
 	body := []byte(`{"user":{"api_key":"secret123"}}`)
-	key := resolveRateLimitKey("body_json:.user.api_key", r, body)
+	key := resolveRateLimitKey("body_json:.user.api_key", r, &parsedBody{raw: body})
 	if key != "secret123" {
 		t.Errorf("want secret123, got %s", key)
 	}
@@ -259,7 +259,7 @@ func TestResolveRateLimitKey_BodyJSON(t *testing.T) {
 func TestResolveRateLimitKey_BodyForm(t *testing.T) {
 	r := httptest.NewRequest("POST", "/", nil)
 	body := []byte("action=login&user=admin")
-	key := resolveRateLimitKey("body_form:action", r, body)
+	key := resolveRateLimitKey("body_form:action", r, &parsedBody{raw: body})
 	if key != "login" {
 		t.Errorf("want login, got %s", key)
 	}
@@ -656,10 +656,11 @@ func TestCompileRLGlobalConfig_ClampJitter(t *testing.T) {
 
 // ─── ServeHTTP Integration Tests ────────────────────────────────────
 
-func newTestPolicyEngine(rules []PolicyRule) *PolicyEngine {
+func newTestPolicyEngine(t *testing.T, rules []PolicyRule) *PolicyEngine {
+	t.Helper()
 	compiled, err := compileRules(rules)
 	if err != nil {
-		panic(err)
+		t.Fatalf("compileRules: %v", err)
 	}
 	pe := &PolicyEngine{
 		mu:      &sync.RWMutex{},
@@ -672,7 +673,7 @@ func newTestPolicyEngine(rules []PolicyRule) *PolicyEngine {
 }
 
 func TestServeHTTP_RateLimit_Deny(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "test-limit",
 		Type:    "rate_limit",
@@ -734,7 +735,7 @@ func TestServeHTTP_RateLimit_Deny(t *testing.T) {
 }
 
 func TestServeHTTP_RateLimit_LogOnly(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "monitor-rule",
 		Type:    "rate_limit",
@@ -775,7 +776,7 @@ func TestServeHTTP_RateLimit_LogOnly(t *testing.T) {
 }
 
 func TestServeHTTP_RateLimit_ServiceFilter(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "sonarr-limit",
 		Type:    "rate_limit",
@@ -829,7 +830,7 @@ func TestServeHTTP_RateLimit_ServiceFilter(t *testing.T) {
 }
 
 func TestServeHTTP_RateLimit_WithConditions(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "api-limit",
 		Type:    "rate_limit",
@@ -881,7 +882,7 @@ func TestServeHTTP_RateLimit_WithConditions(t *testing.T) {
 }
 
 func TestServeHTTP_RateLimit_EmptyKey_Skipped(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "header-limit",
 		Type:    "rate_limit",
@@ -905,7 +906,7 @@ func TestServeHTTP_RateLimit_EmptyKey_Skipped(t *testing.T) {
 }
 
 func TestServeHTTP_RateLimit_Tags(t *testing.T) {
-	pe := newTestPolicyEngine([]PolicyRule{{
+	pe := newTestPolicyEngine(t, []PolicyRule{{
 		ID:      "rl1",
 		Name:    "tagged-limit",
 		Type:    "rate_limit",
@@ -1113,7 +1114,7 @@ func TestSetRateLimitHeaders_NegativeRemaining(t *testing.T) {
 
 func TestServeHTTP_BlockBeforeRateLimit(t *testing.T) {
 	// Block rule has lower priority, should fire first.
-	pe := newTestPolicyEngine([]PolicyRule{
+	pe := newTestPolicyEngine(t, []PolicyRule{
 		{
 			ID:       "b1",
 			Name:     "block-bad",
@@ -1145,5 +1146,52 @@ func TestServeHTTP_BlockBeforeRateLimit(t *testing.T) {
 	httpErr, ok := err.(caddyhttp.HandlerError)
 	if !ok || httpErr.StatusCode != 403 {
 		t.Errorf("want 403 from block rule, got %v", err)
+	}
+}
+
+func TestServeHTTP_RateLimit_HideHeaders(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{{
+		ID:      "rl1",
+		Name:    "secret-limit",
+		Type:    "rate_limit",
+		Enabled: true,
+		RateLimit: &RateLimitConfig{
+			Key:    "client_ip",
+			Events: 1,
+			Window: "1m",
+			Action: "deny",
+		},
+	}})
+	pe.HideHeaders = true
+
+	// First request — under limit. Informational headers should be suppressed.
+	w1 := httptest.NewRecorder()
+	r1 := makeRequest("GET", "/", "10.0.0.1:12345")
+	pe.ServeHTTP(w1, r1, &nextHandler{})
+	if w1.Header().Get("X-RateLimit-Limit") != "" {
+		t.Error("X-RateLimit-Limit should be suppressed with HideHeaders=true (informational)")
+	}
+
+	// Second request — over limit (429). Functional headers should still be
+	// set (clients need them for backoff) but X-RateLimit-Policy with rule
+	// name should be suppressed.
+	w2 := httptest.NewRecorder()
+	r2 := makeRequest("GET", "/", "10.0.0.1:12345")
+	err := pe.ServeHTTP(w2, r2, &nextHandler{})
+	httpErr, ok := err.(caddyhttp.HandlerError)
+	if !ok || httpErr.StatusCode != 429 {
+		t.Fatalf("want 429, got %v", err)
+	}
+	// Functional numeric headers should still be present.
+	if w2.Header().Get("X-RateLimit-Limit") != "1" {
+		t.Errorf("X-RateLimit-Limit should still be set on 429, got %q", w2.Header().Get("X-RateLimit-Limit"))
+	}
+	if w2.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After should still be set on 429")
+	}
+	// X-RateLimit-Policy should NOT contain the rule name.
+	policy := w2.Header().Get("X-RateLimit-Policy")
+	if strings.Contains(policy, "secret-limit") {
+		t.Errorf("X-RateLimit-Policy should not contain rule name with HideHeaders=true, got %q", policy)
 	}
 }

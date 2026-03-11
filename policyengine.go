@@ -36,6 +36,12 @@ import (
 // defaultBodyMaxSize matches the Coraza WAF request_body_limit (13 MiB).
 const defaultBodyMaxSize = 13 * 1024 * 1024
 
+// maxRegexLen is the maximum allowed regex pattern length (bytes).
+// Go's RE2 engine is linear-time, but extremely large compiled regexes
+// can still consume significant memory. 8 KiB is generous for any
+// reasonable security rule pattern.
+const maxRegexLen = 8 * 1024
+
 func init() {
 	caddy.RegisterModule(PolicyEngine{})
 	httpcaddyfile.RegisterHandlerDirective("policy_engine", parseCaddyfilePolicyEngine)
@@ -57,6 +63,12 @@ type PolicyEngine struct {
 	// BodyMaxSize is the maximum bytes to buffer for body field matching.
 	// Default 13 MiB (matching Coraza WAF request_body_limit).
 	BodyMaxSize int64 `json:"body_max_size,omitempty"`
+
+	// HideHeaders suppresses debug response headers (X-Blocked-By,
+	// X-Blocked-Rule, X-Policy-Tags, X-RateLimit-Monitor) in responses.
+	// Caddy variables are still set regardless. Use this in production
+	// to avoid exposing internal rule names to clients.
+	HideHeaders bool `json:"hide_headers,omitempty"`
 
 	// compiled state (not serialized)
 	rules          []compiledRule
@@ -131,6 +143,48 @@ var bodyFields = map[string]bool{
 	"body":      true,
 	"body_json": true,
 	"body_form": true,
+}
+
+// parsedBody caches pre-parsed representations of the request body to avoid
+// re-parsing JSON or form data on every condition evaluation.
+type parsedBody struct {
+	raw      []byte
+	jsonRoot interface{} // lazily parsed on first body_json access
+	jsonOK   bool        // true if jsonRoot was successfully parsed
+	jsonDone bool        // true if JSON parsing was attempted
+	formVals url.Values  // lazily parsed on first body_form access
+	formDone bool        // true if form parsing was attempted
+}
+
+// getJSON returns the pre-parsed JSON root, parsing lazily on first call.
+func (pb *parsedBody) getJSON() (interface{}, bool) {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil, false
+	}
+	if !pb.jsonDone {
+		pb.jsonDone = true
+		var root interface{}
+		if err := json.Unmarshal(pb.raw, &root); err == nil {
+			pb.jsonRoot = root
+			pb.jsonOK = true
+		}
+	}
+	return pb.jsonRoot, pb.jsonOK
+}
+
+// getForm returns the pre-parsed form values, parsing lazily on first call.
+func (pb *parsedBody) getForm() url.Values {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil
+	}
+	if !pb.formDone {
+		pb.formDone = true
+		vals, err := url.ParseQuery(string(pb.raw))
+		if err == nil {
+			pb.formVals = vals
+		}
+	}
+	return pb.formVals
 }
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
@@ -211,6 +265,11 @@ func (pe *PolicyEngine) Cleanup() error {
 	if pe.stopSweep != nil {
 		close(pe.stopSweep)
 	}
+	// Note: pe.rlState is intentionally NOT nilled here. ServeHTTP reads
+	// pe.rlState without holding mu (it's set once in Provision and never
+	// changed), so nilling it here would introduce a data race with
+	// in-flight requests. The GC will collect it after the handler is
+	// dereferenced by Caddy.
 	return nil
 }
 
@@ -222,7 +281,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	globalCfg := pe.rlGlobalConfig
 	pe.mu.RUnlock()
 
-	var bodyBuf []byte
+	var pb *parsedBody
 	var bodyRead bool
 
 	for _, cr := range rules {
@@ -238,16 +297,18 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// Lazy body read: only when a rule needs body fields and we haven't read yet.
 		if cr.needsBody && !bodyRead {
 			if r.Body != nil && r.Body != http.NoBody {
-				var err error
-				bodyBuf, err = readBody(r, pe.BodyMaxSize)
+				buf, err := readBody(r, pe.BodyMaxSize)
 				if err != nil {
 					pe.logger.Debug("failed to read request body", zap.Error(err))
 				}
+				pb = &parsedBody{raw: buf}
+			} else {
+				pb = &parsedBody{}
 			}
 			bodyRead = true
 		}
 
-		if !matchRule(cr, r, bodyBuf) {
+		if !matchRule(cr, r, pb) {
 			continue
 		}
 
@@ -278,10 +339,13 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 			}
 			// Also set response headers for downstream visibility (error pages, debugging).
-			w.Header().Set("X-Blocked-By", "policy-engine")
-			w.Header().Set("X-Blocked-Rule", cr.rule.Name)
-			if len(cr.rule.Tags) > 0 {
-				w.Header().Set("X-Policy-Tags", strings.Join(cr.rule.Tags, ","))
+			// Suppressed when HideHeaders is true to avoid exposing rule internals.
+			if !pe.HideHeaders {
+				w.Header().Set("X-Blocked-By", "policy-engine")
+				w.Header().Set("X-Blocked-Rule", cr.rule.Name)
+				if len(cr.rule.Tags) > 0 {
+					w.Header().Set("X-Policy-Tags", strings.Join(cr.rule.Tags, ","))
+				}
 			}
 			pe.logger.Info("policy block",
 				zap.String("rule_id", cr.rule.ID),
@@ -303,7 +367,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			}
 
 			// Resolve the rate limit key from the request.
-			key := resolveRateLimitKey(cr.rlConfig.Key, r, bodyBuf)
+			key := resolveRateLimitKey(cr.rlConfig.Key, r, pb)
 			if key == "" {
 				// Empty key (e.g., missing header) — skip this rule.
 				continue
@@ -314,8 +378,10 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 			if cr.rlConfig.Action == "log_only" {
 				// Monitor mode: set headers but don't block.
-				setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
-				w.Header().Set("X-RateLimit-Monitor", cr.rule.Name)
+				if !pe.HideHeaders {
+					setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
+					w.Header().Set("X-RateLimit-Monitor", cr.rule.Name)
+				}
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit_monitor")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -331,7 +397,15 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				if len(cr.rule.Tags) > 0 {
 					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 				}
-				setRateLimitHeaders(w, limit, 0, cr.rlConfig.parsedWindow, cr.rule.Name)
+				// Numeric rate limit headers (Limit, Remaining, Reset) and
+				// Retry-After are functional — clients need them for backoff.
+				// Only suppress the rule name in X-RateLimit-Policy when
+				// HideHeaders is true.
+				rlHeaderName := cr.rule.Name
+				if pe.HideHeaders {
+					rlHeaderName = ""
+				}
+				setRateLimitHeaders(w, limit, 0, cr.rlConfig.parsedWindow, rlHeaderName)
 
 				jitter := float64(0)
 				if globalCfg != nil {
@@ -352,7 +426,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			}
 
 			// Under limit — set informational headers and continue.
-			setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
+			if !pe.HideHeaders {
+				setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
+			}
 		}
 	}
 
@@ -389,7 +465,7 @@ func readBody(r *http.Request, maxSize int64) ([]byte, error) {
 
 // ─── Rule Matching ──────────────────────────────────────────────────
 
-func matchRule(cr compiledRule, r *http.Request, bodyBuf []byte) bool {
+func matchRule(cr compiledRule, r *http.Request, pb *parsedBody) bool {
 	if len(cr.conditions) == 0 {
 		// No conditions = matches all requests.
 		return true
@@ -397,7 +473,7 @@ func matchRule(cr compiledRule, r *http.Request, bodyBuf []byte) bool {
 
 	if cr.rule.GroupOp == "or" {
 		for _, cc := range cr.conditions {
-			if matchCondition(cc, r, bodyBuf) {
+			if matchCondition(cc, r, pb) {
 				return true
 			}
 		}
@@ -406,25 +482,25 @@ func matchRule(cr compiledRule, r *http.Request, bodyBuf []byte) bool {
 
 	// Default: AND — all conditions must match.
 	for _, cc := range cr.conditions {
-		if !matchCondition(cc, r, bodyBuf) {
+		if !matchCondition(cc, r, pb) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchCondition(cc compiledCondition, r *http.Request, bodyBuf []byte) bool {
+func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool {
 	// Special handling for "exists" operator on body_json — checks field presence,
 	// not string comparison.
 	if cc.isExists {
-		result := extractFieldExists(cc, bodyBuf)
+		result := extractFieldExists(cc, pb)
 		if cc.negate {
 			return !result
 		}
 		return result
 	}
 
-	target := extractField(cc, r, bodyBuf)
+	target := extractField(cc, r, pb)
 	result := evalOperator(cc, target)
 	if cc.negate {
 		return !result
@@ -433,11 +509,20 @@ func matchCondition(cc compiledCondition, r *http.Request, bodyBuf []byte) bool 
 }
 
 // extractField gets the request value for a condition's field.
-func extractField(cc compiledCondition, r *http.Request, bodyBuf []byte) string {
+//
+// Field semantics:
+//   - "path":     full request URI including query string (r.URL.RequestURI())
+//   - "uri_path": path component only, without query string (r.URL.Path)
+//
+// These are intentionally distinct — "path" matches the full URI for backward
+// compatibility with wafctl-generated rules that need query string matching.
+func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string {
 	switch cc.field {
 	case "ip":
 		return clientIP(r)
 	case "path":
+		// NOTE: "path" includes the query string (full request URI).
+		// Use "uri_path" for path-only matching without query string.
 		return r.URL.RequestURI()
 	case "uri_path":
 		return r.URL.Path
@@ -473,20 +558,33 @@ func extractField(cc compiledCondition, r *http.Request, bodyBuf []byte) string 
 		}
 		return ""
 	case "body":
-		return string(bodyBuf)
+		if pb != nil {
+			return string(pb.raw)
+		}
+		return ""
 	case "body_json":
-		if cc.name != "" && len(bodyBuf) > 0 {
-			val, ok := resolveJSONPath(bodyBuf, cc.name)
+		if pb == nil {
+			return ""
+		}
+		if cc.name != "" && len(pb.raw) > 0 {
+			root, ok := pb.getJSON()
 			if !ok {
+				return ""
+			}
+			val, found := resolveJSONPathParsed(root, cc.name)
+			if !found {
 				return ""
 			}
 			return jsonValueToString(val)
 		}
-		return string(bodyBuf)
+		return string(pb.raw)
 	case "body_form":
-		if cc.name != "" && len(bodyBuf) > 0 {
-			values, err := url.ParseQuery(string(bodyBuf))
-			if err != nil {
+		if pb == nil {
+			return ""
+		}
+		if cc.name != "" && len(pb.raw) > 0 {
+			values := pb.getForm()
+			if values == nil {
 				return ""
 			}
 			if fv, ok := values[cc.name]; ok && len(fv) > 0 {
@@ -500,11 +598,15 @@ func extractField(cc compiledCondition, r *http.Request, bodyBuf []byte) string 
 }
 
 // extractFieldExists checks whether a body_json field exists (for the "exists" operator).
-func extractFieldExists(cc compiledCondition, bodyBuf []byte) bool {
-	if cc.field != "body_json" || cc.name == "" || len(bodyBuf) == 0 {
+func extractFieldExists(cc compiledCondition, pb *parsedBody) bool {
+	if cc.field != "body_json" || cc.name == "" || pb == nil || len(pb.raw) == 0 {
 		return false
 	}
-	_, found := resolveJSONPath(bodyBuf, cc.name)
+	root, ok := pb.getJSON()
+	if !ok {
+		return false
+	}
+	_, found := resolveJSONPathParsed(root, cc.name)
 	return found
 }
 
@@ -515,7 +617,11 @@ func evalOperator(cc compiledCondition, target string) bool {
 	case "eq":
 		return target == cc.exactVal
 	case "neq":
-		// neq is handled via negate flag; eval as eq.
+		// neq returns the *equality* result here; the negate flag on the
+		// compiledCondition (set during compilation for neq/not_ip_match/
+		// not_in_list) causes matchCondition to invert this result.
+		// This two-step pattern keeps evalOperator focused on positive
+		// matching while matchCondition handles all negation uniformly.
 		return target == cc.exactVal
 	case "contains":
 		return strings.Contains(target, cc.contains)
@@ -618,12 +724,19 @@ func compileIPList(items []string) (map[[16]byte]bool, []net.IPNet, error) {
 
 // resolveJSONPath walks a dot-path like ".user.roles.0" through parsed JSON.
 // Leading dot is optional. Returns (value, found).
+// This variant parses from raw bytes — use resolveJSONPathParsed when
+// you have a pre-parsed root (to avoid re-parsing per condition).
 func resolveJSONPath(body []byte, dotPath string) (interface{}, bool) {
 	var root interface{}
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
+	return resolveJSONPathParsed(root, dotPath)
+}
 
+// resolveJSONPathParsed walks a dot-path through an already-parsed JSON value.
+// Leading dot is optional. Returns (value, found).
+func resolveJSONPathParsed(root interface{}, dotPath string) (interface{}, bool) {
 	dotPath = strings.TrimPrefix(dotPath, ".")
 	if dotPath == "" {
 		return root, true
@@ -712,8 +825,22 @@ func compileRules(rules []PolicyRule) ([]compiledRule, error) {
 	return compiled, nil
 }
 
+// validRuleTypes is the set of recognized rule types.
+var validRuleTypes = map[string]bool{
+	"allow":      true,
+	"block":      true,
+	"honeypot":   true,
+	"rate_limit": true,
+}
+
 func compileRule(rule PolicyRule) (compiledRule, error) {
 	cr := compiledRule{rule: rule}
+
+	// Validate rule type early — unknown types would silently match
+	// conditions but take no action in ServeHTTP.
+	if !validRuleTypes[rule.Type] {
+		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, or rate_limit)", rule.Type)
+	}
 
 	for _, cond := range rule.Conditions {
 		cc, err := compileCondition(cond)
@@ -783,6 +910,9 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		cc.suffix = value
 
 	case "regex":
+		if len(value) > maxRegexLen {
+			return cc, fmt.Errorf("regex pattern too long (%d bytes, max %d)", len(value), maxRegexLen)
+		}
 		re, err := regexp.Compile(value)
 		if err != nil {
 			return cc, fmt.Errorf("invalid regex %q: %w", value, err)
@@ -916,7 +1046,20 @@ func (pe *PolicyEngine) checkReload() {
 }
 
 func (pe *PolicyEngine) loadFromFile() error {
-	data, err := os.ReadFile(pe.RulesFile)
+	// Open and stat the same file descriptor to avoid TOCTOU races
+	// (the file could be modified between a separate ReadFile and Stat).
+	f, err := os.Open(pe.RulesFile)
+	if err != nil {
+		return fmt.Errorf("opening rules file: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat rules file: %w", err)
+	}
+
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return fmt.Errorf("reading rules file: %w", err)
 	}
@@ -934,19 +1077,27 @@ func (pe *PolicyEngine) loadFromFile() error {
 	// Parse global rate limit config.
 	globalCfg := compileRLGlobalConfig(file.RateLimitConfig)
 
-	info, _ := os.Stat(pe.RulesFile)
+	// Check if sweep interval changed (need to restart sweep goroutine).
+	oldSweepInterval := pe.sweepInterval()
 
 	pe.mu.Lock()
 	pe.rules = compiled
 	pe.rlGlobalConfig = globalCfg
-	if info != nil {
-		pe.lastMod = info.ModTime()
-	}
+	pe.lastMod = info.ModTime()
 	pe.mu.Unlock()
 
 	// Update rate limit zones — preserves counters for unchanged rules.
 	if pe.rlState != nil {
 		pe.rlState.updateZones(compiled)
+	}
+
+	// Restart sweep goroutine if the sweep interval changed.
+	newSweepInterval := pe.sweepInterval()
+	if newSweepInterval != oldSweepInterval {
+		pe.logger.Info("sweep interval changed, restarting sweep goroutine",
+			zap.Duration("old", oldSweepInterval),
+			zap.Duration("new", newSweepInterval))
+		pe.restartSweep()
 	}
 
 	enabledCount := 0
@@ -1000,6 +1151,9 @@ func (pe *PolicyEngine) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid body_max_size: %v", err)
 			}
 			pe.BodyMaxSize = size
+
+		case "hide_headers":
+			pe.HideHeaders = true
 
 		case "rule":
 			rule, err := parseInlineRule(d)

@@ -82,6 +82,14 @@ func writeTempRulesFile(t *testing.T, rules []PolicyRule) string {
 	return path
 }
 
+// pbFrom creates a parsedBody from raw bytes for testing.
+func pbFrom(data []byte) *parsedBody {
+	if data == nil {
+		return nil
+	}
+	return &parsedBody{raw: data}
+}
+
 // ─── Condition Matching: eq / neq ───────────────────────────────────
 
 func TestCondition_Eq_Match(t *testing.T) {
@@ -492,10 +500,10 @@ func TestField_Body_Contains(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`some malicious payload here`)
-	if !matchCondition(cc, r, body) {
+	if !matchCondition(cc, r, pbFrom(body)) {
 		t.Error("body contains should match")
 	}
-	if matchCondition(cc, r, []byte(`clean payload`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`clean payload`))) {
 		t.Error("body contains should not match clean payload")
 	}
 	if matchCondition(cc, r, nil) {
@@ -509,10 +517,10 @@ func TestField_Body_Regex(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`query: DROP TABLE users`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`query: DROP TABLE users`))) {
 		t.Error("body regex should match SQL drop")
 	}
-	if matchCondition(cc, r, []byte(`normal query`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`normal query`))) {
 		t.Error("body regex should not match normal content")
 	}
 }
@@ -524,11 +532,11 @@ func TestField_BodyJSON_DotPath(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`{"user":{"role":"admin","name":"test"}}`)
-	if !matchCondition(cc, r, body) {
+	if !matchCondition(cc, r, pbFrom(body)) {
 		t.Error("body_json should match .user.role=admin")
 	}
 	body2 := []byte(`{"user":{"role":"viewer","name":"test"}}`)
-	if matchCondition(cc, r, body2) {
+	if matchCondition(cc, r, pbFrom(body2)) {
 		t.Error("body_json should not match .user.role=viewer")
 	}
 }
@@ -540,7 +548,7 @@ func TestField_BodyJSON_NestedArray(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`{"items":[{"type":"secret"},{"type":"public"}]}`)
-	if !matchCondition(cc, r, body) {
+	if !matchCondition(cc, r, pbFrom(body)) {
 		t.Error("body_json should match array index .items.0.type")
 	}
 }
@@ -551,10 +559,10 @@ func TestField_BodyJSON_NumericValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"count":42}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"count":42}`))) {
 		t.Error("body_json should match numeric value 42")
 	}
-	if matchCondition(cc, r, []byte(`{"count":99}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"count":99}`))) {
 		t.Error("body_json should not match numeric value 99")
 	}
 }
@@ -565,10 +573,10 @@ func TestField_BodyJSON_BoolValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"active":true}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"active":true}`))) {
 		t.Error("body_json should match boolean true")
 	}
-	if matchCondition(cc, r, []byte(`{"active":false}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"active":false}`))) {
 		t.Error("body_json should not match boolean false")
 	}
 }
@@ -579,7 +587,7 @@ func TestField_BodyJSON_Contains(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"message":"fatal error occurred"}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"message":"fatal error occurred"}`))) {
 		t.Error("body_json contains should match substring")
 	}
 }
@@ -590,10 +598,10 @@ func TestField_BodyJSON_Regex(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"token":"Bearer abc123"}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"Bearer abc123"}`))) {
 		t.Error("body_json regex should match")
 	}
-	if matchCondition(cc, r, []byte(`{"token":"Basic abc123"}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"token":"Basic abc123"}`))) {
 		t.Error("body_json regex should not match Basic")
 	}
 }
@@ -604,10 +612,10 @@ func TestField_BodyJSON_Exists(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"token":"abc"}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"abc"}`))) {
 		t.Error("body_json exists should match when field present")
 	}
-	if matchCondition(cc, r, []byte(`{"other":"abc"}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"other":"abc"}`))) {
 		t.Error("body_json exists should not match when field absent")
 	}
 	if matchCondition(cc, r, nil) {
@@ -621,10 +629,10 @@ func TestField_BodyJSON_Exists_Nested(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte(`{"data":{"secret":"hidden"}}`)) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"data":{"secret":"hidden"}}`))) {
 		t.Error("body_json exists should match nested field")
 	}
-	if matchCondition(cc, r, []byte(`{"data":{"public":"visible"}}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"data":{"public":"visible"}}`))) {
 		t.Error("body_json exists should not match absent nested field")
 	}
 }
@@ -635,7 +643,7 @@ func TestField_BodyJSON_MissingPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, []byte(`{"other":"value"}`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"other":"value"}`))) {
 		t.Error("body_json should not match when path doesn't exist")
 	}
 }
@@ -646,7 +654,7 @@ func TestField_BodyJSON_InvalidJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, []byte(`not json at all`)) {
+	if matchCondition(cc, r, pbFrom([]byte(`not json at all`))) {
 		t.Error("body_json should not match invalid JSON")
 	}
 }
@@ -658,11 +666,11 @@ func TestField_BodyForm_Eq(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte("action=login&user=test")
-	if !matchCondition(cc, r, body) {
+	if !matchCondition(cc, r, pbFrom(body)) {
 		t.Error("body_form should match action=login")
 	}
 	body2 := []byte("action=logout&user=test")
-	if matchCondition(cc, r, body2) {
+	if matchCondition(cc, r, pbFrom(body2)) {
 		t.Error("body_form should not match action=logout")
 	}
 }
@@ -673,7 +681,7 @@ func TestField_BodyForm_Contains(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, []byte("query=SELECT+*+FROM+users")) {
+	if !matchCondition(cc, r, pbFrom([]byte("query=SELECT+*+FROM+users"))) {
 		t.Error("body_form contains should match")
 	}
 }
@@ -685,7 +693,7 @@ func TestField_BodyForm_URLEncoding(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	// url.ParseQuery decodes %40 → @
-	if !matchCondition(cc, r, []byte("email=user%40test.com")) {
+	if !matchCondition(cc, r, pbFrom([]byte("email=user%40test.com"))) {
 		t.Error("body_form should handle URL-encoded values")
 	}
 }
@@ -696,7 +704,7 @@ func TestField_BodyForm_MissingField(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, []byte("user=test")) {
+	if matchCondition(cc, r, pbFrom([]byte("user=test"))) {
 		t.Error("body_form should not match when field is missing")
 	}
 }
@@ -1708,12 +1716,12 @@ func TestCondition_InList_InvalidIP(t *testing.T) {
 func generateTestIPs(n int) []string {
 	ips := make([]string, n)
 	for i := 0; i < n; i++ {
-		a := (i / 65536) % 256
-		b := (i / 256) % 256
-		c := (i % 256) + 1
-		if c > 254 {
-			c = 254
-		}
+		// Generate unique IPs in the 10.x.x.x range using all 3 octets.
+		// Each octet uses a different portion of the index to ensure uniqueness
+		// for up to 256*256*254 (~16.7M) IPs. Octet c is 1-254 (skip 0 and 255).
+		a := (i / (254 * 256)) % 256
+		b := (i / 254) % 256
+		c := (i % 254) + 1
 		ips[i] = fmt.Sprintf("10.%d.%d.%d", a, b, c)
 	}
 	return ips
@@ -1938,5 +1946,197 @@ func TestValidate_WithInlineRules(t *testing.T) {
 	}
 	if err := pe.Validate(); err != nil {
 		t.Errorf("unexpected validation error: %v", err)
+	}
+}
+
+// ─── Regex Length Limit (#5) ────────────────────────────────────────
+
+func TestCompile_RegexTooLong(t *testing.T) {
+	longPattern := strings.Repeat("a", maxRegexLen+1)
+	_, err := compileCondition(PolicyCondition{Field: "path", Operator: "regex", Value: longPattern})
+	if err == nil {
+		t.Error("expected error for regex exceeding max length")
+	}
+	if !strings.Contains(err.Error(), "regex pattern too long") {
+		t.Errorf("expected 'regex pattern too long' error, got: %v", err)
+	}
+}
+
+func TestCompile_RegexAtLimit(t *testing.T) {
+	// Exactly at the limit should still compile.
+	pattern := strings.Repeat("a", maxRegexLen)
+	_, err := compileCondition(PolicyCondition{Field: "path", Operator: "regex", Value: pattern})
+	if err != nil {
+		t.Errorf("regex at exactly max length should compile, got: %v", err)
+	}
+}
+
+// ─── HideHeaders (#7) ──────────────────────────────────────────────
+
+func TestHideHeaders_Block(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "b1", Name: "Block Admin", Type: "block", Enabled: true,
+				Priority: 200,
+				Tags:     []string{"test-tag"},
+				Conditions: []PolicyCondition{
+					{Field: "uri_path", Operator: "eq", Value: "/admin"},
+				},
+			},
+		},
+		HideHeaders: true,
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for block action")
+	}
+	// Headers should NOT be set when HideHeaders is true.
+	if w.Header().Get("X-Blocked-By") != "" {
+		t.Error("X-Blocked-By should be suppressed when HideHeaders=true")
+	}
+	if w.Header().Get("X-Blocked-Rule") != "" {
+		t.Error("X-Blocked-Rule should be suppressed when HideHeaders=true")
+	}
+	if w.Header().Get("X-Policy-Tags") != "" {
+		t.Error("X-Policy-Tags should be suppressed when HideHeaders=true")
+	}
+	// Caddy vars should still be set.
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "block" {
+		t.Errorf("policy_engine.action should still be set, got %q", action)
+	}
+	tags, _ := caddyhttp.GetVar(r.Context(), "policy_engine.tags").(string)
+	if tags != "test-tag" {
+		t.Errorf("policy_engine.tags should still be set, got %q", tags)
+	}
+}
+
+func TestHideHeaders_Disabled(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "b1", Name: "Block Admin", Type: "block", Enabled: true,
+				Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "uri_path", Operator: "eq", Value: "/admin"},
+				},
+			},
+		},
+		HideHeaders: false,
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	err := pe.ServeHTTP(w, r, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected error for block action")
+	}
+	// Headers should be set when HideHeaders is false.
+	if w.Header().Get("X-Blocked-By") != "policy-engine" {
+		t.Error("X-Blocked-By should be present when HideHeaders=false")
+	}
+}
+
+// ─── Rule Type Validation (#11) ─────────────────────────────────────
+
+func TestCompile_InvalidRuleType(t *testing.T) {
+	_, err := compileRule(PolicyRule{
+		ID: "test", Type: "unknown_type", Enabled: true,
+		Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/test"}},
+	})
+	if err == nil {
+		t.Error("expected error for unsupported rule type")
+	}
+	if !strings.Contains(err.Error(), "unsupported rule type") {
+		t.Errorf("expected 'unsupported rule type' error, got: %v", err)
+	}
+}
+
+func TestCompile_ValidRuleTypes(t *testing.T) {
+	for _, ruleType := range []string{"allow", "block", "honeypot"} {
+		_, err := compileRule(PolicyRule{
+			ID: "test", Type: ruleType, Enabled: true,
+			Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/test"}},
+		})
+		if err != nil {
+			t.Errorf("rule type %q should compile, got: %v", ruleType, err)
+		}
+	}
+}
+
+// ─── parsedBody Caching (#2/#8) ─────────────────────────────────────
+
+func TestParsedBody_JSONCaching(t *testing.T) {
+	raw := []byte(`{"user":{"role":"admin"}}`)
+	pb := &parsedBody{raw: raw}
+
+	// First call parses.
+	root1, ok1 := pb.getJSON()
+	if !ok1 || root1 == nil {
+		t.Fatal("first getJSON should succeed")
+	}
+
+	// Second call returns cached result without re-parsing.
+	root2, ok2 := pb.getJSON()
+	if !ok2 || root2 == nil {
+		t.Fatal("second getJSON should succeed")
+	}
+	if !pb.jsonDone {
+		t.Error("jsonDone should be true after getJSON")
+	}
+}
+
+func TestParsedBody_FormCaching(t *testing.T) {
+	raw := []byte("action=login&user=admin")
+	pb := &parsedBody{raw: raw}
+
+	vals1 := pb.getForm()
+	if vals1 == nil || vals1.Get("action") != "login" {
+		t.Fatal("first getForm should parse correctly")
+	}
+
+	vals2 := pb.getForm()
+	if vals2 == nil || vals2.Get("user") != "admin" {
+		t.Fatal("second getForm should return cached result")
+	}
+	if !pb.formDone {
+		t.Error("formDone should be true after getForm")
+	}
+}
+
+func TestParsedBody_InvalidJSON(t *testing.T) {
+	pb := &parsedBody{raw: []byte(`not json`)}
+	_, ok := pb.getJSON()
+	if ok {
+		t.Error("getJSON should fail for invalid JSON")
+	}
+	if !pb.jsonDone {
+		t.Error("jsonDone should be true even on failure (don't retry)")
+	}
+}
+
+func TestParsedBody_NilAndEmpty(t *testing.T) {
+	// nil parsedBody.
+	var pb *parsedBody
+	_, ok := pb.getJSON()
+	if ok {
+		t.Error("nil parsedBody getJSON should return false")
+	}
+	vals := pb.getForm()
+	if vals != nil {
+		t.Error("nil parsedBody getForm should return nil")
+	}
+
+	// Empty raw.
+	pb2 := &parsedBody{raw: []byte{}}
+	_, ok2 := pb2.getJSON()
+	if ok2 {
+		t.Error("empty raw getJSON should return false")
 	}
 }
