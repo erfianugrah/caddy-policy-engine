@@ -78,6 +78,7 @@ type PolicyEngine struct {
 	stopPoll       chan struct{}
 	rlState        *rateLimitState
 	rlGlobalConfig *parsedRLGlobalConfig
+	respHeaders    *compiledResponseHeaders // CSP + security headers
 	stopSweep      chan struct{}
 }
 
@@ -85,6 +86,7 @@ type PolicyEngine struct {
 type PolicyRulesFile struct {
 	Rules           []PolicyRule           `json:"rules"`
 	RateLimitConfig *RateLimitGlobalConfig `json:"rate_limit_config,omitempty"`
+	ResponseHeaders *ResponseHeaderConfig  `json:"response_headers,omitempty"`
 	Generated       string                 `json:"generated"`
 	Version         int                    `json:"version"`
 }
@@ -279,6 +281,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	pe.mu.RLock()
 	rules := pe.rules
 	globalCfg := pe.rlGlobalConfig
+	respHeaders := pe.respHeaders
 	pe.mu.RUnlock()
 
 	// ── 3-pass evaluation ──────────────────────────────────────────
@@ -459,6 +462,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			}
 		}
 	}
+
+	// Apply response headers (CSP + security) before passing to next handler.
+	// This wraps the ResponseWriter when "default" mode CSP or header removal
+	// requires intercepting WriteHeader(). Must happen after rule evaluation
+	// (block/rate_limit return early above) and before next.ServeHTTP().
+	w = applyResponseHeaders(w, r.Host, respHeaders)
 
 	// Pass through to next handler. If allowMatched is true, the Caddyfile
 	// @needs_waf matcher will see policy_engine.action=allow and skip WAF.
@@ -1117,12 +1126,16 @@ func (pe *PolicyEngine) loadFromFile() error {
 	// Parse global rate limit config.
 	globalCfg := compileRLGlobalConfig(file.RateLimitConfig)
 
+	// Compile response headers (CSP + security) for O(1) per-request lookup.
+	respHeaders := compileResponseHeaders(file.ResponseHeaders)
+
 	// Check if sweep interval changed (need to restart sweep goroutine).
 	oldSweepInterval := pe.sweepInterval()
 
 	pe.mu.Lock()
 	pe.rules = compiled
 	pe.rlGlobalConfig = globalCfg
+	pe.respHeaders = respHeaders
 	pe.lastMod = info.ModTime()
 	pe.mu.Unlock()
 
@@ -1150,10 +1163,14 @@ func (pe *PolicyEngine) loadFromFile() error {
 			rlCount++
 		}
 	}
+	hasCSP := respHeaders != nil && respHeaders.csp != nil && respHeaders.csp.enabled
+	hasSec := respHeaders != nil && respHeaders.security != nil && respHeaders.security.enabled
 	pe.logger.Info("rules loaded",
 		zap.Int("total", len(compiled)),
 		zap.Int("enabled", enabledCount),
 		zap.Int("rate_limit_zones", rlCount),
+		zap.Bool("csp_enabled", hasCSP),
+		zap.Bool("security_headers_enabled", hasSec),
 		zap.String("generated", file.Generated))
 
 	return nil
