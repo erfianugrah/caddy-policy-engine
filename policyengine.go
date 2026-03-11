@@ -189,6 +189,11 @@ type compiledCondition struct {
 	negate     bool
 	isExists   bool            // true for "exists" operator (field presence check)
 	transforms []transformFunc // ordered transform chain applied before operator evaluation
+	acMatcher  *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
+	isMulti    bool            // true for aggregate fields (all_args, all_headers, etc.)
+	isCount    bool            // true for count: pseudo-field
+	countField string          // the underlying field for count: (e.g., "all_args")
+	numericVal float64         // pre-parsed numeric value for gt/ge/lt/le operators
 }
 
 // bodyFields lists condition fields that require reading the request body.
@@ -197,6 +202,39 @@ var bodyFields = map[string]bool{
 	"body_json": true,
 	"body_form": true,
 }
+
+// needsBodyField returns true if a field requires reading the request body.
+// This covers direct body fields AND aggregate fields that include POST params.
+func needsBodyField(field string) bool {
+	switch field {
+	case "all_args", "all_args_values", "all_args_names":
+		return true // these include POST form params from the body
+	}
+	if strings.HasPrefix(field, countPrefix) {
+		underlying := field[len(countPrefix):]
+		switch underlying {
+		case "all_args", "all_args_values", "all_args_names":
+			return true
+		}
+	}
+	return false
+}
+
+// multiFields lists aggregate fields that iterate over multiple values.
+// When a condition uses one of these, matchCondition iterates all values
+// and returns true if ANY value matches (OR semantics).
+var multiFields = map[string]bool{
+	"all_args":          true,
+	"all_args_values":   true,
+	"all_args_names":    true,
+	"all_headers":       true,
+	"all_headers_names": true,
+	"all_cookies":       true,
+	"all_cookies_names": true,
+}
+
+// countPrefix is the prefix for count pseudo-fields (e.g., "count:all_args").
+const countPrefix = "count:"
 
 // parsedBody caches pre-parsed representations of the request body to avoid
 // re-parsing JSON or form data on every condition evaluation.
@@ -638,6 +676,39 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 		return result
 	}
 
+	// count: pseudo-field — count values in a collection, compare numerically.
+	if cc.isCount {
+		count := countMultiField(cc.countField, r, pb)
+		target := strconv.Itoa(count)
+		result := evalOperator(cc, target)
+		if cc.negate {
+			return !result
+		}
+		return result
+	}
+
+	// Multi-value fields (all_args, all_headers, all_cookies, etc.) —
+	// iterate all values, return true if ANY matches (OR semantics).
+	if cc.isMulti {
+		values := extractMultiField(cc, r, pb)
+		for _, val := range values {
+			if len(cc.transforms) > 0 {
+				val = applyTransforms(val, cc.transforms)
+			}
+			if evalOperator(cc, val) {
+				if cc.negate {
+					return false // negate + any match = fail (NOT-ANY = ALL-NOT)
+				}
+				return true
+			}
+		}
+		// No value matched.
+		if cc.negate {
+			return true // negate + no match = pass (NOT-ANY when none matched)
+		}
+		return false
+	}
+
 	target := extractField(cc, r, pb)
 
 	// Apply transforms before operator evaluation.
@@ -754,6 +825,95 @@ func extractFieldExists(cc compiledCondition, pb *parsedBody) bool {
 	return found
 }
 
+// extractMultiField returns all values for an aggregate field.
+// Used by matchCondition when cc.isMulti is true.
+func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []string {
+	switch cc.field {
+	case "all_args":
+		// All query + POST params: names AND values (matches CRS ARGS|ARGS_NAMES)
+		var vals []string
+		for k, vs := range r.URL.Query() {
+			vals = append(vals, k)
+			vals = append(vals, vs...)
+		}
+		if pb != nil {
+			for k, vs := range pb.getForm() {
+				vals = append(vals, k)
+				vals = append(vals, vs...)
+			}
+		}
+		return vals
+
+	case "all_args_values":
+		// All query + POST param values only (matches CRS ARGS)
+		var vals []string
+		for _, vs := range r.URL.Query() {
+			vals = append(vals, vs...)
+		}
+		if pb != nil {
+			for _, vs := range pb.getForm() {
+				vals = append(vals, vs...)
+			}
+		}
+		return vals
+
+	case "all_args_names":
+		// All query + POST param names (matches CRS ARGS_NAMES)
+		var vals []string
+		for k := range r.URL.Query() {
+			vals = append(vals, k)
+		}
+		if pb != nil {
+			for k := range pb.getForm() {
+				vals = append(vals, k)
+			}
+		}
+		return vals
+
+	case "all_headers":
+		// All request header values (matches CRS REQUEST_HEADERS)
+		var vals []string
+		for _, vs := range r.Header {
+			vals = append(vals, vs...)
+		}
+		return vals
+
+	case "all_headers_names":
+		// All request header names (matches CRS REQUEST_HEADERS_NAMES)
+		var vals []string
+		for k := range r.Header {
+			vals = append(vals, k)
+		}
+		return vals
+
+	case "all_cookies":
+		// All cookie values (matches CRS REQUEST_COOKIES)
+		var vals []string
+		for _, c := range r.Cookies() {
+			vals = append(vals, c.Value)
+		}
+		return vals
+
+	case "all_cookies_names":
+		// All cookie names (matches CRS REQUEST_COOKIES_NAMES)
+		var vals []string
+		for _, c := range r.Cookies() {
+			vals = append(vals, c.Name)
+		}
+		return vals
+
+	default:
+		return nil
+	}
+}
+
+// countMultiField returns the count of values for a given field.
+// Used by the count: pseudo-field.
+func countMultiField(field string, r *http.Request, pb *parsedBody) int {
+	cc := compiledCondition{field: field}
+	return len(extractMultiField(cc, r, pb))
+}
+
 // evalOperator evaluates the operator against the extracted target value.
 // The negate flag is handled by the caller (matchCondition).
 func evalOperator(cc compiledCondition, target string) bool {
@@ -791,6 +951,35 @@ func evalOperator(cc compiledCondition, target string) bool {
 			return evalIPMatch(cc, target)
 		}
 		return cc.stringSet[target]
+	case "phrase_match":
+		if cc.acMatcher != nil {
+			return cc.acMatcher.ContainsAny(target)
+		}
+		return false
+	case "gt":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false
+		}
+		return v > cc.numericVal
+	case "ge":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false
+		}
+		return v >= cc.numericVal
+	case "lt":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false
+		}
+		return v < cc.numericVal
+	case "le":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false
+		}
+		return v <= cc.numericVal
 	default:
 		return false
 	}
@@ -1013,7 +1202,7 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 			return cr, fmt.Errorf("condition %s %s: %w", cond.Field, cond.Operator, err)
 		}
 		cr.conditions = append(cr.conditions, cc)
-		if bodyFields[cond.Field] {
+		if bodyFields[cond.Field] || needsBodyField(cond.Field) {
 			cr.needsBody = true
 		}
 	}
@@ -1207,8 +1396,40 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		// No value comparison needed.
 		cc.isExists = true
 
+	case "phrase_match":
+		// Aho-Corasick multi-pattern substring search.
+		// Patterns come from ListItems (resolved by wafctl from managed lists or inline).
+		if len(cond.ListItems) == 0 {
+			return cc, fmt.Errorf("phrase_match requires list_items (pattern list)")
+		}
+		cc.acMatcher = CompileAC(cond.ListItems)
+
+	case "gt", "ge", "lt", "le":
+		// Numeric comparison operators.
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return cc, fmt.Errorf("numeric operator %q requires a numeric value, got %q: %w", cond.Operator, value, err)
+		}
+		cc.numericVal = v
+
 	default:
 		return cc, fmt.Errorf("unsupported operator %q", cond.Operator)
+	}
+
+	// Detect aggregate fields — set isMulti for multi-value iteration in matchCondition.
+	if multiFields[cc.field] {
+		cc.isMulti = true
+	}
+
+	// Detect count: pseudo-field — "count:all_args", "count:all_headers", etc.
+	if strings.HasPrefix(cond.Field, countPrefix) {
+		underlying := cond.Field[len(countPrefix):]
+		if !multiFields[underlying] {
+			return cc, fmt.Errorf("count: requires an aggregate field, got %q (valid: all_args, all_args_values, all_args_names, all_headers, all_headers_names, all_cookies, all_cookies_names)", underlying)
+		}
+		cc.isCount = true
+		cc.countField = underlying
+		cc.isMulti = false // count produces a single value, not multi-iteration
 	}
 
 	// Resolve transform chain.

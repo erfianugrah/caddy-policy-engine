@@ -3062,3 +3062,621 @@ func TestDetect_HotReload_WafConfig(t *testing.T) {
 		t.Errorf("expected action=detect_block, got %q", action)
 	}
 }
+
+// ─── v0.9.0: Multi-Variable Inspection ────────────────────────────────
+
+func TestExtractMultiField_AllArgs(t *testing.T) {
+	r := makeRequest("GET", "/search?q=hello&sort=asc&q=world", "")
+	cc := compiledCondition{field: "all_args"}
+	vals := extractMultiField(cc, r, nil)
+
+	// Should contain param names AND values.
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	for _, want := range []string{"q", "sort", "hello", "asc", "world"} {
+		if !have[want] {
+			t.Errorf("all_args missing %q, got %v", want, vals)
+		}
+	}
+}
+
+func TestExtractMultiField_AllArgsValues(t *testing.T) {
+	r := makeRequest("GET", "/search?q=hello&sort=asc", "")
+	cc := compiledCondition{field: "all_args_values"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	// Should contain values only, not names.
+	if have["q"] || have["sort"] {
+		t.Errorf("all_args_values should not contain param names, got %v", vals)
+	}
+	for _, want := range []string{"hello", "asc"} {
+		if !have[want] {
+			t.Errorf("all_args_values missing %q", want)
+		}
+	}
+}
+
+func TestExtractMultiField_AllArgsNames(t *testing.T) {
+	r := makeRequest("GET", "/search?q=hello&sort=asc", "")
+	cc := compiledCondition{field: "all_args_names"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	for _, want := range []string{"q", "sort"} {
+		if !have[want] {
+			t.Errorf("all_args_names missing %q", want)
+		}
+	}
+	// Should not contain values.
+	if have["hello"] || have["asc"] {
+		t.Errorf("all_args_names should not contain values, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_AllHeaders(t *testing.T) {
+	r := makeRequestWithHeaders("GET", "/", "", map[string]string{
+		"X-Custom":     "foo",
+		"X-Another":    "bar",
+		"Content-Type": "text/html",
+	})
+	cc := compiledCondition{field: "all_headers"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	if !have["foo"] || !have["bar"] || !have["text/html"] {
+		t.Errorf("all_headers missing expected values, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_AllHeadersNames(t *testing.T) {
+	r := makeRequestWithHeaders("GET", "/", "", map[string]string{
+		"X-Custom":  "foo",
+		"X-Another": "bar",
+	})
+	cc := compiledCondition{field: "all_headers_names"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	// Go canonicalizes header names.
+	if !have["X-Custom"] || !have["X-Another"] {
+		t.Errorf("all_headers_names missing expected names, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_AllCookies(t *testing.T) {
+	r := makeRequest("GET", "/", "")
+	r.Header.Set("Cookie", "session=abc123; pref=dark")
+	cc := compiledCondition{field: "all_cookies"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	if !have["abc123"] || !have["dark"] {
+		t.Errorf("all_cookies missing expected values, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_AllCookiesNames(t *testing.T) {
+	r := makeRequest("GET", "/", "")
+	r.Header.Set("Cookie", "session=abc123; pref=dark")
+	cc := compiledCondition{field: "all_cookies_names"}
+	vals := extractMultiField(cc, r, nil)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	if !have["session"] || !have["pref"] {
+		t.Errorf("all_cookies_names missing expected names, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_WithFormBody(t *testing.T) {
+	r := httptest.NewRequest("POST", "/login?redirect=/home", strings.NewReader("username=admin&password=secret"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "all_args"}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+	// Should include both query params AND form params (names + values).
+	for _, want := range []string{"redirect", "/home", "username", "admin", "password", "secret"} {
+		if !have[want] {
+			t.Errorf("all_args (with body) missing %q, got %v", want, vals)
+		}
+	}
+}
+
+// ─── v0.9.0: Multi-Value Matching (matchCondition with isMulti) ────
+
+func TestMatchCondition_MultiField_Contains(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "all_args",
+		Operator: "contains",
+		Value:    "select",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cc.isMulti {
+		t.Fatal("all_args should set isMulti")
+	}
+
+	// Request with SQL in a query param value.
+	r := makeRequest("GET", "/search?q=1+union+select+1", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("should match: 'select' is in query param value")
+	}
+
+	// Clean request.
+	r2 := makeRequest("GET", "/search?q=hello+world", "")
+	if matchCondition(cc, r2, nil) {
+		t.Error("should not match: no 'select' in any arg")
+	}
+}
+
+func TestMatchCondition_MultiField_Negate(t *testing.T) {
+	// neq on multi-field: negate + any match = false (NOT-ANY = ALL-NOT).
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "all_headers",
+		Operator: "neq",
+		Value:    "bad-value",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One header has "bad-value" — neq should return false.
+	r := makeRequestWithHeaders("GET", "/", "", map[string]string{
+		"X-Test": "bad-value",
+	})
+	if matchCondition(cc, r, nil) {
+		t.Error("neq on multi-field should return false when any value equals the target")
+	}
+
+	// No header has "bad-value" — neq should return true.
+	r2 := makeRequestWithHeaders("GET", "/", "", map[string]string{
+		"X-Test": "good-value",
+	})
+	if !matchCondition(cc, r2, nil) {
+		t.Error("neq on multi-field should return true when no value equals the target")
+	}
+}
+
+func TestMatchCondition_MultiField_WithTransforms(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "all_args_values",
+		Operator:   "contains",
+		Value:      "select",
+		Transforms: []string{"lowercase", "urlDecode"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// URL-encoded uppercase.
+	r := makeRequest("GET", "/search?q=%53ELECT", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("transforms should decode %53 → S, then lowercase → select")
+	}
+}
+
+// ─── v0.9.0: phrase_match Operator ─────────────────────────────────
+
+func TestCompileCondition_PhraseMatch(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:     "all_args",
+		Operator:  "phrase_match",
+		ListItems: []string{"select", "union", "insert", "drop"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.acMatcher == nil {
+		t.Fatal("phrase_match should compile an AC matcher")
+	}
+	if !cc.isMulti {
+		t.Fatal("all_args should set isMulti")
+	}
+}
+
+func TestCompileCondition_PhraseMatch_NoItems(t *testing.T) {
+	_, err := compileCondition(PolicyCondition{
+		Field:    "path",
+		Operator: "phrase_match",
+	})
+	if err == nil {
+		t.Fatal("phrase_match without list_items should fail")
+	}
+}
+
+func TestMatchCondition_PhraseMatch_SingleField(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:     "query",
+		Operator:  "phrase_match",
+		ListItems: []string{"select", "union", "drop", "insert"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := makeRequest("GET", "/search?q=1+union+select+1,2,3", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("phrase_match should find 'union' or 'select' in query string")
+	}
+
+	r2 := makeRequest("GET", "/search?q=hello+world", "")
+	if matchCondition(cc, r2, nil) {
+		t.Error("phrase_match should not match clean query string")
+	}
+}
+
+func TestMatchCondition_PhraseMatch_MultiField(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:     "all_args",
+		Operator:  "phrase_match",
+		ListItems: []string{"<script", "javascript:", "onerror="},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := makeRequest("GET", "/page?name=normal&bio=<script>alert(1)</script>", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("phrase_match should find '<script' in bio arg value")
+	}
+
+	r2 := makeRequest("GET", "/page?name=normal&bio=hello", "")
+	if matchCondition(cc, r2, nil) {
+		t.Error("phrase_match should not match clean args")
+	}
+}
+
+func TestMatchCondition_PhraseMatch_WithTransforms(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "all_args_values",
+		Operator:   "phrase_match",
+		ListItems:  []string{"select", "union", "insert"},
+		Transforms: []string{"lowercase", "urlDecode"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// URL-encoded uppercase: %53ELECT → SELECT → select
+	r := makeRequest("GET", "/search?q=%53ELECT", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("phrase_match with transforms should decode and lowercase")
+	}
+}
+
+// ─── v0.9.0: Numeric Comparison Operators ──────────────────────────
+
+func TestCompileCondition_NumericOperators(t *testing.T) {
+	tests := []struct {
+		op    string
+		value string
+		err   bool
+	}{
+		{"gt", "100", false},
+		{"ge", "0", false},
+		{"lt", "255.5", false},
+		{"le", "-1", false},
+		{"gt", "abc", true}, // non-numeric
+		{"le", "", true},    // empty
+	}
+
+	for _, tt := range tests {
+		_, err := compileCondition(PolicyCondition{
+			Field:    "header",
+			Operator: tt.op,
+			Value:    "Content-Length:" + tt.value,
+		})
+		if tt.err && err == nil {
+			t.Errorf("op=%s value=%q should fail", tt.op, tt.value)
+		}
+		if !tt.err && err != nil {
+			t.Errorf("op=%s value=%q unexpected error: %v", tt.op, tt.value, err)
+		}
+	}
+}
+
+func TestEvalOperator_NumericComparison(t *testing.T) {
+	tests := []struct {
+		op     string
+		numVal float64
+		target string
+		want   bool
+	}{
+		{"gt", 100, "150", true},
+		{"gt", 100, "100", false},
+		{"gt", 100, "50", false},
+		{"ge", 100, "100", true},
+		{"ge", 100, "101", true},
+		{"ge", 100, "99", false},
+		{"lt", 100, "50", true},
+		{"lt", 100, "100", false},
+		{"lt", 100, "150", false},
+		{"le", 100, "100", true},
+		{"le", 100, "99", true},
+		{"le", 100, "101", false},
+		// Non-numeric target → false.
+		{"gt", 100, "abc", false},
+		{"lt", 100, "", false},
+		// Decimal comparison.
+		{"gt", 99.5, "100", true},
+		{"lt", 99.5, "99", true},
+	}
+
+	for _, tt := range tests {
+		cc := compiledCondition{operator: tt.op, numericVal: tt.numVal}
+		got := evalOperator(cc, tt.target)
+		if got != tt.want {
+			t.Errorf("evalOperator(%s, numVal=%.1f, target=%q) = %v, want %v",
+				tt.op, tt.numVal, tt.target, got, tt.want)
+		}
+	}
+}
+
+// ─── v0.9.0: count: Pseudo-Field ──────────────────────────────────
+
+func TestCompileCondition_Count(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:all_args",
+		Operator: "gt",
+		Value:    "10",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cc.isCount {
+		t.Error("count: field should set isCount")
+	}
+	if cc.countField != "all_args" {
+		t.Errorf("countField = %q, want all_args", cc.countField)
+	}
+	if cc.isMulti {
+		t.Error("count: should NOT set isMulti (produces a single value)")
+	}
+}
+
+func TestCompileCondition_Count_InvalidField(t *testing.T) {
+	_, err := compileCondition(PolicyCondition{
+		Field:    "count:path",
+		Operator: "gt",
+		Value:    "10",
+	})
+	if err == nil {
+		t.Fatal("count:path should fail (path is not an aggregate field)")
+	}
+}
+
+func TestMatchCondition_Count(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:all_args",
+		Operator: "gt",
+		Value:    "3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4 values (2 names + 2 values = 4 in all_args) > 3
+	r := makeRequest("GET", "/search?q=hello&sort=asc", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("count:all_args should be > 3 (q, hello, sort, asc = 4)")
+	}
+
+	// 2 values (1 name + 1 value = 2) not > 3
+	r2 := makeRequest("GET", "/search?q=hello", "")
+	if matchCondition(cc, r2, nil) {
+		t.Error("count:all_args should NOT be > 3 (q, hello = 2)")
+	}
+}
+
+func TestMatchCondition_Count_ArgsNames(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:all_args_names",
+		Operator: "gt",
+		Value:    "255",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a request with 256 unique query params.
+	q := make([]string, 256)
+	for i := range q {
+		q[i] = fmt.Sprintf("p%d=v", i)
+	}
+	path := "/?" + strings.Join(q, "&")
+	r := makeRequest("GET", path, "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("count:all_args_names should be > 255 with 256 params")
+	}
+}
+
+// ─── v0.9.0: ServeHTTP Integration ────────────────────────────────
+
+func TestServeHTTP_PhraseMatch_Block(t *testing.T) {
+	rules := []PolicyRule{
+		{
+			ID:   "pm-block",
+			Name: "sql-keyword-block",
+			Type: "block",
+			Conditions: []PolicyCondition{
+				{
+					Field:      "all_args_values",
+					Operator:   "phrase_match",
+					ListItems:  []string{"select", "union", "insert", "drop", "delete"},
+					Transforms: []string{"lowercase"},
+				},
+			},
+			Enabled:  true,
+			Priority: 100,
+		},
+	}
+
+	path := writeTempRulesFile(t, rules)
+	pe := &PolicyEngine{RulesFile: path, ReloadInterval: caddy.Duration(0)}
+	mustProvision(t, pe)
+
+	// Attack request: "UNION SELECT" in query param.
+	r := makeRequest("GET", "/search?q=1+UNION+SELECT+1,2,3", "")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+
+	if err == nil {
+		t.Fatal("expected block error for SQL keywords in args")
+	}
+	if next.called {
+		t.Error("next handler should not be called on block")
+	}
+
+	// Clean request: should pass.
+	r2 := makeRequest("GET", "/search?q=hello+world", "")
+	w2 := httptest.NewRecorder()
+	next2 := &nextHandler{}
+	err2 := pe.ServeHTTP(w2, r2, next2)
+
+	if err2 != nil {
+		t.Errorf("clean request should pass, got error: %v", err2)
+	}
+	if !next2.called {
+		t.Error("next handler should be called for clean request")
+	}
+}
+
+func TestServeHTTP_NumericBlock(t *testing.T) {
+	rules := []PolicyRule{
+		{
+			ID:   "count-block",
+			Name: "too-many-args",
+			Type: "block",
+			Conditions: []PolicyCondition{
+				{
+					Field:    "count:all_args_names",
+					Operator: "gt",
+					Value:    "5",
+				},
+			},
+			Enabled:  true,
+			Priority: 100,
+		},
+	}
+
+	path := writeTempRulesFile(t, rules)
+	pe := &PolicyEngine{RulesFile: path, ReloadInterval: caddy.Duration(0)}
+	mustProvision(t, pe)
+
+	// 6 params > 5 → block.
+	r := makeRequest("GET", "/?a=1&b=2&c=3&d=4&e=5&f=6", "")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected block for 6 args > 5")
+	}
+
+	// 3 params ≤ 5 → pass.
+	r2 := makeRequest("GET", "/?a=1&b=2&c=3", "")
+	w2 := httptest.NewRecorder()
+	next2 := &nextHandler{}
+	err2 := pe.ServeHTTP(w2, r2, next2)
+	if err2 != nil {
+		t.Errorf("3 args should pass, got error: %v", err2)
+	}
+}
+
+func TestServeHTTP_Detect_PhraseMatch(t *testing.T) {
+	rules := []PolicyRule{
+		{
+			ID:   "detect-sqli",
+			Name: "sql-keywords-detect",
+			Type: "detect",
+			Conditions: []PolicyCondition{
+				{
+					Field:      "all_args_values",
+					Operator:   "phrase_match",
+					ListItems:  []string{"select", "union", "insert", "drop"},
+					Transforms: []string{"lowercase"},
+				},
+			},
+			Severity:      "CRITICAL",
+			ParanoiaLevel: 1,
+			Enabled:       true,
+			Priority:      100,
+		},
+	}
+
+	wafCfg := &WafConfig{
+		ParanoiaLevel:    1,
+		InboundThreshold: 4, // CRITICAL=5 > threshold=4, should block
+	}
+
+	path := writeTempRulesFileWithConfig(t, rules, wafCfg)
+	pe := &PolicyEngine{RulesFile: path, ReloadInterval: caddy.Duration(0)}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/search?q=1+union+select+1", "")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+
+	if err == nil {
+		t.Fatal("expected detect_block — CRITICAL(5) > threshold(4)")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "detect_block" {
+		t.Errorf("expected action=detect_block, got %q", action)
+	}
+}
+
+func TestNeedsBodyField(t *testing.T) {
+	tests := []struct {
+		field string
+		want  bool
+	}{
+		{"all_args", true},
+		{"all_args_values", true},
+		{"all_args_names", true},
+		{"all_headers", false},
+		{"all_cookies", false},
+		{"path", false},
+		{"count:all_args", true},
+		{"count:all_headers", false},
+	}
+
+	for _, tt := range tests {
+		got := needsBodyField(tt.field)
+		if got != tt.want {
+			t.Errorf("needsBodyField(%q) = %v, want %v", tt.field, got, tt.want)
+		}
+	}
+}
