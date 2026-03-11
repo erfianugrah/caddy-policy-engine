@@ -602,14 +602,50 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_block")
-			// Build matched rule names for logging.
-			ruleNames := make([]string, len(scorer.matched))
-			for i, m := range scorer.matched {
-				ruleNames[i] = m.ruleID
+
+			// Build matched-rule detail strings for logging and access log capture.
+			ruleNames := make([]string, 0, len(scorer.matched))
+			ruleDetails := make([]string, 0, len(scorer.matched))
+			var tags []string
+			tagSeen := map[string]bool{}
+			for _, m := range scorer.matched {
+				ruleNames = append(ruleNames, m.ruleID)
+				// Format: "PE-920350:WARNING:3" (id:severity:score)
+				ruleDetails = append(ruleDetails, m.ruleID+":"+m.severity+":"+strconv.Itoa(m.score))
+				// Collect unique tags from all matched detect rules.
+				// Tags aren't stored on matchedRule, so we look them up from compiled rules.
 			}
+			// Look up tags from compiled rules for all matched detect rules.
+			// Use the local `rules` snapshot (captured at function start) —
+			// no lock needed since it's already a slice copy.
+			for _, m := range scorer.matched {
+				for _, cr := range rules {
+					if cr.rule.ID == m.ruleID {
+						for _, t := range cr.rule.Tags {
+							if !tagSeen[t] {
+								tagSeen[t] = true
+								tags = append(tags, t)
+							}
+						}
+						break
+					}
+				}
+			}
+
+			// Set Caddy vars for access log capture (matches block/allow pattern).
+			summary := fmt.Sprintf("Detect Block (score %d/%d, %d rules)", scorer.inbound, serviceThreshold, len(scorer.matched))
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", summary)
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", strings.Join(ruleNames, ","))
+			caddyhttp.SetVar(r.Context(), "policy_engine.detect_rules", strings.Join(ruleDetails, ","))
+			if len(tags) > 0 {
+				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(tags, ","))
+			}
+
 			if !pe.HideHeaders {
 				w.Header().Set("X-Blocked-By", "policy-engine")
 				w.Header().Set("X-Anomaly-Score", strconv.Itoa(scorer.inbound))
+				w.Header().Set("X-Blocked-Rule", summary)
+				w.Header().Set("X-Detect-Rules", strings.Join(ruleDetails, " "))
 			}
 			pe.logger.Info("anomaly threshold exceeded",
 				zap.Int("score", scorer.inbound),

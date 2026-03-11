@@ -2507,6 +2507,42 @@ func TestDetect_ThresholdExceeded_Blocks(t *testing.T) {
 	if score != "12" {
 		t.Errorf("expected anomaly_score=12, got %q", score)
 	}
+	// Verify new detect_block observability vars.
+	ruleName, _ := caddyhttp.GetVar(r.Context(), "policy_engine.rule_name").(string)
+	if ruleName == "" {
+		t.Error("expected policy_engine.rule_name to be set for detect_block")
+	}
+	if !strings.Contains(ruleName, "score 12/10") {
+		t.Errorf("expected rule_name to contain 'score 12/10', got %q", ruleName)
+	}
+	if !strings.Contains(ruleName, "3 rules") {
+		t.Errorf("expected rule_name to contain '3 rules', got %q", ruleName)
+	}
+	ruleID, _ := caddyhttp.GetVar(r.Context(), "policy_engine.rule_id").(string)
+	if ruleID == "" {
+		t.Error("expected policy_engine.rule_id to be set for detect_block")
+	}
+	// Should contain all three rule IDs.
+	if !strings.Contains(ruleID, "d1") || !strings.Contains(ruleID, "d2") || !strings.Contains(ruleID, "d3") {
+		t.Errorf("expected rule_id to contain d1, d2, d3, got %q", ruleID)
+	}
+	detectRules, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_rules").(string)
+	if detectRules == "" {
+		t.Error("expected policy_engine.detect_rules to be set for detect_block")
+	}
+	// Verify format: "d1:CRITICAL:5,d2:ERROR:4,d3:WARNING:3"
+	if !strings.Contains(detectRules, "d1:CRITICAL:5") {
+		t.Errorf("expected detect_rules to contain 'd1:CRITICAL:5', got %q", detectRules)
+	}
+	// Verify X-Blocked-Rule response header.
+	blockedRule := w.Header().Get("X-Blocked-Rule")
+	if blockedRule == "" {
+		t.Error("expected X-Blocked-Rule response header for detect_block")
+	}
+	detectHeader := w.Header().Get("X-Detect-Rules")
+	if detectHeader == "" {
+		t.Error("expected X-Detect-Rules response header for detect_block")
+	}
 }
 
 func TestDetect_BelowThreshold_Passes(t *testing.T) {
