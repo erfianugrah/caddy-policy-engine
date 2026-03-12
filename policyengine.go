@@ -1264,40 +1264,44 @@ func parseByteRangeSet(spec string) (*[256]bool, error) {
 // evalValidateByteRange returns true if ALL bytes in target are within the
 // allowed set. CRS semantics: @validateByteRange succeeds when the input
 // contains only allowed bytes.
+// evalValidateByteRange returns true if any byte in target is OUTSIDE the
+// allowed set (i.e., a violation was found). This matches CRS/ModSecurity
+// semantics where @validateByteRange fires when invalid bytes are present.
 func evalValidateByteRange(set *[256]bool, target string) bool {
 	if set == nil {
 		return false
 	}
 	for i := 0; i < len(target); i++ {
 		if !set[target[i]] {
-			return false
+			return true // violation: byte outside allowed range
 		}
 	}
-	return true
+	return false // all bytes valid
 }
 
 // ─── URL Encoding Validation ───────────────────────────────────────
 
-// evalValidateURLEncoding returns true if all percent-encoded sequences in
-// target are well-formed (%HH where H is a hex digit). Non-encoded bytes pass.
-// CRS semantics: @validateUrlEncoding
+// evalValidateURLEncoding returns true if any percent-encoded sequence in
+// target is malformed (violation detected). This matches CRS/ModSecurity
+// semantics where @validateUrlEncoding fires when invalid encoding is found.
+// Non-encoded bytes are ignored (not violations).
 func evalValidateURLEncoding(target string) bool {
 	i := 0
 	for i < len(target) {
 		if target[i] == '%' {
 			// Need at least 2 more characters.
 			if i+2 >= len(target) {
-				return false // truncated %
+				return true // violation: truncated %
 			}
 			if unhex(target[i+1]) < 0 || unhex(target[i+2]) < 0 {
-				return false // invalid hex digits
+				return true // violation: invalid hex digits
 			}
 			i += 3
 		} else {
 			i++
 		}
 	}
-	return true
+	return false // all encoding valid
 }
 
 // compileIPList compiles a list of IP/CIDR strings into an ipSet (for single IPs)

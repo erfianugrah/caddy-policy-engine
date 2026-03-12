@@ -5227,20 +5227,21 @@ func TestEvalValidateByteRange(t *testing.T) {
 	// Permissive: 1-255 (no null bytes)
 	noNull, _ := parseByteRangeSet("1-255")
 
+	// CRS semantics: returns true when a violation is found (byte outside range).
 	tests := []struct {
 		name string
 		set  *[256]bool
 		in   string
 		want bool
 	}{
-		{"printable ASCII", ascii, "Hello World!", true},
-		{"null byte fails ASCII", ascii, "hello\x00world", false},
-		{"tab fails ASCII", ascii, "hello\tworld", false},
-		{"newline fails ASCII", ascii, "hello\nworld", false},
-		{"empty always valid", ascii, "", true},
-		{"null byte fails noNull", noNull, "\x00", false},
-		{"all bytes valid in noNull", noNull, "anything\xff\x01", true},
-		{"nil set", nil, "test", false},
+		{"printable ASCII — no violation", ascii, "Hello World!", false},
+		{"null byte violates ASCII", ascii, "hello\x00world", true},
+		{"tab violates ASCII", ascii, "hello\tworld", true},
+		{"newline violates ASCII", ascii, "hello\nworld", true},
+		{"empty — no violation", ascii, "", false},
+		{"null byte violates noNull", noNull, "\x00", true},
+		{"all bytes valid in noNull", noNull, "anything\xff\x01", false},
+		{"nil set — no violation", nil, "test", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5254,6 +5255,7 @@ func TestEvalValidateByteRange(t *testing.T) {
 
 func TestMatchCondition_ValidateByteRange(t *testing.T) {
 	// CRS 920270: @validateByteRange 1-255 (no null bytes)
+	// CRS semantics: fires when violation found (byte outside 1-255)
 	cond := PolicyCondition{
 		Field:    "all_args_values",
 		Operator: "validate_byte_range",
@@ -5264,16 +5266,24 @@ func TestMatchCondition_ValidateByteRange(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 
-	// Clean args → all bytes in range → validate returns true → no negate → true
+	// Clean args → no violation → eval returns false → no match (rule doesn't fire)
 	req := httptest.NewRequest("GET", "/?q=hello", nil)
-	if !matchCondition(cc, req, nil) {
-		t.Error("expected true: 'hello' has all bytes in 1-255")
+	if matchCondition(cc, req, nil) {
+		t.Error("expected false: 'hello' has all bytes in 1-255, no violation")
+	}
+
+	// Null byte → violation → eval returns true → match (rule fires)
+	req2 := httptest.NewRequest("GET", "/?q=test", nil)
+	req2.URL.RawQuery = "q=test%00injected"
+	if !matchCondition(cc, req2, nil) {
+		t.Error("expected true: null byte violates 1-255 range")
 	}
 }
 
 func TestMatchCondition_ValidateByteRange_Negated(t *testing.T) {
 	// CRS 941010: !@validateByteRange → negate=true
-	// Detects non-printable chars in URI path
+	// Matches when all bytes ARE in range (no violation).
+	// Used to skip XSS perf-disable rules when filename has only safe bytes.
 	cond := PolicyCondition{
 		Field:    "uri_path",
 		Operator: "validate_byte_range",
@@ -5285,38 +5295,40 @@ func TestMatchCondition_ValidateByteRange_Negated(t *testing.T) {
 	}
 	cc.negate = true // Simulating !@validateByteRange
 
-	// Clean URI → byte range valid → eval returns true → negate → false (no match)
+	// Clean URI → no violation → eval returns false → negate → true (match)
 	req := httptest.NewRequest("GET", "/normal-path", nil)
-	if matchCondition(cc, req, nil) {
-		t.Error("expected false: clean path should validate (negate makes it false)")
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected true: clean path has no violation, negate makes it match")
 	}
 
 	// URI with non-allowed byte (e.g., tab char 0x09 is not in the set)
+	// → violation → eval returns true → negate → false (no match)
 	req2 := httptest.NewRequest("GET", "/path", nil)
 	req2.URL.Path = "/path\tinject" // tab (0x09) not in allowed set
-	if !matchCondition(cc, req2, nil) {
-		t.Error("expected true: tab in path should fail validation (negate makes it true)")
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected false: tab violates range, negate makes it not match")
 	}
 }
 
 // ─── Validate URL Encoding Operator ────────────────────────────────
 
 func TestEvalValidateURLEncoding(t *testing.T) {
+	// CRS semantics: returns true when a violation is found (malformed encoding).
 	tests := []struct {
 		name string
 		in   string
 		want bool
 	}{
-		{"no encoding", "hello world", true},
-		{"valid %20", "hello%20world", true},
-		{"valid %3C%3E", "%3Cscript%3E", true},
-		{"truncated %2", "hello%2", false},
-		{"bare %", "hello%", false},
-		{"invalid hex %ZZ", "hello%ZZworld", false},
-		{"invalid hex %GH", "%GH", false},
-		{"empty", "", true},
-		{"double encoded", "%253C", true}, // %25 is valid (%25 = "%"), "3C" is just text
-		{"mixed valid", "/path?q=hello%20world&foo=%2Fbar", true},
+		{"no encoding — no violation", "hello world", false},
+		{"valid %20 — no violation", "hello%20world", false},
+		{"valid %3C%3E — no violation", "%3Cscript%3E", false},
+		{"truncated %2 — violation", "hello%2", true},
+		{"bare % — violation", "hello%", true},
+		{"invalid hex %ZZ — violation", "hello%ZZworld", true},
+		{"invalid hex %GH — violation", "%GH", true},
+		{"empty — no violation", "", false},
+		{"double encoded — no violation", "%253C", false}, // %25 is valid (%25 = "%"), "3C" is just text
+		{"mixed valid — no violation", "/path?q=hello%20world&foo=%2Fbar", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5339,18 +5351,18 @@ func TestMatchCondition_ValidateURLEncoding(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 
-	// Valid URL encoding → true
+	// Valid URL encoding → no violation → false (rule doesn't fire)
 	req := httptest.NewRequest("GET", "/?q=hello%20world", nil)
-	if !matchCondition(cc, req, nil) {
-		t.Error("expected true: valid URL encoding")
+	if matchCondition(cc, req, nil) {
+		t.Error("expected false: valid URL encoding, no violation")
 	}
 
-	// Invalid URL encoding → false. Must set RawQuery directly since Go's URL parser
-	// rejects %ZZ during construction.
+	// Invalid URL encoding → violation → true (rule fires).
+	// Must set RawQuery directly since Go's URL parser rejects %ZZ.
 	req2 := httptest.NewRequest("GET", "/page", nil)
 	req2.URL.RawQuery = "q=hello%ZZworld"
-	if matchCondition(cc, req2, nil) {
-		t.Error("expected false: %ZZ is invalid URL encoding")
+	if !matchCondition(cc, req2, nil) {
+		t.Error("expected true: %ZZ is invalid URL encoding, violation found")
 	}
 }
 
@@ -5448,6 +5460,7 @@ func TestMatchCondition_DetectXSS_ImgOnerror(t *testing.T) {
 
 func TestCompileCondition_NegateField(t *testing.T) {
 	// CRS !@validateByteRange → negate: true in JSON
+	// Matches when all bytes ARE in range (no violation).
 	cond := PolicyCondition{
 		Field:    "uri_path",
 		Operator: "validate_byte_range",
@@ -5462,17 +5475,17 @@ func TestCompileCondition_NegateField(t *testing.T) {
 		t.Error("expected negate=true from Negate field")
 	}
 
-	// Clean printable path → validate returns true → negate → false
+	// Clean printable path → no violation → eval false → negate → true (match)
 	req := httptest.NewRequest("GET", "/normal", nil)
-	if matchCondition(cc, req, nil) {
-		t.Error("expected false: clean path with negate should not match")
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected true: clean path has no violation, negate makes it match")
 	}
 
-	// Path with non-printable → validate returns false → negate → true
+	// Path with non-printable → violation → eval true → negate → false (no match)
 	req2 := httptest.NewRequest("GET", "/path", nil)
 	req2.URL.Path = "/path\x01inject"
-	if !matchCondition(cc, req2, nil) {
-		t.Error("expected true: non-printable byte with negate should match")
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected false: violation found, negate makes it not match")
 	}
 }
 
