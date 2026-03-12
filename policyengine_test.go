@@ -3827,7 +3827,7 @@ func TestLoadDefaultRulesFile(t *testing.T) {
 	t.Run("valid file loads rules", func(t *testing.T) {
 		content := `{
 			"rules": [
-				{"id": "PE-001", "name": "test default", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "header", "operator": "eq", "value": "Accept:"}], "group_op": "and"}
+				{"id": "001", "name": "test default", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "header", "operator": "eq", "value": "Accept:"}], "group_op": "and"}
 			],
 			"version": 1
 		}`
@@ -3842,8 +3842,8 @@ func TestLoadDefaultRulesFile(t *testing.T) {
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 rule, got %d", len(rules))
 		}
-		if rules[0].ID != "PE-001" {
-			t.Errorf("expected PE-001, got %q", rules[0].ID)
+		if rules[0].ID != "001" {
+			t.Errorf("expected 001, got %q", rules[0].ID)
 		}
 		if mod.IsZero() {
 			t.Error("expected non-zero mod time")
@@ -3871,8 +3871,8 @@ func TestDefaultRulesFileLoading(t *testing.T) {
 	// Write default rules.
 	defaultContent := `{
 		"rules": [
-			{"id": "PE-001", "name": "default detect", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 450, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
-			{"id": "PE-002", "name": "default detect 2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 451, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
+			{"id": "001", "name": "default detect", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 450, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
+			{"id": "002", "name": "default detect 2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 451, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
 		],
 		"version": 1
 	}`
@@ -3911,7 +3911,7 @@ func TestDefaultRulesFileLoading(t *testing.T) {
 	t.Run("user overrides default by ID", func(t *testing.T) {
 		userContent := `{
 			"rules": [
-				{"id": "PE-001", "name": "user override", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/override"}], "group_op": "and"}
+				{"id": "001", "name": "user override", "type": "block", "enabled": true, "priority": 100, "conditions": [{"field": "path", "operator": "eq", "value": "/override"}], "group_op": "and"}
 			],
 			"generated": "2026-01-01T00:00:00Z",
 			"version": 1
@@ -3930,26 +3930,26 @@ func TestDefaultRulesFileLoading(t *testing.T) {
 		if err := pe.loadFromFile(); err != nil {
 			t.Fatalf("loadFromFile: %v", err)
 		}
-		// PE-001 overridden + PE-002 default = 2 rules.
+		// 001 overridden + 002 default = 2 rules.
 		if len(pe.rules) != 2 {
 			t.Fatalf("expected 2 compiled rules, got %d", len(pe.rules))
 		}
 		// The user override should be present (block type, priority 100 = first).
 		found := false
 		for _, r := range pe.rules {
-			if r.rule.ID == "PE-001" && r.rule.Name == "user override" {
+			if r.rule.ID == "001" && r.rule.Name == "user override" {
 				found = true
 			}
 		}
 		if !found {
-			t.Error("user override for PE-001 not found")
+			t.Error("user override for 001 not found")
 		}
 	})
 
 	t.Run("disabled defaults filtered", func(t *testing.T) {
 		userContent := `{
 			"rules": [],
-			"disabled_default_rules": ["PE-002"],
+			"disabled_default_rules": ["002"],
 			"generated": "2026-01-01T00:00:00Z",
 			"version": 1
 		}`
@@ -3967,12 +3967,12 @@ func TestDefaultRulesFileLoading(t *testing.T) {
 		if err := pe.loadFromFile(); err != nil {
 			t.Fatalf("loadFromFile: %v", err)
 		}
-		// PE-001 kept, PE-002 disabled = 1 rule.
+		// 001 kept, 002 disabled = 1 rule.
 		if len(pe.rules) != 1 {
 			t.Fatalf("expected 1 compiled rule, got %d", len(pe.rules))
 		}
-		if pe.rules[0].rule.ID != "PE-001" {
-			t.Errorf("expected PE-001, got %q", pe.rules[0].rule.ID)
+		if pe.rules[0].rule.ID != "001" {
+			t.Errorf("expected 001, got %q", pe.rules[0].rule.ID)
 		}
 	})
 
@@ -4064,7 +4064,7 @@ func TestDefaultRulesServeHTTP(t *testing.T) {
 	// Default rule: detect DELETE requests with CRITICAL severity (score 5).
 	defaultContent := `{
 		"rules": [
-			{"id": "PE-TEST-001", "name": "block DELETE", "type": "detect", "severity": "CRITICAL", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
+			{"id": "TEST-001", "name": "block DELETE", "type": "detect", "severity": "CRITICAL", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "method", "operator": "eq", "value": "DELETE"}], "group_op": "and"}
 		],
 		"version": 1
 	}`
@@ -4121,7 +4121,7 @@ func TestDefaultRulesHotReload(t *testing.T) {
 	userFile := filepath.Join(dir, "rules.json")
 
 	// Start with one default rule.
-	defaultContent := `{"rules": [{"id": "PE-HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"}], "version": 1}`
+	defaultContent := `{"rules": [{"id": "HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"}], "version": 1}`
 	if err := os.WriteFile(defaultFile, []byte(defaultContent), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -4148,8 +4148,8 @@ func TestDefaultRulesHotReload(t *testing.T) {
 	// Update default rules file — add a second rule.
 	time.Sleep(10 * time.Millisecond) // Ensure mtime differs.
 	defaultContent2 := `{"rules": [
-		{"id": "PE-HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
-		{"id": "PE-HR-002", "name": "hot-default-2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 401, "conditions": [{"field": "method", "operator": "eq", "value": "PUT"}], "group_op": "and"}
+		{"id": "HR-001", "name": "hot-default", "type": "detect", "severity": "NOTICE", "paranoia_level": 1, "enabled": true, "priority": 400, "conditions": [{"field": "path", "operator": "eq", "value": "/test"}], "group_op": "and"},
+		{"id": "HR-002", "name": "hot-default-2", "type": "detect", "severity": "WARNING", "paranoia_level": 1, "enabled": true, "priority": 401, "conditions": [{"field": "method", "operator": "eq", "value": "PUT"}], "group_op": "and"}
 	], "version": 1}`
 	if err := os.WriteFile(defaultFile, []byte(defaultContent2), 0644); err != nil {
 		t.Fatal(err)
@@ -4165,7 +4165,7 @@ func TestDefaultRulesHotReload(t *testing.T) {
 
 	// Now disable one default via user rules file.
 	time.Sleep(10 * time.Millisecond)
-	userContent2 := `{"rules": [], "disabled_default_rules": ["PE-HR-002"], "generated": "2026-01-01T00:01:00Z", "version": 1}`
+	userContent2 := `{"rules": [], "disabled_default_rules": ["HR-002"], "generated": "2026-01-01T00:01:00Z", "version": 1}`
 	if err := os.WriteFile(userFile, []byte(userContent2), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -4173,10 +4173,10 @@ func TestDefaultRulesHotReload(t *testing.T) {
 		t.Fatalf("reload with disabled: %v", err)
 	}
 	if len(pe.rules) != 1 {
-		t.Fatalf("expected 1 rule after disabling PE-HR-002, got %d", len(pe.rules))
+		t.Fatalf("expected 1 rule after disabling HR-002, got %d", len(pe.rules))
 	}
-	if pe.rules[0].rule.ID != "PE-HR-001" {
-		t.Errorf("expected PE-HR-001, got %q", pe.rules[0].rule.ID)
+	if pe.rules[0].rule.ID != "HR-001" {
+		t.Errorf("expected HR-001, got %q", pe.rules[0].rule.ID)
 	}
 }
 
@@ -4202,7 +4202,7 @@ func TestDisabledDefaultRulesDeserialization(t *testing.T) {
 	// Verify PolicyRulesFile properly deserializes disabled_default_rules.
 	jsonFile := `{
 		"rules": [],
-		"disabled_default_rules": ["PE-001", "PE-002"],
+		"disabled_default_rules": ["001", "002"],
 		"generated": "2026-01-01T00:00:00Z",
 		"version": 1
 	}`
@@ -4213,7 +4213,7 @@ func TestDisabledDefaultRulesDeserialization(t *testing.T) {
 	if len(file.DisabledDefaultRules) != 2 {
 		t.Fatalf("expected 2 disabled defaults, got %d", len(file.DisabledDefaultRules))
 	}
-	if file.DisabledDefaultRules[0] != "PE-001" || file.DisabledDefaultRules[1] != "PE-002" {
+	if file.DisabledDefaultRules[0] != "001" || file.DisabledDefaultRules[1] != "002" {
 		t.Errorf("unexpected disabled IDs: %v", file.DisabledDefaultRules)
 	}
 }
@@ -4222,7 +4222,7 @@ func TestDefaultRulesFileSerialization(t *testing.T) {
 	// Verify DefaultRulesFile round-trips through JSON.
 	file := DefaultRulesFile{
 		Rules: []PolicyRule{
-			{ID: "PE-001", Name: "test", Type: "detect", Severity: "WARNING",
+			{ID: "001", Name: "test", Type: "detect", Severity: "WARNING",
 				ParanoiaLevel: 1, Enabled: true, Priority: 400,
 				Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/x"}},
 				GroupOp:    "and"},
@@ -4237,7 +4237,7 @@ func TestDefaultRulesFileSerialization(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.Rules) != 1 || decoded.Rules[0].ID != "PE-001" {
+	if len(decoded.Rules) != 1 || decoded.Rules[0].ID != "001" {
 		t.Errorf("round-trip failed: %+v", decoded)
 	}
 }
@@ -4597,7 +4597,7 @@ func TestMatchRuleDetailed_NoConditions(t *testing.T) {
 func TestSerializeDetectMatches(t *testing.T) {
 	matches := []matchedRule{
 		{
-			ruleID:   "PE-920350",
+			ruleID:   "920350",
 			ruleName: "Missing Host header",
 			severity: "WARNING",
 			score:    3,
@@ -4612,7 +4612,7 @@ func TestSerializeDetectMatches(t *testing.T) {
 			},
 		},
 		{
-			ruleID:   "PE-920300",
+			ruleID:   "920300",
 			ruleName: "Missing Accept header",
 			severity: "NOTICE",
 			score:    2,
@@ -4633,8 +4633,8 @@ func TestSerializeDetectMatches(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
-	if entries[0].RuleID != "PE-920350" {
-		t.Errorf("expected rule_id 'PE-920350', got %q", entries[0].RuleID)
+	if entries[0].RuleID != "920350" {
+		t.Errorf("expected rule_id '920350', got %q", entries[0].RuleID)
 	}
 	if entries[0].Score != 3 {
 		t.Errorf("expected score 3, got %d", entries[0].Score)
