@@ -1,9 +1,12 @@
 package policyengine
 
-// Aho-Corasick automaton for multi-pattern substring matching.
+import "strings"
+
+// Aho-Corasick automaton for case-insensitive multi-pattern substring matching.
 //
 // Used by the phrase_match operator to scan input against wordlists (SQL keywords,
 // XSS vectors, command names, etc.) in O(n) time regardless of pattern count.
+// Matching is case-insensitive to match CRS/Coraza @pm operator semantics.
 //
 // This is a minimal, zero-dependency implementation. It builds a trie from the
 // pattern set, computes failure links (BFS), and scans input with a single pass.
@@ -33,15 +36,17 @@ func CompileAC(patterns []string) *ACMatcher {
 	m := &ACMatcher{root: root}
 
 	// Phase 1: Build trie (goto function).
+	// Patterns are lowercased for case-insensitive matching (CRS @pm semantics).
 	count := 0
 	for _, pat := range patterns {
 		if pat == "" {
 			continue
 		}
 		count++
+		lowerPat := strings.ToLower(pat)
 		cur := root
-		for i := 0; i < len(pat); i++ {
-			b := pat[i]
+		for i := 0; i < len(lowerPat); i++ {
+			b := lowerPat[i]
 			next, ok := cur.children[b]
 			if !ok {
 				next = &acNode{children: make(map[byte]*acNode)}
@@ -49,7 +54,7 @@ func CompileAC(patterns []string) *ACMatcher {
 			}
 			cur = next
 		}
-		cur.output = pat
+		cur.output = pat // store original case for logging
 		cur.hasOut = true
 	}
 
@@ -101,15 +106,17 @@ func CompileAC(patterns []string) *ACMatcher {
 }
 
 // ContainsAny returns true if the input contains any pattern as a substring.
-// This is the primary hot-path method — returns as soon as the first match is found.
+// Matching is case-insensitive. This is the primary hot-path method — returns
+// as soon as the first match is found.
 func (m *ACMatcher) ContainsAny(input string) bool {
 	if m.empty {
 		return false
 	}
 
+	lower := strings.ToLower(input)
 	cur := m.root
-	for i := 0; i < len(input); i++ {
-		b := input[i]
+	for i := 0; i < len(lower); i++ {
+		b := lower[i]
 
 		// Follow fail links until we find a transition or reach root.
 		for cur != m.root && cur.children[b] == nil {
@@ -131,15 +138,17 @@ func (m *ACMatcher) ContainsAny(input string) bool {
 }
 
 // FindFirst returns the first pattern found as a substring in input, or ("", false)
-// if no pattern matches. Useful for logging which pattern triggered a match.
+// if no pattern matches. Matching is case-insensitive. The returned pattern string
+// preserves the original case from compilation for logging purposes.
 func (m *ACMatcher) FindFirst(input string) (string, bool) {
 	if m.empty {
 		return "", false
 	}
 
+	lower := strings.ToLower(input)
 	cur := m.root
-	for i := 0; i < len(input); i++ {
-		b := input[i]
+	for i := 0; i < len(lower); i++ {
+		b := lower[i]
 
 		for cur != m.root && cur.children[b] == nil {
 			cur = cur.fail

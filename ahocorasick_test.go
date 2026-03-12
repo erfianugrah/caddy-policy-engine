@@ -15,7 +15,7 @@ func TestAC_BasicSubstringMatch(t *testing.T) {
 		input string
 		want  bool
 	}{
-		{"SELECT * FROM users", false},     // case-sensitive, no match
+		{"SELECT * FROM users", true},      // case-insensitive, matches "select"
 		{"select * from users", true},      // exact substring
 		{"1 union select 1,2,3", true},     // union matches
 		{"drop table students", true},      // drop matches
@@ -89,7 +89,7 @@ func TestAC_SingleCharPatterns(t *testing.T) {
 		{"xyz", false},
 		{"xbz", true},
 		{"", false},
-		{"ABC", false}, // case-sensitive
+		{"ABC", true}, // case-insensitive, matches "a", "b", "c"
 	}
 
 	for _, tt := range tests {
@@ -173,7 +173,7 @@ func TestAC_CRSLikeSQLKeywords(t *testing.T) {
 		input string
 		want  bool
 	}{
-		{"1 UNION SELECT 1,2,3", false},          // case-sensitive, uppercase won't match
+		{"1 UNION SELECT 1,2,3", true},           // case-insensitive, matches "union" and "select"
 		{"1 union select 1,2,3", true},           // lowercase matches
 		{"admin'--", true},                       // "--" matches
 		{"1; drop table users", true},            // "drop" matches
