@@ -153,6 +153,24 @@ type matchedRule struct {
 	ruleName string
 	severity string
 	score    int
+	matches  []matchDetail // per-condition match details (nil for non-detect)
+}
+
+// matchDetail records what a single condition matched — field, variable name,
+// the actual value tested, and what the operator matched against.
+// Mirrors Coraza's MATCHED_VAR_NAME / MATCHED_VAR / TX:0 / logdata.
+type matchDetail struct {
+	Field       string `json:"field"`                  // condition field (e.g., "all_args_values", "header")
+	VarName     string `json:"var_name"`               // SecRule-style variable name (e.g., "ARGS:username", "REQUEST_HEADERS:User-Agent")
+	Value       string `json:"value"`                  // actual input value that was tested (truncated)
+	MatchedData string `json:"matched_data,omitempty"` // regex group 0, phrase_match hit, or matched literal
+	Operator    string `json:"operator"`               // operator name (e.g., "regex", "phrase_match")
+}
+
+// keyedValue pairs a variable name/key with its value for multi-field extraction.
+type keyedValue struct {
+	key string // e.g., "username", "User-Agent", "session_id"
+	val string
 }
 
 // PolicyRule is a single policy rule.
@@ -457,8 +475,19 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			bodyRead = true
 		}
 
-		if !matchRule(cr, r, pb) {
-			continue
+		// For detect rules, use detailed matching to capture match data.
+		// For all other types, use the fast non-detailed path.
+		var detectDetails []matchDetail
+		if cr.rule.Type == "detect" {
+			matched, details := matchRuleDetailed(cr, r, pb)
+			if !matched {
+				continue
+			}
+			detectDetails = details
+		} else {
+			if !matchRule(cr, r, pb) {
+				continue
+			}
 		}
 
 		// Rule matched — take action.
@@ -489,6 +518,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			if len(cr.rule.Tags) > 0 {
 				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 			}
+			// Capture full request context for investigation.
+			captureRequestContext(r, pb)
 			if !pe.HideHeaders {
 				w.Header().Set("X-Blocked-By", "policy-engine")
 				w.Header().Set("X-Blocked-Rule", cr.rule.Name)
@@ -513,6 +544,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				ruleName: cr.rule.Name,
 				severity: cr.rule.Severity,
 				score:    cr.score,
+				matches:  detectDetails,
 			})
 			pe.logger.Debug("detect rule matched",
 				zap.String("rule_id", cr.rule.ID),
@@ -520,6 +552,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("severity", cr.rule.Severity),
 				zap.Int("score", cr.score),
 				zap.Int("cumulative", scorer.inbound),
+				zap.Int("match_details", len(detectDetails)),
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 
@@ -600,8 +633,17 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		caddyhttp.SetVar(r.Context(), "policy_engine.anomaly_threshold", strconv.Itoa(serviceThreshold))
 		caddyhttp.SetVar(r.Context(), "policy_engine.matched_rules", strconv.Itoa(len(scorer.matched)))
 
+		// Always emit match details for all detect events (both blocking and logged).
+		// This enables observability for below-threshold events too.
+		matchesJSON := serializeDetectMatches(scorer.matched)
+		if matchesJSON != "" {
+			caddyhttp.SetVar(r.Context(), "policy_engine.detect_matches", matchesJSON)
+		}
+
 		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_block")
+			// Capture full request context for investigation.
+			captureRequestContext(r, pb)
 
 			// Build matched-rule detail strings for logging and access log capture.
 			ruleNames := make([]string, 0, len(scorer.matched))
@@ -964,6 +1006,92 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 	}
 }
 
+// extractMultiFieldKeyed returns key-value pairs from multi-value fields,
+// preserving which specific parameter/header/cookie matched.
+// Key is the Coraza-style variable name (e.g., "ARGS:username", "REQUEST_HEADERS:User-Agent").
+func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBody) []keyedValue {
+	switch cc.field {
+	case "all_args":
+		var kvs []keyedValue
+		for k, vs := range r.URL.Query() {
+			kvs = append(kvs, keyedValue{key: "ARGS_NAMES:" + k, val: k})
+			for _, v := range vs {
+				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
+			}
+		}
+		if pb != nil {
+			for k, vs := range pb.getForm() {
+				kvs = append(kvs, keyedValue{key: "ARGS_POST_NAMES:" + k, val: k})
+				for _, v := range vs {
+					kvs = append(kvs, keyedValue{key: "ARGS_POST:" + k, val: v})
+				}
+			}
+		}
+		return kvs
+
+	case "all_args_values":
+		var kvs []keyedValue
+		for k, vs := range r.URL.Query() {
+			for _, v := range vs {
+				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
+			}
+		}
+		if pb != nil {
+			for k, vs := range pb.getForm() {
+				for _, v := range vs {
+					kvs = append(kvs, keyedValue{key: "ARGS_POST:" + k, val: v})
+				}
+			}
+		}
+		return kvs
+
+	case "all_args_names":
+		var kvs []keyedValue
+		for k := range r.URL.Query() {
+			kvs = append(kvs, keyedValue{key: "ARGS_NAMES", val: k})
+		}
+		if pb != nil {
+			for k := range pb.getForm() {
+				kvs = append(kvs, keyedValue{key: "ARGS_POST_NAMES", val: k})
+			}
+		}
+		return kvs
+
+	case "all_headers":
+		var kvs []keyedValue
+		for k, vs := range r.Header {
+			for _, v := range vs {
+				kvs = append(kvs, keyedValue{key: "REQUEST_HEADERS:" + k, val: v})
+			}
+		}
+		return kvs
+
+	case "all_headers_names":
+		var kvs []keyedValue
+		for k := range r.Header {
+			kvs = append(kvs, keyedValue{key: "REQUEST_HEADERS_NAMES", val: k})
+		}
+		return kvs
+
+	case "all_cookies":
+		var kvs []keyedValue
+		for _, c := range r.Cookies() {
+			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES:" + c.Name, val: c.Value})
+		}
+		return kvs
+
+	case "all_cookies_names":
+		var kvs []keyedValue
+		for _, c := range r.Cookies() {
+			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES_NAMES", val: c.Name})
+		}
+		return kvs
+
+	default:
+		return nil
+	}
+}
+
 // countMultiField returns the count of values for a given field.
 // Used by the count: pseudo-field.
 func countMultiField(field string, r *http.Request, pb *parsedBody) int {
@@ -1108,6 +1236,410 @@ func compileIPList(items []string) (map[[16]byte]bool, []net.IPNet, error) {
 	}
 
 	return ipSet, nets, nil
+}
+
+// ─── Detailed Matching (Observability) ──────────────────────────────
+
+const maxLogValueLen = 200
+
+// truncateForLog truncates a string to maxLogValueLen for safe logging.
+func truncateForLog(s string) string {
+	if len(s) <= maxLogValueLen {
+		return s
+	}
+	return s[:maxLogValueLen] + "..."
+}
+
+// singleFieldVarName maps a single-value field + optional name to a
+// Coraza-style variable name (e.g., "header"+"User-Agent" → "REQUEST_HEADERS:User-Agent").
+func singleFieldVarName(field, name string) string {
+	switch field {
+	case "ip":
+		return "REMOTE_ADDR"
+	case "path":
+		return "REQUEST_URI"
+	case "uri_path":
+		return "REQUEST_FILENAME"
+	case "host":
+		return "SERVER_NAME"
+	case "method":
+		return "REQUEST_METHOD"
+	case "user_agent":
+		return "REQUEST_HEADERS:User-Agent"
+	case "query":
+		return "QUERY_STRING"
+	case "country":
+		return "REQUEST_HEADERS:Cf-Ipcountry"
+	case "referer":
+		return "REQUEST_HEADERS:Referer"
+	case "http_version":
+		return "REQUEST_PROTOCOL"
+	case "header":
+		if name != "" {
+			return "REQUEST_HEADERS:" + name
+		}
+		return "REQUEST_HEADERS"
+	case "cookie":
+		if name != "" {
+			return "REQUEST_COOKIES:" + name
+		}
+		return "REQUEST_COOKIES"
+	case "args":
+		if name != "" {
+			return "ARGS:" + name
+		}
+		return "ARGS"
+	case "body":
+		return "REQUEST_BODY"
+	case "body_json":
+		if name != "" {
+			return "REQUEST_BODY_JSON:" + name
+		}
+		return "REQUEST_BODY"
+	case "body_form":
+		if name != "" {
+			return "ARGS_POST:" + name
+		}
+		return "ARGS_POST"
+	default:
+		return strings.ToUpper(field)
+	}
+}
+
+// evalOperatorDetailed evaluates the operator and returns the matched data string.
+// Returns (matched bool, matchedData string). The matchedData is the substring
+// that the operator matched — regex group 0, phrase_match hit, or the literal value.
+func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
+	switch cc.operator {
+	case "eq":
+		if target == cc.exactVal {
+			return true, target
+		}
+		return false, ""
+	case "neq":
+		// neq returns the *equality* result; negate handled by caller.
+		if target == cc.exactVal {
+			return true, target
+		}
+		return false, ""
+	case "contains":
+		if strings.Contains(target, cc.contains) {
+			return true, cc.contains
+		}
+		return false, ""
+	case "begins_with":
+		if strings.HasPrefix(target, cc.prefix) {
+			return true, cc.prefix
+		}
+		return false, ""
+	case "ends_with":
+		if strings.HasSuffix(target, cc.suffix) {
+			return true, cc.suffix
+		}
+		return false, ""
+	case "regex":
+		if cc.regex != nil {
+			m := cc.regex.FindString(target)
+			if m != "" {
+				return true, m
+			}
+			// Regex can match empty string (e.g., "^$" on "").
+			if cc.regex.MatchString(target) {
+				return true, ""
+			}
+		}
+		return false, ""
+	case "ip_match", "not_ip_match":
+		if evalIPMatch(cc, target) {
+			return true, target
+		}
+		return false, ""
+	case "in", "in_list":
+		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
+			if evalIPMatch(cc, target) {
+				return true, target
+			}
+			return false, ""
+		}
+		if cc.stringSet[target] {
+			return true, target
+		}
+		return false, ""
+	case "not_in_list":
+		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
+			if evalIPMatch(cc, target) {
+				return true, target
+			}
+			return false, ""
+		}
+		if cc.stringSet[target] {
+			return true, target
+		}
+		return false, ""
+	case "phrase_match":
+		if cc.acMatcher != nil {
+			if pattern, found := cc.acMatcher.FindFirst(target); found {
+				return true, pattern
+			}
+		}
+		return false, ""
+	case "gt":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false, ""
+		}
+		if v > cc.numericVal {
+			return true, target
+		}
+		return false, ""
+	case "ge":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false, ""
+		}
+		if v >= cc.numericVal {
+			return true, target
+		}
+		return false, ""
+	case "lt":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false, ""
+		}
+		if v < cc.numericVal {
+			return true, target
+		}
+		return false, ""
+	case "le":
+		v, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return false, ""
+		}
+		if v <= cc.numericVal {
+			return true, target
+		}
+		return false, ""
+	default:
+		return false, ""
+	}
+}
+
+// matchConditionDetailed evaluates a condition and returns the match detail
+// on success. Returns (matched bool, detail *matchDetail).
+// For multi-value fields, reports the FIRST matching value (same as Coraza's
+// MATCHED_VAR which captures the first matching variable).
+func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBody) (bool, *matchDetail) {
+	// Special handling for "exists" operator on body_json.
+	if cc.isExists {
+		result := extractFieldExists(cc, pb)
+		if cc.negate {
+			result = !result
+		}
+		if result {
+			return true, &matchDetail{
+				Field:    cc.field,
+				VarName:  singleFieldVarName(cc.field, cc.name),
+				Operator: cc.operator,
+			}
+		}
+		return false, nil
+	}
+
+	// count: pseudo-field.
+	if cc.isCount {
+		count := countMultiField(cc.countField, r, pb)
+		target := strconv.Itoa(count)
+		matched, matchedData := evalOperatorDetailed(cc, target)
+		if cc.negate {
+			matched = !matched
+		}
+		if matched {
+			return true, &matchDetail{
+				Field:       "count:" + cc.countField,
+				VarName:     "&" + strings.ToUpper(cc.countField),
+				Value:       truncateForLog(target),
+				MatchedData: truncateForLog(matchedData),
+				Operator:    cc.operator,
+			}
+		}
+		return false, nil
+	}
+
+	// Multi-value fields — iterate all, report first match.
+	if cc.isMulti {
+		kvs := extractMultiFieldKeyed(cc, r, pb)
+		for _, kv := range kvs {
+			val := kv.val
+			if len(cc.transforms) > 0 {
+				val = applyTransforms(val, cc.transforms)
+			}
+			matched, matchedData := evalOperatorDetailed(cc, val)
+			if matched {
+				if cc.negate {
+					return false, nil // negate + any match = fail
+				}
+				return true, &matchDetail{
+					Field:       cc.field,
+					VarName:     kv.key,
+					Value:       truncateForLog(kv.val), // original pre-transform value
+					MatchedData: truncateForLog(matchedData),
+					Operator:    cc.operator,
+				}
+			}
+		}
+		// No value matched.
+		if cc.negate {
+			return true, &matchDetail{
+				Field:    cc.field,
+				VarName:  strings.ToUpper(cc.field),
+				Operator: cc.operator,
+			}
+		}
+		return false, nil
+	}
+
+	// Single-value field.
+	target := extractField(cc, r, pb)
+	origTarget := target
+
+	if len(cc.transforms) > 0 {
+		target = applyTransforms(target, cc.transforms)
+	}
+
+	matched, matchedData := evalOperatorDetailed(cc, target)
+	if cc.negate {
+		matched = !matched
+	}
+	if matched {
+		return true, &matchDetail{
+			Field:       cc.field,
+			VarName:     singleFieldVarName(cc.field, cc.name),
+			Value:       truncateForLog(origTarget),
+			MatchedData: truncateForLog(matchedData),
+			Operator:    cc.operator,
+		}
+	}
+	return false, nil
+}
+
+// matchRuleDetailed evaluates a rule and returns per-condition match details.
+// Returns (matched bool, details []matchDetail).
+func matchRuleDetailed(cr compiledRule, r *http.Request, pb *parsedBody) (bool, []matchDetail) {
+	if len(cr.conditions) == 0 {
+		return true, nil
+	}
+
+	if cr.rule.GroupOp == "or" {
+		// OR: return on first match.
+		for _, cc := range cr.conditions {
+			matched, detail := matchConditionDetailed(cc, r, pb)
+			if matched {
+				if detail != nil {
+					return true, []matchDetail{*detail}
+				}
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	// AND: all must match, collect all details.
+	var details []matchDetail
+	for _, cc := range cr.conditions {
+		matched, detail := matchConditionDetailed(cc, r, pb)
+		if !matched {
+			return false, nil
+		}
+		if detail != nil {
+			details = append(details, *detail)
+		}
+	}
+	return true, details
+}
+
+// detectMatchEntry is the JSON-serializable format for a matched detect rule
+// with its per-condition match details. Emitted as a JSON array in the
+// policy_engine.detect_matches Caddy variable for access log capture.
+type detectMatchEntry struct {
+	RuleID   string        `json:"rule_id"`
+	RuleName string        `json:"rule_name,omitempty"`
+	Severity string        `json:"severity"`
+	Score    int           `json:"score"`
+	Matches  []matchDetail `json:"matches,omitempty"`
+}
+
+// serializeDetectMatches converts matched detect rules into a compact JSON string.
+// Returns "" if there are no matches worth serializing.
+func serializeDetectMatches(matched []matchedRule) string {
+	if len(matched) == 0 {
+		return ""
+	}
+
+	entries := make([]detectMatchEntry, 0, len(matched))
+	for _, m := range matched {
+		entries = append(entries, detectMatchEntry{
+			RuleID:   m.ruleID,
+			RuleName: m.ruleName,
+			Severity: m.severity,
+			Score:    m.score,
+			Matches:  m.matches,
+		})
+	}
+
+	buf, err := json.Marshal(entries)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+// ─── Request Context Capture ────────────────────────────────────────
+
+// maxRequestBodyLog is the max bytes of request body to include in log capture.
+const maxRequestBodyLog = 8192 // 8 KB
+
+// serializeRequestHeaders converts request headers to a compact JSON string
+// for access log capture. Strips large cookie values and caps total size.
+func serializeRequestHeaders(r *http.Request) string {
+	if len(r.Header) == 0 {
+		return ""
+	}
+	// Copy headers, truncating oversized values (e.g., large cookies).
+	hdr := make(map[string][]string, len(r.Header))
+	for k, vs := range r.Header {
+		vals := make([]string, len(vs))
+		for i, v := range vs {
+			if len(v) > 500 {
+				vals[i] = v[:500] + "...(truncated)"
+			} else {
+				vals[i] = v
+			}
+		}
+		hdr[k] = vals
+	}
+	buf, err := json.Marshal(hdr)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+// captureRequestContext sets Caddy variables with the full request headers
+// and (optionally) a truncated request body excerpt. Only called for
+// block/honeypot/detect_block events — not on every request.
+func captureRequestContext(r *http.Request, pb *parsedBody) {
+	if hdrs := serializeRequestHeaders(r); hdrs != "" {
+		caddyhttp.SetVar(r.Context(), "policy_engine.request_headers", hdrs)
+	}
+	// Include request body excerpt if it was already read for body conditions.
+	// We don't read the body just for logging — only capture what's available.
+	if pb != nil && len(pb.raw) > 0 {
+		excerpt := pb.raw
+		if len(excerpt) > maxRequestBodyLog {
+			excerpt = excerpt[:maxRequestBodyLog]
+		}
+		caddyhttp.SetVar(r.Context(), "policy_engine.request_body", string(excerpt))
+	}
 }
 
 // ─── JSON Helpers ───────────────────────────────────────────────────

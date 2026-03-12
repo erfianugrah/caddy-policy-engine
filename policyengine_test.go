@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -4238,5 +4239,944 @@ func TestDefaultRulesFileSerialization(t *testing.T) {
 	}
 	if len(decoded.Rules) != 1 || decoded.Rules[0].ID != "PE-001" {
 		t.Errorf("round-trip failed: %+v", decoded)
+	}
+}
+
+// ─── Detailed Matching (Observability) Tests ────────────────────────
+
+func TestTruncateForLog(t *testing.T) {
+	short := "hello"
+	if got := truncateForLog(short); got != short {
+		t.Errorf("expected %q, got %q", short, got)
+	}
+	long := strings.Repeat("x", 300)
+	got := truncateForLog(long)
+	if len(got) != 203 { // 200 + "..."
+		t.Errorf("expected length 203, got %d", len(got))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Error("expected truncated string to end with ...")
+	}
+}
+
+func TestSingleFieldVarName(t *testing.T) {
+	tests := []struct {
+		field, name, want string
+	}{
+		{"ip", "", "REMOTE_ADDR"},
+		{"path", "", "REQUEST_URI"},
+		{"uri_path", "", "REQUEST_FILENAME"},
+		{"host", "", "SERVER_NAME"},
+		{"method", "", "REQUEST_METHOD"},
+		{"user_agent", "", "REQUEST_HEADERS:User-Agent"},
+		{"query", "", "QUERY_STRING"},
+		{"country", "", "REQUEST_HEADERS:Cf-Ipcountry"},
+		{"referer", "", "REQUEST_HEADERS:Referer"},
+		{"http_version", "", "REQUEST_PROTOCOL"},
+		{"header", "X-Custom", "REQUEST_HEADERS:X-Custom"},
+		{"header", "", "REQUEST_HEADERS"},
+		{"cookie", "session", "REQUEST_COOKIES:session"},
+		{"args", "id", "ARGS:id"},
+		{"body", "", "REQUEST_BODY"},
+		{"body_json", ".user.name", "REQUEST_BODY_JSON:.user.name"},
+		{"body_form", "action", "ARGS_POST:action"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field+"_"+tt.name, func(t *testing.T) {
+			got := singleFieldVarName(tt.field, tt.name)
+			if got != tt.want {
+				t.Errorf("singleFieldVarName(%q, %q) = %q, want %q", tt.field, tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvalOperatorDetailed_Eq(t *testing.T) {
+	cc := compiledCondition{operator: "eq", exactVal: "hello"}
+	matched, data := evalOperatorDetailed(cc, "hello")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "hello" {
+		t.Errorf("expected matched data 'hello', got %q", data)
+	}
+
+	matched, data = evalOperatorDetailed(cc, "world")
+	if matched {
+		t.Error("expected no match")
+	}
+	if data != "" {
+		t.Errorf("expected empty matched data, got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_Contains(t *testing.T) {
+	cc := compiledCondition{operator: "contains", contains: "bad"}
+	matched, data := evalOperatorDetailed(cc, "this is bad stuff")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "bad" {
+		t.Errorf("expected matched data 'bad', got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_Regex(t *testing.T) {
+	re := regexp.MustCompile(`\d{3}-\d{4}`)
+	cc := compiledCondition{operator: "regex", regex: re}
+	matched, data := evalOperatorDetailed(cc, "call 555-1234 now")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "555-1234" {
+		t.Errorf("expected matched data '555-1234', got %q", data)
+	}
+
+	matched, data = evalOperatorDetailed(cc, "no numbers here")
+	if matched {
+		t.Error("expected no match")
+	}
+	if data != "" {
+		t.Errorf("expected empty matched data, got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_PhraseMatch(t *testing.T) {
+	ac := CompileAC([]string{"curl", "wget", "nikto"})
+	cc := compiledCondition{operator: "phrase_match", acMatcher: ac}
+	matched, data := evalOperatorDetailed(cc, "Mozilla/5.0 curl/7.88")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "curl" {
+		t.Errorf("expected matched data 'curl', got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_BeginsWith(t *testing.T) {
+	cc := compiledCondition{operator: "begins_with", prefix: "/admin"}
+	matched, data := evalOperatorDetailed(cc, "/admin/settings")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "/admin" {
+		t.Errorf("expected matched data '/admin', got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_EndsWith(t *testing.T) {
+	cc := compiledCondition{operator: "ends_with", suffix: ".php"}
+	matched, data := evalOperatorDetailed(cc, "/index.php")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != ".php" {
+		t.Errorf("expected matched data '.php', got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_In(t *testing.T) {
+	cc := compiledCondition{operator: "in", stringSet: map[string]bool{
+		"GET": true, "POST": true, "PUT": true,
+	}}
+	matched, data := evalOperatorDetailed(cc, "POST")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "POST" {
+		t.Errorf("expected matched data 'POST', got %q", data)
+	}
+}
+
+func TestEvalOperatorDetailed_Gt(t *testing.T) {
+	cc := compiledCondition{operator: "gt", numericVal: 10}
+	matched, data := evalOperatorDetailed(cc, "15")
+	if !matched {
+		t.Error("expected match")
+	}
+	if data != "15" {
+		t.Errorf("expected matched data '15', got %q", data)
+	}
+	matched, _ = evalOperatorDetailed(cc, "5")
+	if matched {
+		t.Error("expected no match for 5 > 10")
+	}
+}
+
+func TestMatchConditionDetailed_SingleField(t *testing.T) {
+	cc := compiledCondition{
+		field:    "user_agent",
+		operator: "contains",
+		contains: "curl",
+	}
+	r := makeRequestWithHeaders("GET", "/test", "1.2.3.4:1234", map[string]string{
+		"User-Agent": "curl/7.88.1",
+	})
+	matched, detail := matchConditionDetailed(cc, r, nil)
+	if !matched {
+		t.Fatal("expected match")
+	}
+	if detail == nil {
+		t.Fatal("expected non-nil detail")
+	}
+	if detail.Field != "user_agent" {
+		t.Errorf("expected field 'user_agent', got %q", detail.Field)
+	}
+	if detail.VarName != "REQUEST_HEADERS:User-Agent" {
+		t.Errorf("expected var_name 'REQUEST_HEADERS:User-Agent', got %q", detail.VarName)
+	}
+	if detail.Value != "curl/7.88.1" {
+		t.Errorf("expected value 'curl/7.88.1', got %q", detail.Value)
+	}
+	if detail.MatchedData != "curl" {
+		t.Errorf("expected matched_data 'curl', got %q", detail.MatchedData)
+	}
+	if detail.Operator != "contains" {
+		t.Errorf("expected operator 'contains', got %q", detail.Operator)
+	}
+}
+
+func TestMatchConditionDetailed_MultiField(t *testing.T) {
+	// all_headers with phrase_match — should find the header that matches.
+	ac := CompileAC([]string{"nikto", "sqlmap"})
+	cc := compiledCondition{
+		field:     "all_headers",
+		operator:  "phrase_match",
+		acMatcher: ac,
+		isMulti:   true,
+	}
+	r := makeRequestWithHeaders("GET", "/test", "1.2.3.4:1234", map[string]string{
+		"User-Agent": "nikto/2.1.6",
+		"Accept":     "text/html",
+	})
+	matched, detail := matchConditionDetailed(cc, r, nil)
+	if !matched {
+		t.Fatal("expected match")
+	}
+	if detail == nil {
+		t.Fatal("expected non-nil detail")
+	}
+	// The var_name should be REQUEST_HEADERS:<header-name>
+	if !strings.HasPrefix(detail.VarName, "REQUEST_HEADERS:") {
+		t.Errorf("expected VarName to start with 'REQUEST_HEADERS:', got %q", detail.VarName)
+	}
+	if detail.MatchedData != "nikto" {
+		t.Errorf("expected matched_data 'nikto', got %q", detail.MatchedData)
+	}
+}
+
+func TestMatchConditionDetailed_MultiField_AllArgs(t *testing.T) {
+	// all_args_values with regex — match a query parameter value.
+	re := regexp.MustCompile(`(?i)union\s+select`)
+	cc := compiledCondition{
+		field:    "all_args_values",
+		operator: "regex",
+		regex:    re,
+		isMulti:  true,
+	}
+	r := makeRequest("GET", "/search?q=1+UNION+SELECT+*+FROM+users&page=1", "1.2.3.4:1234")
+	matched, detail := matchConditionDetailed(cc, r, nil)
+	if !matched {
+		t.Fatal("expected match")
+	}
+	if detail == nil {
+		t.Fatal("expected non-nil detail")
+	}
+	if detail.VarName != "ARGS:q" {
+		t.Errorf("expected VarName 'ARGS:q', got %q", detail.VarName)
+	}
+	if detail.MatchedData == "" {
+		t.Error("expected non-empty matched_data for regex match")
+	}
+}
+
+func TestMatchConditionDetailed_Negate(t *testing.T) {
+	// neq is compiled with negate=true and operator="neq" (which returns eq result).
+	cc := compiledCondition{
+		field:    "method",
+		operator: "neq",
+		exactVal: "POST",
+		negate:   true,
+	}
+	r := makeRequest("GET", "/test", "1.2.3.4:1234")
+	matched, detail := matchConditionDetailed(cc, r, nil)
+	if !matched {
+		t.Fatal("expected match (GET != POST)")
+	}
+	if detail == nil {
+		t.Fatal("expected non-nil detail for negated match")
+	}
+	if detail.Field != "method" {
+		t.Errorf("expected field 'method', got %q", detail.Field)
+	}
+}
+
+func TestMatchRuleDetailed_AND(t *testing.T) {
+	// AND rule with two conditions — both must match, both details returned.
+	cc1 := compiledCondition{
+		field:    "path",
+		operator: "contains",
+		contains: "/admin",
+	}
+	cc2 := compiledCondition{
+		field:    "method",
+		operator: "eq",
+		exactVal: "POST",
+	}
+	cr := compiledRule{
+		rule:       PolicyRule{ID: "r1", GroupOp: "and"},
+		conditions: []compiledCondition{cc1, cc2},
+	}
+	r := makeRequest("POST", "/admin/delete", "1.2.3.4:1234")
+	matched, details := matchRuleDetailed(cr, r, nil)
+	if !matched {
+		t.Fatal("expected match")
+	}
+	if len(details) != 2 {
+		t.Fatalf("expected 2 details, got %d", len(details))
+	}
+	if details[0].Field != "path" {
+		t.Errorf("expected first detail field='path', got %q", details[0].Field)
+	}
+	if details[0].MatchedData != "/admin" {
+		t.Errorf("expected first matched_data '/admin', got %q", details[0].MatchedData)
+	}
+	if details[1].Field != "method" {
+		t.Errorf("expected second detail field='method', got %q", details[1].Field)
+	}
+}
+
+func TestMatchRuleDetailed_OR(t *testing.T) {
+	// OR rule — returns on first match.
+	cc1 := compiledCondition{
+		field:    "path",
+		operator: "contains",
+		contains: "/secret",
+	}
+	cc2 := compiledCondition{
+		field:    "user_agent",
+		operator: "contains",
+		contains: "curl",
+	}
+	cr := compiledRule{
+		rule:       PolicyRule{ID: "r1", GroupOp: "or"},
+		conditions: []compiledCondition{cc1, cc2},
+	}
+	r := makeRequestWithHeaders("GET", "/test", "1.2.3.4:1234", map[string]string{
+		"User-Agent": "curl/7.88",
+	})
+	matched, details := matchRuleDetailed(cr, r, nil)
+	if !matched {
+		t.Fatal("expected match via user_agent")
+	}
+	// OR returns exactly 1 detail (the first match).
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail for OR match, got %d", len(details))
+	}
+	if details[0].Field != "user_agent" {
+		t.Errorf("expected detail field='user_agent', got %q", details[0].Field)
+	}
+}
+
+func TestMatchRuleDetailed_NoConditions(t *testing.T) {
+	// Rule with no conditions matches everything — no details.
+	cr := compiledRule{
+		rule:       PolicyRule{ID: "r1"},
+		conditions: nil,
+	}
+	r := makeRequest("GET", "/test", "1.2.3.4:1234")
+	matched, details := matchRuleDetailed(cr, r, nil)
+	if !matched {
+		t.Fatal("expected match for empty conditions")
+	}
+	if len(details) != 0 {
+		t.Errorf("expected no details, got %d", len(details))
+	}
+}
+
+func TestSerializeDetectMatches(t *testing.T) {
+	matches := []matchedRule{
+		{
+			ruleID:   "PE-920350",
+			ruleName: "Missing Host header",
+			severity: "WARNING",
+			score:    3,
+			matches: []matchDetail{
+				{
+					Field:       "header",
+					VarName:     "REQUEST_HEADERS:Host",
+					Value:       "",
+					MatchedData: "",
+					Operator:    "eq",
+				},
+			},
+		},
+		{
+			ruleID:   "PE-920300",
+			ruleName: "Missing Accept header",
+			severity: "NOTICE",
+			score:    2,
+			matches:  nil,
+		},
+	}
+
+	result := serializeDetectMatches(matches)
+	if result == "" {
+		t.Fatal("expected non-empty JSON")
+	}
+
+	// Parse back to verify structure.
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(result), &entries); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].RuleID != "PE-920350" {
+		t.Errorf("expected rule_id 'PE-920350', got %q", entries[0].RuleID)
+	}
+	if entries[0].Score != 3 {
+		t.Errorf("expected score 3, got %d", entries[0].Score)
+	}
+	if len(entries[0].Matches) != 1 {
+		t.Fatalf("expected 1 match detail, got %d", len(entries[0].Matches))
+	}
+	if entries[0].Matches[0].VarName != "REQUEST_HEADERS:Host" {
+		t.Errorf("expected VarName 'REQUEST_HEADERS:Host', got %q", entries[0].Matches[0].VarName)
+	}
+	// Second entry has no matches.
+	if len(entries[1].Matches) != 0 {
+		t.Errorf("expected 0 matches for second entry, got %d", len(entries[1].Matches))
+	}
+}
+
+func TestSerializeDetectMatches_Empty(t *testing.T) {
+	result := serializeDetectMatches(nil)
+	if result != "" {
+		t.Errorf("expected empty string for nil matches, got %q", result)
+	}
+}
+
+func TestDetect_MatchDetails_InCaddyVar(t *testing.T) {
+	// Integration test: detect rules fire, match details should appear in Caddy var.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "curl detector", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "contains", Value: "curl"},
+			},
+		},
+		{
+			ID: "d2", Name: "admin path", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "WARNING", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/admin"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 5, // CRITICAL(5) + WARNING(3) = 8 > 5
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/admin/panel", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "curl/7.88.1",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected error for detect_block")
+	}
+
+	// Verify detect_matches Caddy var is set.
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	if matchesRaw == "" {
+		t.Fatal("expected policy_engine.detect_matches to be set")
+	}
+
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("failed to parse detect_matches JSON: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	// First entry: curl detector — should have match details.
+	if entries[0].RuleID != "d1" {
+		t.Errorf("expected first rule_id 'd1', got %q", entries[0].RuleID)
+	}
+	if entries[0].Severity != "CRITICAL" {
+		t.Errorf("expected severity 'CRITICAL', got %q", entries[0].Severity)
+	}
+	if len(entries[0].Matches) != 1 {
+		t.Fatalf("expected 1 match for d1, got %d", len(entries[0].Matches))
+	}
+	m := entries[0].Matches[0]
+	if m.VarName != "REQUEST_HEADERS:User-Agent" {
+		t.Errorf("expected VarName 'REQUEST_HEADERS:User-Agent', got %q", m.VarName)
+	}
+	if m.Value != "curl/7.88.1" {
+		t.Errorf("expected Value 'curl/7.88.1', got %q", m.Value)
+	}
+	if m.MatchedData != "curl" {
+		t.Errorf("expected MatchedData 'curl', got %q", m.MatchedData)
+	}
+
+	// Second entry: admin path.
+	if entries[1].RuleID != "d2" {
+		t.Errorf("expected second rule_id 'd2', got %q", entries[1].RuleID)
+	}
+	if len(entries[1].Matches) != 1 {
+		t.Fatalf("expected 1 match for d2, got %d", len(entries[1].Matches))
+	}
+	m2 := entries[1].Matches[0]
+	if m2.VarName != "REQUEST_URI" {
+		t.Errorf("expected VarName 'REQUEST_URI', got %q", m2.VarName)
+	}
+	if m2.MatchedData != "/admin" {
+		t.Errorf("expected MatchedData '/admin', got %q", m2.MatchedData)
+	}
+}
+
+func TestDetect_MatchDetails_BelowThreshold(t *testing.T) {
+	// Below threshold: match details should still be emitted for logged events.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "notice detect", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "NOTICE", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 10, // NOTICE(2) < 10
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test-page", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called (below threshold)")
+	}
+
+	// Match details should still be emitted even below threshold.
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	if matchesRaw == "" {
+		t.Fatal("expected policy_engine.detect_matches even below threshold")
+	}
+
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("failed to parse detect_matches: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].RuleID != "d1" {
+		t.Errorf("expected rule_id 'd1', got %q", entries[0].RuleID)
+	}
+}
+
+func TestDetect_MatchDetails_PhraseMatch(t *testing.T) {
+	// phrase_match should report which specific pattern matched.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "scanner UA", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "phrase_match", ListItems: []string{"nikto", "sqlmap", "nmap"}},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3, // CRITICAL(5) > 3
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "Mozilla/5.0 sqlmap/1.7",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected detect_block")
+	}
+
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	if matchesRaw == "" {
+		t.Fatal("expected detect_matches")
+	}
+
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(entries) != 1 || len(entries[0].Matches) != 1 {
+		t.Fatalf("expected 1 entry with 1 match, got %d entries", len(entries))
+	}
+	m := entries[0].Matches[0]
+	if m.MatchedData != "sqlmap" {
+		t.Errorf("expected MatchedData 'sqlmap', got %q", m.MatchedData)
+	}
+}
+
+func TestDetect_MatchDetails_Regex(t *testing.T) {
+	// regex should capture the matched substring.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "SQL injection", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "regex", Value: `(?i)sqlmap`},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/items", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "sqlmap/1.7.0",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected detect_block")
+	}
+
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(entries[0].Matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(entries[0].Matches))
+	}
+	m := entries[0].Matches[0]
+	if m.MatchedData != "sqlmap" {
+		t.Errorf("expected MatchedData 'sqlmap', got %q", m.MatchedData)
+	}
+	if m.Operator != "regex" {
+		t.Errorf("expected operator 'regex', got %q", m.Operator)
+	}
+}
+
+func TestDetect_MatchDetails_MultiConditionAND(t *testing.T) {
+	// AND rule with two conditions — both match details should be present.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "suspicious POST", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			GroupOp: "and",
+			Conditions: []PolicyCondition{
+				{Field: "method", Operator: "eq", Value: "POST"},
+				{Field: "user_agent", Operator: "contains", Value: "curl"},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("POST", "/api/data", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "curl/7.88.1",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err == nil {
+		t.Fatal("expected detect_block")
+	}
+
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if len(entries[0].Matches) != 2 {
+		t.Fatalf("expected 2 match details for AND rule, got %d", len(entries[0].Matches))
+	}
+	// First condition: method
+	if entries[0].Matches[0].Field != "method" {
+		t.Errorf("expected first match field='method', got %q", entries[0].Matches[0].Field)
+	}
+	if entries[0].Matches[0].MatchedData != "POST" {
+		t.Errorf("expected first MatchedData 'POST', got %q", entries[0].Matches[0].MatchedData)
+	}
+	// Second condition: user_agent
+	if entries[0].Matches[1].Field != "user_agent" {
+		t.Errorf("expected second match field='user_agent', got %q", entries[0].Matches[1].Field)
+	}
+	if entries[0].Matches[1].MatchedData != "curl" {
+		t.Errorf("expected second MatchedData 'curl', got %q", entries[0].Matches[1].MatchedData)
+	}
+}
+
+func TestDetect_MatchDetails_ValueTruncated(t *testing.T) {
+	// Long values should be truncated in match details.
+	longValue := strings.Repeat("A", 300)
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "long param", Type: "detect", Enabled: true,
+			Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "regex", Value: `A{10,}`},
+			},
+		},
+	}, &WafConfig{
+		ParanoiaLevel:    2,
+		InboundThreshold: 3,
+	})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/"+longValue, "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	_ = pe.ServeHTTP(w, r, next)
+
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	if matchesRaw == "" {
+		t.Fatal("expected detect_matches")
+	}
+	var entries []detectMatchEntry
+	if err := json.Unmarshal([]byte(matchesRaw), &entries); err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(entries) > 0 && len(entries[0].Matches) > 0 {
+		m := entries[0].Matches[0]
+		// Value should be truncated.
+		if len(m.Value) > 210 { // 200 + "..." + some slack
+			t.Errorf("expected value to be truncated, got length %d", len(m.Value))
+		}
+	}
+}
+
+// ─── Request Context Capture Tests ──────────────────────────────────
+
+func TestSerializeRequestHeaders(t *testing.T) {
+	r := makeRequestWithHeaders("GET", "/test", "10.0.0.1:1234", map[string]string{
+		"User-Agent":    "Mozilla/5.0",
+		"X-Custom":      "hello",
+		"Authorization": "Bearer token123",
+	})
+	result := serializeRequestHeaders(r)
+	if result == "" {
+		t.Fatal("expected non-empty header JSON")
+	}
+	var hdrs map[string][]string
+	if err := json.Unmarshal([]byte(result), &hdrs); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(hdrs["User-Agent"]) == 0 || hdrs["User-Agent"][0] != "Mozilla/5.0" {
+		t.Errorf("User-Agent not preserved: %v", hdrs["User-Agent"])
+	}
+	if len(hdrs["X-Custom"]) == 0 || hdrs["X-Custom"][0] != "hello" {
+		t.Errorf("X-Custom not preserved: %v", hdrs["X-Custom"])
+	}
+}
+
+func TestSerializeRequestHeaders_TruncatesLargeValues(t *testing.T) {
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	// Set a header value > 500 chars.
+	bigVal := strings.Repeat("x", 600)
+	r.Header.Set("Cookie", bigVal)
+	result := serializeRequestHeaders(r)
+	var hdrs map[string][]string
+	if err := json.Unmarshal([]byte(result), &hdrs); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	cookieVal := hdrs["Cookie"][0]
+	if len(cookieVal) > 520 { // 500 + "...(truncated)"
+		t.Errorf("expected cookie truncated, got length %d", len(cookieVal))
+	}
+	if !strings.HasSuffix(cookieVal, "...(truncated)") {
+		t.Errorf("expected truncation suffix, got %q", cookieVal[len(cookieVal)-20:])
+	}
+}
+
+func TestSerializeRequestHeaders_Empty(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.Header = http.Header{} // explicitly empty
+	result := serializeRequestHeaders(r)
+	if result != "" {
+		t.Errorf("expected empty string for empty headers, got %q", result)
+	}
+}
+
+func TestBlockAction_CapturesRequestHeaders(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "b-ctx", Name: "Block Test", Type: "block", Enabled: true,
+				Priority: 100,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/blocked"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/blocked", "10.0.0.1:1234", map[string]string{
+		"User-Agent":      "TestBot/1.0",
+		"X-Forwarded-For": "203.0.113.5",
+		"Accept":          "text/html",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	_ = pe.ServeHTTP(w, r, next)
+
+	// Verify request_headers var is set.
+	hdrsRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.request_headers").(string)
+	if hdrsRaw == "" {
+		t.Fatal("expected policy_engine.request_headers to be set on block")
+	}
+	var hdrs map[string][]string
+	if err := json.Unmarshal([]byte(hdrsRaw), &hdrs); err != nil {
+		t.Fatalf("invalid header JSON: %v", err)
+	}
+	if len(hdrs["User-Agent"]) == 0 || hdrs["User-Agent"][0] != "TestBot/1.0" {
+		t.Errorf("User-Agent not captured: %v", hdrs["User-Agent"])
+	}
+	if len(hdrs["Accept"]) == 0 || hdrs["Accept"][0] != "text/html" {
+		t.Errorf("Accept not captured: %v", hdrs["Accept"])
+	}
+}
+
+func TestDetectBlock_CapturesRequestHeaders(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d-ctx", Name: "Detect Test", Type: "detect", Enabled: true,
+			Priority: 200, Severity: "CRITICAL", // score = 5
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "contains", Value: "evil"},
+			},
+		},
+	}, &WafConfig{
+		InboundThreshold: 3, // CRITICAL(5) > 3 → block
+	})
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/test", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "evil-scanner/1.0",
+		"Referer":    "https://evil.example.com",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	_ = pe.ServeHTTP(w, r, next)
+
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "detect_block" {
+		t.Fatalf("expected detect_block action, got %q", action)
+	}
+
+	hdrsRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.request_headers").(string)
+	if hdrsRaw == "" {
+		t.Fatal("expected policy_engine.request_headers to be set on detect_block")
+	}
+	var hdrs map[string][]string
+	if err := json.Unmarshal([]byte(hdrsRaw), &hdrs); err != nil {
+		t.Fatalf("invalid header JSON: %v", err)
+	}
+	if len(hdrs["User-Agent"]) == 0 || hdrs["User-Agent"][0] != "evil-scanner/1.0" {
+		t.Errorf("User-Agent not captured: %v", hdrs["User-Agent"])
+	}
+	if len(hdrs["Referer"]) == 0 || hdrs["Referer"][0] != "https://evil.example.com" {
+		t.Errorf("Referer not captured: %v", hdrs["Referer"])
+	}
+}
+
+func TestAllowAction_DoesNotCaptureHeaders(t *testing.T) {
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "a-ctx", Name: "Allow Test", Type: "allow", Enabled: true,
+				Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "ip", Operator: "eq", Value: "10.0.0.1"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	r.Header.Set("User-Agent", "LegitBot/1.0")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	_ = pe.ServeHTTP(w, r, next)
+
+	hdrsRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.request_headers").(string)
+	if hdrsRaw != "" {
+		t.Errorf("expected no request_headers for allow action, got %q", hdrsRaw[:min(50, len(hdrsRaw))])
+	}
+}
+
+func TestBelowThresholdDetect_DoesNotCaptureHeaders(t *testing.T) {
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d-low", Name: "Low Detect", Type: "detect", Enabled: true,
+			Priority: 200, Severity: "WARNING", // score = 3
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "contains", Value: "curl"},
+			},
+		},
+	}, &WafConfig{
+		InboundThreshold: 10, // WARNING(3) < 10 → pass
+	})
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequestWithHeaders("GET", "/test", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "curl/7.68",
+	})
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	_ = pe.ServeHTTP(w, r, next)
+
+	// Below threshold → should NOT capture headers (only blocking events get full context).
+	hdrsRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.request_headers").(string)
+	if hdrsRaw != "" {
+		t.Errorf("expected no request_headers for below-threshold detect, got headers")
+	}
+
+	// But detect_matches should still be set (observability for logged events).
+	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
+	if matchesRaw == "" {
+		t.Error("expected detect_matches to still be set for below-threshold detect")
 	}
 }
