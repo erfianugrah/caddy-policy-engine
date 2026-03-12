@@ -38,10 +38,11 @@ import (
 const defaultBodyMaxSize = 13 * 1024 * 1024
 
 // maxRegexLen is the maximum allowed regex pattern length (bytes).
-// Go's RE2 engine is linear-time, but extremely large compiled regexes
-// can still consume significant memory. 8 KiB is generous for any
-// reasonable security rule pattern.
-const maxRegexLen = 8 * 1024
+// Go's RE2 engine is linear-time, so large patterns are safe from ReDoS.
+// CRS 4.x rules (especially RCE/PHP injection) can have patterns up to
+// ~12 KiB due to extensive command/function name alternations.
+// 128 KiB provides ample headroom for current and future CRS versions.
+const maxRegexLen = 128 * 1024
 
 func init() {
 	caddy.RegisterModule(PolicyEngine{})
