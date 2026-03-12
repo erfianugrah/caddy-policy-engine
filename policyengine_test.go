@@ -3250,6 +3250,350 @@ func TestExtractMultiField_WithFormBody(t *testing.T) {
 	}
 }
 
+// ─── request_combined: aggregate CRS variable field ────────────────
+
+func TestExtractMultiField_RequestCombined_FormBody(t *testing.T) {
+	r := httptest.NewRequest("POST", "/login?redirect=/home", strings.NewReader("username=admin&password=secret"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("X-Custom", "custom-value")
+	r.AddCookie(&http.Cookie{Name: "session", Value: "abc123"})
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "request_combined"}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	// Query params (names + values)
+	for _, want := range []string{"redirect", "/home"} {
+		if !have[want] {
+			t.Errorf("request_combined missing query param %q", want)
+		}
+	}
+	// Form body params (names + values)
+	for _, want := range []string{"username", "admin", "password", "secret"} {
+		if !have[want] {
+			t.Errorf("request_combined missing form param %q", want)
+		}
+	}
+	// Raw body
+	if !have["username=admin&password=secret"] {
+		t.Error("request_combined missing raw body")
+	}
+	// Cookie name + value
+	if !have["session"] {
+		t.Error("request_combined missing cookie name")
+	}
+	if !have["abc123"] {
+		t.Error("request_combined missing cookie value")
+	}
+	// Header value
+	if !have["custom-value"] {
+		t.Error("request_combined missing header value")
+	}
+	// Request basename
+	if !have["login"] {
+		t.Error("request_combined missing request basename")
+	}
+}
+
+func TestExtractMultiField_RequestCombined_JSONBody(t *testing.T) {
+	body := `{"test": "com.opensymphony.xwork2", "nested": {"key": "value"}}`
+	r := httptest.NewRequest("POST", "/post", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "request_combined"}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	// JSON key names
+	if !have["test"] {
+		t.Error("request_combined missing JSON key 'test'")
+	}
+	if !have["nested"] {
+		t.Error("request_combined missing JSON key 'nested'")
+	}
+	if !have["key"] {
+		t.Error("request_combined missing JSON key 'key'")
+	}
+	// JSON string values
+	if !have["com.opensymphony.xwork2"] {
+		t.Error("request_combined missing JSON value 'com.opensymphony.xwork2'")
+	}
+	if !have["value"] {
+		t.Error("request_combined missing JSON value 'value'")
+	}
+	// Raw body should also be present
+	if !have[body] {
+		t.Error("request_combined missing raw body")
+	}
+}
+
+func TestExtractMultiField_RequestCombined_XMLBody(t *testing.T) {
+	// XML bodies should at least be present as raw body string
+	body := `<?xml version="1.0"?><xml><element attr="java.lang.Runtime">payload</element></xml>`
+	r := httptest.NewRequest("POST", "/post", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/xml")
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "request_combined"}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	// XML is not parsed into structured values, but raw body should contain it
+	if !have[body] {
+		t.Error("request_combined missing raw body (XML)")
+	}
+	// Since it's not form-encoded or JSON, getForm/getJSON won't extract structured data
+	// but raw body matching will catch attack patterns
+}
+
+func TestExtractMultiFieldKeyed_RequestCombined(t *testing.T) {
+	r := httptest.NewRequest("POST", "/test?q=search", strings.NewReader("username=admin"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("User-Agent", "test-agent")
+	r.AddCookie(&http.Cookie{Name: "sid", Value: "xyz"})
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "request_combined"}
+	kvs := extractMultiFieldKeyed(cc, r, pb)
+
+	keyMap := make(map[string]string)
+	for _, kv := range kvs {
+		keyMap[kv.key] = kv.val
+	}
+
+	// Check query params
+	if keyMap["ARGS:q"] != "search" {
+		t.Errorf("expected ARGS:q=search, got %q", keyMap["ARGS:q"])
+	}
+	if keyMap["ARGS_NAMES:q"] != "q" {
+		t.Errorf("expected ARGS_NAMES:q=q, got %q", keyMap["ARGS_NAMES:q"])
+	}
+
+	// Check form body
+	if keyMap["ARGS_POST:username"] != "admin" {
+		t.Errorf("expected ARGS_POST:username=admin, got %q", keyMap["ARGS_POST:username"])
+	}
+
+	// Check raw body
+	if keyMap["REQUEST_BODY"] != "username=admin" {
+		t.Errorf("expected REQUEST_BODY=username=admin, got %q", keyMap["REQUEST_BODY"])
+	}
+
+	// Check cookies
+	if keyMap["REQUEST_COOKIES:sid"] != "xyz" {
+		t.Errorf("expected REQUEST_COOKIES:sid=xyz, got %q", keyMap["REQUEST_COOKIES:sid"])
+	}
+
+	// Check headers
+	if keyMap["REQUEST_HEADERS:User-Agent"] != "test-agent" {
+		t.Errorf("expected REQUEST_HEADERS:User-Agent=test-agent, got %q", keyMap["REQUEST_HEADERS:User-Agent"])
+	}
+}
+
+func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
+	// Simulate CRS rule 944130: phrase_match for Java classes
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "request_combined",
+		Operator: "phrase_match",
+		ListItems: []string{
+			"java.lang.runtime",
+			"java.lang.processbuilder",
+		},
+		Transforms: []string{"lowercase"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test 1: Payload in form body param value
+	r := httptest.NewRequest("POST", "/post", strings.NewReader("test=java.lang.Runtime"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+	if !matchCondition(cc, r, pb) {
+		t.Error("phrase_match should detect java.lang.Runtime in form body param value")
+	}
+
+	// Test 2: Payload in cookie value
+	r2 := httptest.NewRequest("POST", "/post", nil)
+	r2.AddCookie(&http.Cookie{Name: "test", Value: "java.lang.ProcessBuilder"})
+	ctx2 := context.WithValue(r2.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r2 = r2.WithContext(ctx2)
+	if !matchCondition(cc, r2, &parsedBody{}) {
+		t.Error("phrase_match should detect java.lang.ProcessBuilder in cookie value")
+	}
+
+	// Test 3: Payload in custom header
+	r3 := httptest.NewRequest("POST", "/post", nil)
+	r3.Header.Set("X-Custom", "java.lang.Runtime")
+	ctx3 := context.WithValue(r3.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r3 = r3.WithContext(ctx3)
+	if !matchCondition(cc, r3, &parsedBody{}) {
+		t.Error("phrase_match should detect java.lang.Runtime in header value")
+	}
+
+	// Test 4: Payload in JSON body
+	jsonBody := `{"test": "java.lang.Runtime"}`
+	r4 := httptest.NewRequest("POST", "/post", strings.NewReader(jsonBody))
+	r4.Header.Set("Content-Type", "application/json")
+	ctx4 := context.WithValue(r4.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r4 = r4.WithContext(ctx4)
+	buf4, _ := readBody(r4, 1024*1024)
+	pb4 := &parsedBody{raw: buf4}
+	if !matchCondition(cc, r4, pb4) {
+		t.Error("phrase_match should detect java.lang.Runtime in JSON body value")
+	}
+
+	// Test 5: Payload in raw body (text/plain)
+	r5 := httptest.NewRequest("POST", "/post", strings.NewReader("test=java.lang.Runtime"))
+	r5.Header.Set("Content-Type", "text/plain")
+	ctx5 := context.WithValue(r5.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r5 = r5.WithContext(ctx5)
+	buf5, _ := readBody(r5, 1024*1024)
+	pb5 := &parsedBody{raw: buf5}
+	if !matchCondition(cc, r5, pb5) {
+		t.Error("phrase_match should detect java.lang.Runtime in raw body (text/plain)")
+	}
+
+	// Test 6: Clean request — should NOT match
+	r6 := httptest.NewRequest("GET", "/safe?q=hello", nil)
+	ctx6 := context.WithValue(r6.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r6 = r6.WithContext(ctx6)
+	if matchCondition(cc, r6, &parsedBody{}) {
+		t.Error("phrase_match should not match clean request")
+	}
+}
+
+func TestMatchCondition_RequestCombined_Regex(t *testing.T) {
+	// Simulate CRS rule 942210: regex on request_combined
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "request_combined",
+		Operator: "regex",
+		Value:    `(?i)(?:select|union|insert)\s`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Payload in query param
+	r := httptest.NewRequest("GET", "/page?q=1+UNION+SELECT+1", nil)
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+	if !matchCondition(cc, r, &parsedBody{}) {
+		t.Error("regex should detect SQL injection in query param value")
+	}
+}
+
+func TestFlattenJSONValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected []string
+	}{
+		{
+			name:     "simple object",
+			body:     `{"key": "value"}`,
+			expected: []string{"key", "value"},
+		},
+		{
+			name:     "nested object",
+			body:     `{"a": {"b": "c"}}`,
+			expected: []string{"a", "b", "c"},
+		},
+		{
+			name:     "array",
+			body:     `{"items": ["x", "y"]}`,
+			expected: []string{"items", "x", "y"},
+		},
+		{
+			name:     "numeric value",
+			body:     `{"count": 42}`,
+			expected: []string{"count", "42"},
+		},
+		{
+			name:     "invalid JSON",
+			body:     `not json`,
+			expected: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb := &parsedBody{raw: []byte(tt.body)}
+			vals := flattenJSONValues(pb)
+			if tt.expected == nil {
+				if vals != nil {
+					t.Errorf("expected nil, got %v", vals)
+				}
+				return
+			}
+			have := make(map[string]bool)
+			for _, v := range vals {
+				have[v] = true
+			}
+			for _, want := range tt.expected {
+				if !have[want] {
+					t.Errorf("missing %q in %v", want, vals)
+				}
+			}
+		})
+	}
+}
+
+func TestNeedsBodyField_RequestCombined(t *testing.T) {
+	if !needsBodyField("request_combined") {
+		t.Error("request_combined should need body")
+	}
+	if !needsBodyField("count:request_combined") {
+		t.Error("count:request_combined should need body")
+	}
+}
+
+func TestCompileCondition_RequestCombined_IsMulti(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "request_combined",
+		Operator: "contains",
+		Value:    "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cc.isMulti {
+		t.Error("request_combined should set isMulti")
+	}
+}
+
 // ─── v0.9.0: Multi-Value Matching (matchCondition with isMulti) ────
 
 func TestMatchCondition_MultiField_Contains(t *testing.T) {

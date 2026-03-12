@@ -254,11 +254,15 @@ func needsBodyField(field string) bool {
 	switch field {
 	case "all_args", "all_args_values", "all_args_names":
 		return true // these include POST form params from the body
+	case "request_combined":
+		return true // includes raw body + form params + JSON values
 	}
 	if strings.HasPrefix(field, countPrefix) {
 		underlying := field[len(countPrefix):]
 		switch underlying {
 		case "all_args", "all_args_values", "all_args_names":
+			return true
+		case "request_combined":
 			return true
 		}
 	}
@@ -276,6 +280,7 @@ var multiFields = map[string]bool{
 	"all_headers_names": true,
 	"all_cookies":       true,
 	"all_cookies_names": true,
+	"request_combined":  true,
 }
 
 // countPrefix is the prefix for count pseudo-fields (e.g., "count:all_args").
@@ -1059,8 +1064,101 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 		}
 		return vals
 
+	case "request_combined":
+		// Combined CRS variable set: ARGS + ARGS_NAMES + REQUEST_COOKIES +
+		// REQUEST_COOKIES_NAMES + REQUEST_BODY + REQUEST_HEADERS +
+		// REQUEST_FILENAME + XML:/* + XML://@*
+		// This matches the standard CRS multi-variable rule pattern.
+		var vals []string
+
+		// Query param names and values (ARGS + ARGS_NAMES)
+		for k, vs := range r.URL.Query() {
+			vals = append(vals, k)
+			vals = append(vals, vs...)
+		}
+
+		// POST body params — form-encoded, JSON, or raw
+		if pb != nil {
+			// Try form-encoded first
+			if formVals := pb.getForm(); formVals != nil {
+				for k, vs := range formVals {
+					vals = append(vals, k)
+					vals = append(vals, vs...)
+				}
+			}
+			// Also flatten JSON body values
+			vals = append(vals, flattenJSONValues(pb)...)
+			// Raw body as a single value (matches CRS REQUEST_BODY)
+			if len(pb.raw) > 0 {
+				vals = append(vals, string(pb.raw))
+			}
+		}
+
+		// Cookie names and values (REQUEST_COOKIES + REQUEST_COOKIES_NAMES)
+		for _, c := range r.Cookies() {
+			vals = append(vals, c.Name)
+			vals = append(vals, c.Value)
+		}
+
+		// All header values (REQUEST_HEADERS)
+		for _, vs := range r.Header {
+			vals = append(vals, vs...)
+		}
+
+		// Request basename (REQUEST_FILENAME)
+		p := r.URL.Path
+		if idx := strings.LastIndexByte(p, '/'); idx >= 0 {
+			p = p[idx+1:]
+		}
+		if p != "" {
+			vals = append(vals, p)
+		}
+
+		return vals
+
 	default:
 		return nil
+	}
+}
+
+// flattenJSONValues extracts all leaf string values from a parsed JSON body.
+// Returns nil if the body is not valid JSON. Handles nested objects and arrays.
+// Numeric values are converted to strings, booleans and nulls are skipped.
+func flattenJSONValues(pb *parsedBody) []string {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil
+	}
+	root, ok := pb.getJSON()
+	if !ok {
+		return nil
+	}
+	var vals []string
+	flattenJSONNode(root, &vals)
+	return vals
+}
+
+// flattenJSONNode recursively extracts string values from a JSON structure.
+func flattenJSONNode(node interface{}, vals *[]string) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key, child := range v {
+			*vals = append(*vals, key) // JSON key as ARGS_NAME
+			flattenJSONNode(child, vals)
+		}
+	case []interface{}:
+		for _, child := range v {
+			flattenJSONNode(child, vals)
+		}
+	case string:
+		*vals = append(*vals, v)
+	case float64:
+		// Include numeric values as strings (e.g., JSON integer fields)
+		if v == float64(int64(v)) {
+			*vals = append(*vals, strconv.FormatInt(int64(v), 10))
+		} else {
+			*vals = append(*vals, strconv.FormatFloat(v, 'f', -1, 64))
+		}
+		// bool and nil are skipped — not relevant for CRS pattern matching
 	}
 }
 
@@ -1145,8 +1243,112 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 		}
 		return kvs
 
+	case "request_combined":
+		// Combined CRS variable set with keyed attribution.
+		var kvs []keyedValue
+
+		// Query param names and values
+		for k, vs := range r.URL.Query() {
+			kvs = append(kvs, keyedValue{key: "ARGS_NAMES:" + k, val: k})
+			for _, v := range vs {
+				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
+			}
+		}
+
+		// POST body params — form-encoded
+		if pb != nil {
+			if formVals := pb.getForm(); formVals != nil {
+				for k, vs := range formVals {
+					kvs = append(kvs, keyedValue{key: "ARGS_POST_NAMES:" + k, val: k})
+					for _, v := range vs {
+						kvs = append(kvs, keyedValue{key: "ARGS_POST:" + k, val: v})
+					}
+				}
+			}
+			// JSON body key-value pairs
+			kvs = append(kvs, flattenJSONKeyed(pb)...)
+			// Raw body (REQUEST_BODY)
+			if len(pb.raw) > 0 {
+				kvs = append(kvs, keyedValue{key: "REQUEST_BODY", val: string(pb.raw)})
+			}
+		}
+
+		// Cookie names and values
+		for _, c := range r.Cookies() {
+			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES_NAMES:" + c.Name, val: c.Name})
+			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES:" + c.Name, val: c.Value})
+		}
+
+		// All header values
+		for k, vs := range r.Header {
+			for _, v := range vs {
+				kvs = append(kvs, keyedValue{key: "REQUEST_HEADERS:" + k, val: v})
+			}
+		}
+
+		// Request basename (REQUEST_FILENAME)
+		p := r.URL.Path
+		if idx := strings.LastIndexByte(p, '/'); idx >= 0 {
+			p = p[idx+1:]
+		}
+		if p != "" {
+			kvs = append(kvs, keyedValue{key: "REQUEST_FILENAME", val: p})
+		}
+
+		return kvs
+
 	default:
 		return nil
+	}
+}
+
+// flattenJSONKeyed extracts key-value pairs from a JSON body with Coraza-style keys.
+func flattenJSONKeyed(pb *parsedBody) []keyedValue {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil
+	}
+	root, ok := pb.getJSON()
+	if !ok {
+		return nil
+	}
+	var kvs []keyedValue
+	flattenJSONNodeKeyed(root, "", &kvs)
+	return kvs
+}
+
+// flattenJSONNodeKeyed recursively extracts keyed values from a JSON structure.
+func flattenJSONNodeKeyed(node interface{}, path string, kvs *[]keyedValue) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key, child := range v {
+			childPath := key
+			if path != "" {
+				childPath = path + "." + key
+			}
+			*kvs = append(*kvs, keyedValue{key: "ARGS_JSON_NAMES:" + childPath, val: key})
+			flattenJSONNodeKeyed(child, childPath, kvs)
+		}
+	case []interface{}:
+		for i, child := range v {
+			childPath := path + "." + strconv.Itoa(i)
+			flattenJSONNodeKeyed(child, childPath, kvs)
+		}
+	case string:
+		key := "ARGS_JSON"
+		if path != "" {
+			key = "ARGS_JSON:" + path
+		}
+		*kvs = append(*kvs, keyedValue{key: key, val: v})
+	case float64:
+		key := "ARGS_JSON"
+		if path != "" {
+			key = "ARGS_JSON:" + path
+		}
+		if v == float64(int64(v)) {
+			*kvs = append(*kvs, keyedValue{key: key, val: strconv.FormatInt(int64(v), 10)})
+		} else {
+			*kvs = append(*kvs, keyedValue{key: key, val: strconv.FormatFloat(v, 'f', -1, 64)})
+		}
 	}
 }
 
@@ -2244,7 +2446,7 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 	if strings.HasPrefix(cond.Field, countPrefix) {
 		underlying := cond.Field[len(countPrefix):]
 		if !multiFields[underlying] {
-			return cc, fmt.Errorf("count: requires an aggregate field, got %q (valid: all_args, all_args_values, all_args_names, all_headers, all_headers_names, all_cookies, all_cookies_names)", underlying)
+			return cc, fmt.Errorf("count: requires an aggregate field, got %q (valid: all_args, all_args_values, all_args_names, all_headers, all_headers_names, all_cookies, all_cookies_names, request_combined)", underlying)
 		}
 		cc.isCount = true
 		cc.countField = underlying
