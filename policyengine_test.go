@@ -5180,3 +5180,343 @@ func TestBelowThresholdDetect_DoesNotCaptureHeaders(t *testing.T) {
 		t.Error("expected detect_matches to still be set for below-threshold detect")
 	}
 }
+
+// ─── Validate Byte Range Operator ──────────────────────────────────
+
+func TestParseByteRangeSet(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    string
+		wantErr bool
+	}{
+		{"single value", "65", false},
+		{"range", "32-126", false},
+		{"mixed", "9,10,13,32-126,128-255", false},
+		{"CRS PL1", "1-255", false},
+		{"CRS PL2", "9,10,13,32-126,128-255", false},
+		{"CRS PL3", "32-36,38-126", false},
+		{"CRS PL4", "38,44-46,48-58,61,65-90,95,97-122", false},
+		{"invalid value", "256", true},
+		{"negative", "-1", true},
+		{"invalid range reversed", "100-50", true},
+		{"empty", "", false},
+		{"garbage", "abc", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			set, err := parseByteRangeSet(tc.spec)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if set == nil {
+				t.Fatal("expected non-nil set")
+			}
+		})
+	}
+}
+
+func TestEvalValidateByteRange(t *testing.T) {
+	// ASCII printable: 32-126
+	ascii, _ := parseByteRangeSet("32-126")
+	// Permissive: 1-255 (no null bytes)
+	noNull, _ := parseByteRangeSet("1-255")
+
+	tests := []struct {
+		name string
+		set  *[256]bool
+		in   string
+		want bool
+	}{
+		{"printable ASCII", ascii, "Hello World!", true},
+		{"null byte fails ASCII", ascii, "hello\x00world", false},
+		{"tab fails ASCII", ascii, "hello\tworld", false},
+		{"newline fails ASCII", ascii, "hello\nworld", false},
+		{"empty always valid", ascii, "", true},
+		{"null byte fails noNull", noNull, "\x00", false},
+		{"all bytes valid in noNull", noNull, "anything\xff\x01", true},
+		{"nil set", nil, "test", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evalValidateByteRange(tc.set, tc.in)
+			if got != tc.want {
+				t.Errorf("evalValidateByteRange(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchCondition_ValidateByteRange(t *testing.T) {
+	// CRS 920270: @validateByteRange 1-255 (no null bytes)
+	cond := PolicyCondition{
+		Field:    "all_args_values",
+		Operator: "validate_byte_range",
+		Value:    "1-255",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Clean args → all bytes in range → validate returns true → no negate → true
+	req := httptest.NewRequest("GET", "/?q=hello", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected true: 'hello' has all bytes in 1-255")
+	}
+}
+
+func TestMatchCondition_ValidateByteRange_Negated(t *testing.T) {
+	// CRS 941010: !@validateByteRange → negate=true
+	// Detects non-printable chars in URI path
+	cond := PolicyCondition{
+		Field:    "uri_path",
+		Operator: "validate_byte_range",
+		Value:    "20,45-47,48-57,65-90,95,97-122",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	cc.negate = true // Simulating !@validateByteRange
+
+	// Clean URI → byte range valid → eval returns true → negate → false (no match)
+	req := httptest.NewRequest("GET", "/normal-path", nil)
+	if matchCondition(cc, req, nil) {
+		t.Error("expected false: clean path should validate (negate makes it false)")
+	}
+
+	// URI with non-allowed byte (e.g., tab char 0x09 is not in the set)
+	req2 := httptest.NewRequest("GET", "/path", nil)
+	req2.URL.Path = "/path\tinject" // tab (0x09) not in allowed set
+	if !matchCondition(cc, req2, nil) {
+		t.Error("expected true: tab in path should fail validation (negate makes it true)")
+	}
+}
+
+// ─── Validate URL Encoding Operator ────────────────────────────────
+
+func TestEvalValidateURLEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"no encoding", "hello world", true},
+		{"valid %20", "hello%20world", true},
+		{"valid %3C%3E", "%3Cscript%3E", true},
+		{"truncated %2", "hello%2", false},
+		{"bare %", "hello%", false},
+		{"invalid hex %ZZ", "hello%ZZworld", false},
+		{"invalid hex %GH", "%GH", false},
+		{"empty", "", true},
+		{"double encoded", "%253C", true}, // %25 is valid (%25 = "%"), "3C" is just text
+		{"mixed valid", "/path?q=hello%20world&foo=%2Fbar", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evalValidateURLEncoding(tc.in)
+			if got != tc.want {
+				t.Errorf("evalValidateURLEncoding(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchCondition_ValidateURLEncoding(t *testing.T) {
+	cond := PolicyCondition{
+		Field:    "query",
+		Operator: "validate_url_encoding",
+		Value:    "",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Valid URL encoding → true
+	req := httptest.NewRequest("GET", "/?q=hello%20world", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected true: valid URL encoding")
+	}
+
+	// Invalid URL encoding → false. Must set RawQuery directly since Go's URL parser
+	// rejects %ZZ during construction.
+	req2 := httptest.NewRequest("GET", "/page", nil)
+	req2.URL.RawQuery = "q=hello%ZZworld"
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected false: %ZZ is invalid URL encoding")
+	}
+}
+
+// ─── Detect SQLi Operator ──────────────────────────────────────────
+
+func TestMatchCondition_DetectSQLi(t *testing.T) {
+	cond := PolicyCondition{
+		Field:    "query",
+		Operator: "detect_sqli",
+		Value:    "",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Classic SQL injection
+	req := httptest.NewRequest("GET", "/?id=1'+OR+1=1--", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected SQLi detection: 1' OR 1=1--")
+	}
+
+	// Clean query
+	req2 := httptest.NewRequest("GET", "/?id=42", nil)
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected no SQLi: clean query")
+	}
+}
+
+func TestMatchCondition_DetectSQLi_UnionSelect(t *testing.T) {
+	// Use user_agent field since it's a single string value (no URL encoding issues).
+	cond := PolicyCondition{
+		Field:    "user_agent",
+		Operator: "detect_sqli",
+		Value:    "",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("User-Agent", "1 UNION SELECT username,password FROM users--")
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected SQLi detection: UNION SELECT")
+	}
+}
+
+// ─── Detect XSS Operator ──────────────────────────────────────────
+
+func TestMatchCondition_DetectXSS(t *testing.T) {
+	cond := PolicyCondition{
+		Field:    "query",
+		Operator: "detect_xss",
+		Value:    "",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Classic XSS
+	req := httptest.NewRequest("GET", "/?q=<script>alert(1)</script>", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected XSS detection: <script>alert(1)</script>")
+	}
+
+	// Clean query
+	req2 := httptest.NewRequest("GET", "/?q=hello+world", nil)
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected no XSS: clean query")
+	}
+}
+
+func TestMatchCondition_DetectXSS_ImgOnerror(t *testing.T) {
+	// Use user_agent field for reliable string value (no URL encoding).
+	cond := PolicyCondition{
+		Field:    "user_agent",
+		Operator: "detect_xss",
+		Value:    "",
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("User-Agent", "<img src=x onerror=alert(1)>")
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected XSS detection: <img onerror>")
+	}
+}
+
+// ─── Negate Field from JSON ─────────────────────────────────────────
+
+func TestCompileCondition_NegateField(t *testing.T) {
+	// CRS !@validateByteRange → negate: true in JSON
+	cond := PolicyCondition{
+		Field:    "uri_path",
+		Operator: "validate_byte_range",
+		Value:    "32-126",
+		Negate:   true,
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !cc.negate {
+		t.Error("expected negate=true from Negate field")
+	}
+
+	// Clean printable path → validate returns true → negate → false
+	req := httptest.NewRequest("GET", "/normal", nil)
+	if matchCondition(cc, req, nil) {
+		t.Error("expected false: clean path with negate should not match")
+	}
+
+	// Path with non-printable → validate returns false → negate → true
+	req2 := httptest.NewRequest("GET", "/path", nil)
+	req2.URL.Path = "/path\x01inject"
+	if !matchCondition(cc, req2, nil) {
+		t.Error("expected true: non-printable byte with negate should match")
+	}
+}
+
+func TestCompileCondition_NegateFieldDoubleNegate(t *testing.T) {
+	// !neq should cancel out to eq
+	cond := PolicyCondition{
+		Field:    "method",
+		Operator: "neq",
+		Value:    "GET",
+		Negate:   true, // !neq = eq
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// neq sets negate=true, Negate=true flips it back to false
+	if cc.negate {
+		t.Error("expected negate=false: !neq should cancel to eq")
+	}
+}
+
+// ─── Request Basename Field ────────────────────────────────────────
+
+func TestExtractField_RequestBasename(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"normal path", "/dir/file.txt", "file.txt"},
+		{"root", "/", ""},
+		{"nested", "/a/b/c/deep.json", "deep.json"},
+		{"no extension", "/bin/sh", "sh"},
+		{"just filename", "/README", "README"},
+		{"trailing slash", "/dir/", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cc := compiledCondition{field: "request_basename"}
+			req := httptest.NewRequest("GET", tc.path, nil)
+			got := extractField(cc, req, nil)
+			if got != tc.want {
+				t.Errorf("request_basename(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}

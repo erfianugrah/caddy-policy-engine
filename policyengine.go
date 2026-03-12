@@ -30,6 +30,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	libinjection "github.com/corazawaf/libinjection-go"
 	"go.uber.org/zap"
 )
 
@@ -108,9 +109,12 @@ type PolicyRulesFile struct {
 // Default rules ship with the Docker image and provide built-in detection
 // (CRS-equivalent rules, protocol enforcement, etc.). They are merged with
 // user rules at load time; user rules override defaults by ID.
+// Supports both legacy "rules" key and CRS converter "default_rules" key.
 type DefaultRulesFile struct {
-	Rules   []PolicyRule `json:"rules"`
-	Version int          `json:"version"`
+	Rules        []PolicyRule `json:"rules"`
+	DefaultRules []PolicyRule `json:"default_rules"` // CRS converter output format
+	Version      int          `json:"version"`
+	CRSVersion   string       `json:"crs_version,omitempty"`
 }
 
 // WafConfig controls the anomaly scoring engine's behavior.
@@ -197,6 +201,7 @@ type PolicyCondition struct {
 	Operator   string   `json:"operator"`
 	Value      string   `json:"value"`
 	Transforms []string `json:"transforms,omitempty"` // ordered transform chain applied before operator
+	Negate     bool     `json:"negate,omitempty"`     // CRS !@ prefix — inverts operator result
 	// Phase 2: managed list support
 	ListItems []string `json:"list_items,omitempty"`
 	ListKind  string   `json:"list_kind,omitempty"`
@@ -213,25 +218,26 @@ type compiledRule struct {
 }
 
 type compiledCondition struct {
-	field      string
-	operator   string
-	name       string // for named fields (header, cookie, args, body_json, body_form, etc.)
-	exactVal   string
-	prefix     string
-	suffix     string
-	contains   string
-	regex      *regexp.Regexp
-	ipNets     []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
-	ipSet      map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
-	stringSet  map[string]bool
-	negate     bool
-	isExists   bool            // true for "exists" operator (field presence check)
-	transforms []transformFunc // ordered transform chain applied before operator evaluation
-	acMatcher  *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
-	isMulti    bool            // true for aggregate fields (all_args, all_headers, etc.)
-	isCount    bool            // true for count: pseudo-field
-	countField string          // the underlying field for count: (e.g., "all_args")
-	numericVal float64         // pre-parsed numeric value for gt/ge/lt/le operators
+	field        string
+	operator     string
+	name         string // for named fields (header, cookie, args, body_json, body_form, etc.)
+	exactVal     string
+	prefix       string
+	suffix       string
+	contains     string
+	regex        *regexp.Regexp
+	ipNets       []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
+	ipSet        map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
+	stringSet    map[string]bool
+	negate       bool
+	isExists     bool            // true for "exists" operator (field presence check)
+	transforms   []transformFunc // ordered transform chain applied before operator evaluation
+	acMatcher    *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
+	isMulti      bool            // true for aggregate fields (all_args, all_headers, etc.)
+	isCount      bool            // true for count: pseudo-field
+	countField   string          // the underlying field for count: (e.g., "all_args")
+	numericVal   float64         // pre-parsed numeric value for gt/ge/lt/le operators
+	byteRangeSet *[256]bool      // allowed byte values for validate_byte_range
 }
 
 // bodyFields lists condition fields that require reading the request body.
@@ -840,6 +846,13 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 		return r.URL.RequestURI()
 	case "uri_path":
 		return r.URL.Path
+	case "request_basename":
+		// CRS REQUEST_BASENAME: filename portion of the URI path.
+		p := r.URL.Path
+		if idx := strings.LastIndexByte(p, '/'); idx >= 0 {
+			return p[idx+1:]
+		}
+		return p
 	case "host":
 		return r.Host
 	case "method":
@@ -1165,6 +1178,15 @@ func evalOperator(cc compiledCondition, target string) bool {
 			return false
 		}
 		return v <= cc.numericVal
+	case "validate_byte_range":
+		return evalValidateByteRange(cc.byteRangeSet, target)
+	case "validate_url_encoding":
+		return evalValidateURLEncoding(target)
+	case "detect_sqli":
+		isSQLi, _ := libinjection.IsSQLi(target)
+		return isSQLi
+	case "detect_xss":
+		return libinjection.IsXSS(target)
 	default:
 		return false
 	}
@@ -1199,6 +1221,82 @@ func ipTo16Key(ip net.IP) [16]byte {
 	var key [16]byte
 	copy(key[:], ip.To16())
 	return key
+}
+
+// ─── Byte Range Validation ─────────────────────────────────────────
+
+// parseByteRangeSet parses a CRS-style byte range spec (e.g., "9,10,13,32-126,128-255")
+// into a 256-element boolean array where true means the byte value is allowed.
+func parseByteRangeSet(spec string) (*[256]bool, error) {
+	var set [256]bool
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if idx := strings.IndexByte(part, '-'); idx >= 0 {
+			lo, err := strconv.Atoi(strings.TrimSpace(part[:idx]))
+			if err != nil || lo < 0 || lo > 255 {
+				return nil, fmt.Errorf("invalid byte value %q", part[:idx])
+			}
+			hi, err := strconv.Atoi(strings.TrimSpace(part[idx+1:]))
+			if err != nil || hi < 0 || hi > 255 {
+				return nil, fmt.Errorf("invalid byte value %q", part[idx+1:])
+			}
+			if lo > hi {
+				return nil, fmt.Errorf("invalid range %d-%d: low > high", lo, hi)
+			}
+			for b := lo; b <= hi; b++ {
+				set[b] = true
+			}
+		} else {
+			v, err := strconv.Atoi(part)
+			if err != nil || v < 0 || v > 255 {
+				return nil, fmt.Errorf("invalid byte value %q", part)
+			}
+			set[v] = true
+		}
+	}
+	return &set, nil
+}
+
+// evalValidateByteRange returns true if ALL bytes in target are within the
+// allowed set. CRS semantics: @validateByteRange succeeds when the input
+// contains only allowed bytes.
+func evalValidateByteRange(set *[256]bool, target string) bool {
+	if set == nil {
+		return false
+	}
+	for i := 0; i < len(target); i++ {
+		if !set[target[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+// ─── URL Encoding Validation ───────────────────────────────────────
+
+// evalValidateURLEncoding returns true if all percent-encoded sequences in
+// target are well-formed (%HH where H is a hex digit). Non-encoded bytes pass.
+// CRS semantics: @validateUrlEncoding
+func evalValidateURLEncoding(target string) bool {
+	i := 0
+	for i < len(target) {
+		if target[i] == '%' {
+			// Need at least 2 more characters.
+			if i+2 >= len(target) {
+				return false // truncated %
+			}
+			if unhex(target[i+1]) < 0 || unhex(target[i+2]) < 0 {
+				return false // invalid hex digits
+			}
+			i += 3
+		} else {
+			i++
+		}
+	}
+	return true
 }
 
 // compileIPList compiles a list of IP/CIDR strings into an ipSet (for single IPs)
@@ -1416,6 +1514,35 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 			return false, ""
 		}
 		if v <= cc.numericVal {
+			return true, target
+		}
+		return false, ""
+	case "validate_byte_range":
+		if evalValidateByteRange(cc.byteRangeSet, target) {
+			return true, ""
+		}
+		// Report the first offending byte for diagnostics.
+		if cc.byteRangeSet != nil {
+			for i := 0; i < len(target); i++ {
+				if !cc.byteRangeSet[target[i]] {
+					return false, fmt.Sprintf("byte 0x%02x at position %d", target[i], i)
+				}
+			}
+		}
+		return false, ""
+	case "validate_url_encoding":
+		if evalValidateURLEncoding(target) {
+			return true, ""
+		}
+		return false, target
+	case "detect_sqli":
+		isSQLi, fingerprint := libinjection.IsSQLi(target)
+		if isSQLi {
+			return true, fingerprint
+		}
+		return false, ""
+	case "detect_xss":
+		if libinjection.IsXSS(target) {
 			return true, target
 		}
 		return false, ""
@@ -1914,10 +2041,14 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		}
 	}
 
-	// Handle negate operators.
+	// Handle negate operators (from operator name or explicit negate field).
 	switch cond.Operator {
 	case "neq", "not_ip_match", "not_in_list":
 		cc.negate = true
+	}
+	// CRS !@ prefix: explicit negate field from converter output.
+	if cond.Negate {
+		cc.negate = !cc.negate // double-negate cancels (e.g., !neq = eq)
 	}
 
 	// Compile based on operator.
@@ -2000,6 +2131,19 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 			return cc, fmt.Errorf("numeric operator %q requires a numeric value, got %q: %w", cond.Operator, value, err)
 		}
 		cc.numericVal = v
+
+	case "validate_byte_range":
+		set, err := parseByteRangeSet(value)
+		if err != nil {
+			return cc, fmt.Errorf("invalid byte range %q: %w", value, err)
+		}
+		cc.byteRangeSet = set
+
+	case "validate_url_encoding":
+		// No compile-time state needed — validation is done at eval time.
+
+	case "detect_sqli", "detect_xss":
+		// No compile-time state needed — libinjection runs at eval time.
 
 	default:
 		return cc, fmt.Errorf("unsupported operator %q", cond.Operator)
@@ -2128,7 +2272,13 @@ func loadDefaultRulesFile(path string) ([]PolicyRule, time.Time, error) {
 		return nil, time.Time{}, fmt.Errorf("parsing default rules file: %w", err)
 	}
 
-	return file.Rules, info.ModTime(), nil
+	// Support both "rules" (legacy v6) and "default_rules" (CRS converter v7+).
+	rules := file.Rules
+	if len(rules) == 0 && len(file.DefaultRules) > 0 {
+		rules = file.DefaultRules
+	}
+
+	return rules, info.ModTime(), nil
 }
 
 // ─── Hot Reload ─────────────────────────────────────────────────────

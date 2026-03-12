@@ -311,6 +311,169 @@ func TestTransformLength(t *testing.T) {
 	}
 }
 
+// ─── Phase 3 Transform Unit Tests ──────────────────────────────────
+
+func TestTransformCmdLine(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"basic command", "cat /etc/passwd", "cat etc passwd"},
+		{"windows evasion carets", `c^o^m^m^a^n^d`, "command"},
+		{"windows evasion quotes", `c"o"m"m"a"n"d`, "command"},
+		{"backslash evasion", `c\o\m\m\a\n\d`, "command"},
+		{"uppercase", "CAT /ETC/PASSWD", "cat etc passwd"},
+		{"mixed evasion", `C^A^T /E'T'C/"PASSWD"`, "cat etc passwd"},
+		{"subshell normalization", "$(whoami)", "$ whoami)"},
+		{"comma separation", "wget,-O,/tmp/x", "wget -o tmp x"},
+		{"whitespace collapse", "cat  \t\n  file", "cat file"},
+		{"empty", "", ""},
+		{"single quote removal", "it's", "its"},
+		{"path separators", "/bin/sh -c /usr/bin/env", " bin sh -c usr bin env"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformCmdLine(tc.in)
+			if got != tc.want {
+				t.Errorf("cmdLine(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTransformEscapeSeqDecode(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"newline", `\n`, "\n"},
+		{"tab", `\t`, "\t"},
+		{"carriage return", `\r`, "\r"},
+		{"bell", `\a`, "\a"},
+		{"backspace", `\b`, "\b"},
+		{"form feed", `\f`, "\f"},
+		{"vertical tab", `\v`, "\v"},
+		{"backslash", `\\`, "\\"},
+		{"hex escape", `\x41`, "A"},
+		{"hex lowercase", `\x61`, "a"},
+		{"octal escape", `\0101`, "A"},  // octal 101 = 65 = 'A'
+		{"octal null", `\0`, "\x00"},    // bare \0 with no digits
+		{"invalid hex", `\xZZ`, `\xZZ`}, // pass through
+		{"mixed", `hello\x20world\n`, "hello world\n"},
+		{"multiple", `\x48\x49`, "HI"},
+		{"empty", "", ""},
+		{"no escapes", "plain text", "plain text"},
+		{"unknown escape", `\q`, `\q`}, // unknown → pass through backslash, advance 1
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformEscapeSeqDecode(tc.in)
+			if got != tc.want {
+				t.Errorf("escapeSeqDecode(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTransformRemoveCommentsChar(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"C open comment", "hello /* world", "hello  world"},
+		{"C close comment", "hello */ world", "hello  world"},
+		{"SQL comment", "SELECT -- 1", "SELECT  1"},
+		{"hash comment", "cmd #arg", "cmd arg"},
+		{"all markers", "a/*b*/c--d#e", "abcde"},
+		{"no markers", "plain text", "plain text"},
+		{"empty", "", ""},
+		{"only markers", "/**/--#", ""},
+		{"nested-looking", "a /* b /* c */ d", "a  b  c  d"},
+		{"single dash", "a-b", "a-b"},  // single dash preserved
+		{"single star", "a*b", "a*b"},  // single star preserved
+		{"single slash", "a/b", "a/b"}, // single slash preserved
+		{"SQL injection", "1' OR/**/1=1--", "1' OR1=1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformRemoveCommentsChar(tc.in)
+			if got != tc.want {
+				t.Errorf("removeCommentsChar(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// ─── Phase 3 Integration Tests ─────────────────────────────────────
+
+func TestMatchCondition_CmdLineTransform(t *testing.T) {
+	// CRS RCE detection: detect "cat /etc/passwd" after cmdLine normalization.
+	cond := PolicyCondition{
+		Field:      "path",
+		Operator:   "contains",
+		Value:      "cat etc passwd",
+		Transforms: []string{"urlDecode", "cmdLine"},
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Evasion via carets + URL encoding.
+	req := httptest.NewRequest("GET", "/api?cmd=C%5EA%5ET+/E%5ETC/PASSWD", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected match: c^a^t /e^tc/passwd should normalize to 'cat etc passwd'")
+	}
+
+	// Clean request.
+	req2 := httptest.NewRequest("GET", "/api?cmd=hello", nil)
+	if matchCondition(cc, req2, nil) {
+		t.Error("expected no match on clean request")
+	}
+}
+
+func TestMatchCondition_EscapeSeqDecodeTransform(t *testing.T) {
+	cond := PolicyCondition{
+		Field:      "user_agent",
+		Operator:   "contains",
+		Value:      "A",
+		Transforms: []string{"escapeSeqDecode"},
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("User-Agent", `\x41`)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected match: \\x41 should decode to 'A'")
+	}
+}
+
+func TestMatchCondition_RemoveCommentsCharTransform(t *testing.T) {
+	// SQL injection detection: "OR 1=1" after removing comment chars.
+	cond := PolicyCondition{
+		Field:      "query",
+		Operator:   "regex",
+		Value:      `OR\s*1=1`,
+		Transforms: []string{"removeCommentsChar", "compressWhitespace"},
+	}
+	cc, err := compileCondition(cond)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Evasion via SQL comments: OR/**/1=1
+	req := httptest.NewRequest("GET", "/?id=1'+OR/**/1=1--", nil)
+	if !matchCondition(cc, req, nil) {
+		t.Error("expected match: OR/**/1=1 should become OR1=1 after removeCommentsChar")
+	}
+}
+
 // ─── Transform Chain Tests ─────────────────────────────────────────
 
 func TestApplyTransforms_Chain(t *testing.T) {
@@ -352,8 +515,8 @@ func TestApplyTransforms_Empty(t *testing.T) {
 
 func TestValidTransformNames(t *testing.T) {
 	names := validTransformNames()
-	if len(names) != 17 {
-		t.Errorf("expected 17 transforms, got %d: %v", len(names), names)
+	if len(names) != 20 {
+		t.Errorf("expected 20 transforms, got %d: %v", len(names), names)
 	}
 	// Verify sorted.
 	for i := 1; i < len(names); i++ {

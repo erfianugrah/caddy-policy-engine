@@ -49,6 +49,10 @@ var transformRegistry = map[string]transformFunc{
 	"removeComments": transformRemoveComments,
 	"trim":           transformTrim,
 	"length":         transformLength,
+	// Phase 3 — CRS detection-critical
+	"cmdLine":            transformCmdLine,
+	"escapeSeqDecode":    transformEscapeSeqDecode,
+	"removeCommentsChar": transformRemoveCommentsChar,
 }
 
 // validTransformNames returns a sorted list of all valid transform names.
@@ -537,4 +541,169 @@ func transformTrim(s string) string {
 // CRS: t:length
 func transformLength(s string) string {
 	return strconv.Itoa(len(s))
+}
+
+// ─── Phase 3 Transforms (CRS detection-critical) ──────────────────
+
+// transformCmdLine normalizes command line evasion techniques.
+// Strips characters inserted between command characters to evade detection:
+//   - Deletes: \, ^, "  (Windows cmd evasion: c^o^m^m^a^n^d, c"o"m"m"a"n"d)
+//   - Replaces / with space (Unix path separator used as word boundary)
+//   - Replaces ( with space (shell subshell syntax normalization)
+//   - Collapses whitespace runs to single space
+//   - Lowercases
+//
+// CRS: t:cmdLine — used by 13 RCE detection rules (932xxx).
+func transformCmdLine(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\\', '^', '"', '\'':
+			// Delete evasion characters.
+			continue
+		case '/', '(':
+			// Replace with space (path separator / subshell).
+			if !inSpace {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+		case ' ', '\t', '\n', '\r':
+			// Collapse whitespace.
+			if !inSpace {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+		case ',':
+			// Replace comma with space (argument separator).
+			if !inSpace {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+		default:
+			// Lowercase alphanumeric.
+			if c >= 'A' && c <= 'Z' {
+				c += 0x20
+			}
+			b.WriteByte(c)
+			inSpace = false
+		}
+	}
+	return b.String()
+}
+
+// transformEscapeSeqDecode decodes ANSI C-style escape sequences.
+// Handles: \a, \b, \f, \n, \r, \t, \v, \\, \xHH, \0NNN (octal).
+// CRS: t:escapeSeqDecode — used by 7 RCE/PHP detection rules.
+func transformEscapeSeqDecode(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] != '\\' || i+1 >= len(s) {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		next := s[i+1]
+		switch next {
+		case 'a':
+			b.WriteByte('\a')
+			i += 2
+		case 'b':
+			b.WriteByte('\b')
+			i += 2
+		case 'f':
+			b.WriteByte('\f')
+			i += 2
+		case 'n':
+			b.WriteByte('\n')
+			i += 2
+		case 'r':
+			b.WriteByte('\r')
+			i += 2
+		case 't':
+			b.WriteByte('\t')
+			i += 2
+		case 'v':
+			b.WriteByte('\v')
+			i += 2
+		case '\\':
+			b.WriteByte('\\')
+			i += 2
+		case 'x':
+			// \xHH hex escape.
+			if i+3 < len(s) {
+				hi := unhex(s[i+2])
+				lo := unhex(s[i+3])
+				if hi >= 0 && lo >= 0 {
+					b.WriteByte(byte(hi<<4 | lo))
+					i += 4
+					continue
+				}
+			}
+			b.WriteByte('\\')
+			b.WriteByte('x')
+			i += 2
+		case '0':
+			// \0NNN octal escape (1-3 octal digits after the 0).
+			j := i + 2
+			val := 0
+			digits := 0
+			for j < len(s) && digits < 3 && s[j] >= '0' && s[j] <= '7' {
+				val = val*8 + int(s[j]-'0')
+				j++
+				digits++
+			}
+			if digits > 0 && val <= 255 {
+				b.WriteByte(byte(val))
+				i = j
+			} else {
+				b.WriteByte('\x00')
+				i += 2
+			}
+		default:
+			// Unknown escape — pass through.
+			b.WriteByte('\\')
+			i++
+		}
+	}
+	return b.String()
+}
+
+// transformRemoveCommentsChar strips SQL/shell comment markers: /*, */, --, #
+// Unlike removeComments which strips entire comment blocks, this removes only
+// the marker characters themselves, exposing the content inside.
+// CRS: t:removeCommentsChar — used by SQL injection detection rules.
+func transformRemoveCommentsChar(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		// Strip /*
+		if i+1 < len(s) && s[i] == '/' && s[i+1] == '*' {
+			i += 2
+			continue
+		}
+		// Strip */
+		if i+1 < len(s) && s[i] == '*' && s[i+1] == '/' {
+			i += 2
+			continue
+		}
+		// Strip -- (SQL comment)
+		if i+1 < len(s) && s[i] == '-' && s[i+1] == '-' {
+			i += 2
+			continue
+		}
+		// Strip # (shell/MySQL comment)
+		if s[i] == '#' {
+			i++
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
