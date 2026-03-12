@@ -815,6 +815,16 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 		return false
 	}
 
+	// Coraza semantics: when a negated condition targets a variable that doesn't
+	// exist (e.g., Content-Length header on GET), skip the condition. Without
+	// this, negated regex rules (like "!@rx ^\d+$") would fire on every request
+	// without the header because the empty string fails the regex match, then
+	// negate flips it to true. Non-negated conditions are unaffected — they
+	// evaluate naturally against empty string (e.g., eq "" matches absent header).
+	if cc.negate && fieldAbsent(cc, r) {
+		return false
+	}
+
 	target := extractField(cc, r, pb)
 
 	// Apply transforms before operator evaluation.
@@ -836,6 +846,31 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 //   - "uri_path": path component only, without query string (r.URL.Path)
 //
 // These are intentionally distinct — "path" matches the full URI for backward
+// fieldAbsent returns true if the field represents an optional variable that
+// is not present in the request. This implements Coraza/ModSecurity semantics:
+// when a SecRule targets a variable that doesn't exist (e.g., Content-Length
+// header on a GET request), the rule is skipped entirely — even negated rules.
+// Without this, negated regex rules fire on every request without the header.
+func fieldAbsent(cc compiledCondition, r *http.Request) bool {
+	switch cc.field {
+	case "header":
+		if cc.name != "" {
+			return len(r.Header.Values(cc.name)) == 0
+		}
+	case "cookie":
+		if cc.name != "" {
+			_, err := r.Cookie(cc.name)
+			return err != nil
+		}
+	case "content_type":
+		return len(r.Header.Values("Content-Type")) == 0
+	case "content_length":
+		return len(r.Header.Values("Content-Length")) == 0
+	}
+	// All other fields are always present (ip, path, method, query, etc.)
+	return false
+}
+
 // compatibility with wafctl-generated rules that need query string matching.
 func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string {
 	switch cc.field {
@@ -868,6 +903,15 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 		return r.Header.Get("Referer")
 	case "http_version":
 		return r.Proto
+	case "request_line":
+		// CRS REQUEST_LINE: "METHOD /path HTTP/version"
+		return r.Method + " " + r.URL.RequestURI() + " " + r.Proto
+	case "content_type":
+		// CRS CONTENT_TYPE: shortcut for Content-Type header.
+		return r.Header.Get("Content-Type")
+	case "content_length":
+		// CRS CONTENT_LENGTH: shortcut for Content-Length header.
+		return r.Header.Get("Content-Length")
 	case "header":
 		if cc.name != "" {
 			return r.Header.Get(cc.name)
@@ -1377,6 +1421,14 @@ func singleFieldVarName(field, name string) string {
 		return "REQUEST_HEADERS:Referer"
 	case "http_version":
 		return "REQUEST_PROTOCOL"
+	case "request_line":
+		return "REQUEST_LINE"
+	case "content_type":
+		return "CONTENT_TYPE"
+	case "content_length":
+		return "CONTENT_LENGTH"
+	case "request_basename":
+		return "REQUEST_BASENAME"
 	case "header":
 		if name != "" {
 			return "REQUEST_HEADERS:" + name
@@ -1627,6 +1679,11 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 				Operator: cc.operator,
 			}
 		}
+		return false, nil
+	}
+
+	// Coraza semantics: skip negated condition if the field variable doesn't exist.
+	if cc.negate && fieldAbsent(cc, r) {
 		return false, nil
 	}
 
@@ -2031,18 +2088,42 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		operator: cond.Operator,
 	}
 
-	// Parse named fields: "Name:value" format.
+	// Parse named fields from the field string first (CRS converter convention):
+	// "header:Accept" → cc.field = "header", cc.name = "Accept"
+	// This takes priority over the value-based parsing below.
+	switch {
+	case strings.HasPrefix(cond.Field, "header:"):
+		cc.field = "header"
+		cc.name = cond.Field[len("header:"):]
+	case strings.HasPrefix(cond.Field, "cookie:"):
+		cc.field = "cookie"
+		cc.name = cond.Field[len("cookie:"):]
+	case strings.HasPrefix(cond.Field, "args:"):
+		cc.field = "args"
+		cc.name = cond.Field[len("args:"):]
+	case strings.HasPrefix(cond.Field, "body_form:"):
+		cc.field = "body_form"
+		cc.name = cond.Field[len("body_form:"):]
+	case strings.HasPrefix(cond.Field, "body_json:"):
+		cc.field = "body_json"
+		cc.name = cond.Field[len("body_json:"):]
+	}
+
+	// Parse named fields from value: "Name:value" format (wafctl convention).
+	// Only applies if name wasn't already set from the field string above.
 	value := cond.Value
-	switch cond.Field {
-	case "header", "cookie", "args", "body_form":
-		if idx := strings.IndexByte(value, ':'); idx >= 0 {
-			cc.name = value[:idx]
-			value = value[idx+1:]
-		}
-	case "body_json":
-		if idx := strings.IndexByte(value, ':'); idx >= 0 {
-			cc.name = value[:idx]
-			value = value[idx+1:]
+	if cc.name == "" {
+		switch cond.Field {
+		case "header", "cookie", "args", "body_form":
+			if idx := strings.IndexByte(value, ':'); idx >= 0 {
+				cc.name = value[:idx]
+				value = value[idx+1:]
+			}
+		case "body_json":
+			if idx := strings.IndexByte(value, ':'); idx >= 0 {
+				cc.name = value[:idx]
+				value = value[idx+1:]
+			}
 		}
 	}
 

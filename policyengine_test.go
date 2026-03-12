@@ -5509,6 +5509,128 @@ func TestCompileCondition_NegateFieldDoubleNegate(t *testing.T) {
 
 // ─── Request Basename Field ────────────────────────────────────────
 
+// TestCompileCondition_NamedFieldFromFieldString verifies that the CRS converter
+// convention (field="header:Accept") is correctly parsed into cc.field="header"
+// and cc.name="Accept".
+func TestCompileCondition_NamedFieldFromFieldString(t *testing.T) {
+	tests := []struct {
+		field    string
+		value    string
+		wantName string
+	}{
+		{"header:Accept", "^$", "Accept"},
+		{"header:Content-Type", "application/json", "Content-Type"},
+		{"cookie:session", "abc", "session"},
+		{"args:id", "123", "id"},
+		{"body_form:username", "admin", "username"},
+		{"body_json:.user.role", "admin", ".user.role"},
+		// wafctl convention (name in value) should also work
+		{"header", "Accept:text/html", "Accept"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.field, func(t *testing.T) {
+			cc, err := compileCondition(PolicyCondition{
+				Field: tc.field, Operator: "eq", Value: tc.value,
+			})
+			if err != nil {
+				t.Fatalf("compile error: %v", err)
+			}
+			if cc.name != tc.wantName {
+				t.Errorf("name = %q, want %q", cc.name, tc.wantName)
+			}
+		})
+	}
+}
+
+// TestExtractField_RequestLine verifies the request_line field returns
+// "METHOD /path?query HTTP/version".
+func TestExtractField_RequestLine(t *testing.T) {
+	cc := compiledCondition{field: "request_line"}
+	req := httptest.NewRequest("GET", "/test?q=hello", nil)
+	got := extractField(cc, req, nil)
+	want := "GET /test?q=hello HTTP/1.1"
+	if got != want {
+		t.Errorf("request_line = %q, want %q", got, want)
+	}
+}
+
+// TestExtractField_ContentLengthAndType verifies the content_length and
+// content_type shortcut fields.
+func TestExtractField_ContentLengthAndType(t *testing.T) {
+	cc := compiledCondition{field: "content_length"}
+	req := httptest.NewRequest("POST", "/test", nil)
+	req.Header.Set("Content-Length", "42")
+	got := extractField(cc, req, nil)
+	if got != "42" {
+		t.Errorf("content_length = %q, want %q", got, "42")
+	}
+
+	cc2 := compiledCondition{field: "content_type"}
+	req.Header.Set("Content-Type", "application/json")
+	got2 := extractField(cc2, req, nil)
+	if got2 != "application/json" {
+		t.Errorf("content_type = %q, want %q", got2, "application/json")
+	}
+}
+
+// TestFieldAbsent_NegateSkipsAbsentHeader verifies that a negated condition
+// on an absent header returns false (Coraza semantics), while a non-negated
+// condition on the same absent header evaluates normally.
+func TestFieldAbsent_NegateSkipsAbsentHeader(t *testing.T) {
+	// Negated regex on absent Content-Length → should NOT match (Coraza semantics).
+	cc, err := compileCondition(PolicyCondition{
+		Field: "content_length", Operator: "regex", Value: `^\d+$`, Negate: true,
+	})
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/test", nil) // no Content-Length
+	result := matchCondition(cc, req, nil)
+	if result {
+		t.Error("negated regex on absent Content-Length should return false")
+	}
+
+	// Same condition with Content-Length present and invalid → should match.
+	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2.Header.Set("Content-Length", "abc")
+	result2 := matchCondition(cc, req2, nil)
+	if !result2 {
+		t.Error("negated regex on invalid Content-Length should return true")
+	}
+
+	// Non-negated eq "" on absent header → should match (empty = absent).
+	cc2, _ := compileCondition(PolicyCondition{
+		Field: "header:Accept", Operator: "eq", Value: "",
+	})
+	req3 := httptest.NewRequest("GET", "/test", nil) // no Accept header
+	result3 := matchCondition(cc2, req3, nil)
+	if !result3 {
+		t.Error("non-negated eq '' on absent Accept should return true")
+	}
+}
+
+// TestFieldAbsent_NamedHeader verifies that header:X-Custom is detected as absent.
+func TestFieldAbsent_NamedHeader(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field: "header:X-Custom", Operator: "regex", Value: ".*", Negate: true,
+	})
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/test", nil)
+	result := matchCondition(cc, req, nil)
+	if result {
+		t.Error("negated regex on absent X-Custom header should return false")
+	}
+
+	// With header present.
+	req.Header.Set("X-Custom", "value")
+	result2 := matchCondition(cc, req, nil)
+	if result2 {
+		t.Error("negated .* on present X-Custom should return false (regex matches)")
+	}
+}
+
 func TestExtractField_RequestBasename(t *testing.T) {
 	tests := []struct {
 		name string
