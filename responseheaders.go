@@ -13,6 +13,8 @@
 package policyengine
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -380,6 +382,27 @@ func (rw *responseHeaderWriter) Write(b []byte) (int, error) {
 // (e.g., Caddy's response recording, http.Flusher, http.Hijacker detection).
 func (rw *responseHeaderWriter) Unwrap() http.ResponseWriter {
 	return rw.ResponseWriter
+}
+
+// Hijack delegates to the underlying ResponseWriter if it supports hijacking.
+// This is required for WebSocket upgrades — without it, HTTP/1.1 Upgrade
+// requests fail with NS_ERROR_WEBSOCKET_CONNECTION_REFUSED.
+func (rw *responseHeaderWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// Flush delegates to the underlying ResponseWriter if it supports flushing.
+// Required for Server-Sent Events (SSE) and chunked transfer encoding.
+func (rw *responseHeaderWriter) Flush() {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // ─── Apply Response Headers ─────────────────────────────────────────

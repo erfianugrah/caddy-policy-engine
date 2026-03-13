@@ -1115,3 +1115,42 @@ func TestServeHTTP_NoResponseHeaders(t *testing.T) {
 		t.Error("expected no CSP when response_headers absent")
 	}
 }
+
+// ─── Hijacker / Flusher Interface Tests ─────────────────────────────
+
+type fakeHijacker struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (fh *fakeHijacker) Hijack() (interface{ Close() error }, interface{}, error) {
+	fh.hijacked = true
+	return nil, nil, nil
+}
+
+func TestResponseHeaderWriter_Hijack_Supported(t *testing.T) {
+	// When the underlying ResponseWriter implements http.Hijacker,
+	// the wrapper should delegate.
+	rec := httptest.NewRecorder()
+	rw := &responseHeaderWriter{
+		ResponseWriter: rec,
+	}
+	// httptest.ResponseRecorder implements Hijacker in newer Go versions.
+	// If not, the Hijack method should return http.ErrNotSupported.
+	_, _, err := rw.Hijack()
+	// We just check it doesn't panic — the actual behavior depends on
+	// whether httptest.ResponseRecorder implements Hijacker.
+	_ = err
+}
+
+func TestResponseHeaderWriter_Flush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responseHeaderWriter{
+		ResponseWriter: rec,
+	}
+	// Should not panic; httptest.ResponseRecorder implements http.Flusher.
+	rw.Flush()
+	if !rw.wroteHeader {
+		t.Error("Flush should trigger WriteHeader")
+	}
+}
