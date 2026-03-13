@@ -6158,3 +6158,126 @@ func TestExtractField_RequestBasename(t *testing.T) {
 		})
 	}
 }
+
+// ─── libinjection Benchmarks ────────────────────────────────────────
+// Measures latency of detect_sqli and detect_xss operators via the
+// policy engine's evalOperator path. Covers positive (attack) and
+// negative (clean) inputs, plus comparison against regex-based rules.
+
+func BenchmarkDetectSQLi_Positive(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_sqli",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "1' OR 1=1--")
+	}
+}
+
+func BenchmarkDetectSQLi_UnionSelect(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_sqli",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "id=1 UNION SELECT username,password FROM users--")
+	}
+}
+
+func BenchmarkDetectSQLi_Negative(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_sqli",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "name=John&age=30&city=Portland")
+	}
+}
+
+func BenchmarkDetectSQLi_LongInput(b *testing.B) {
+	// Simulate a realistic query string with many parameters
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_sqli",
+	})
+	long := strings.Repeat("param=value&", 50) + "last=ok"
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, long)
+	}
+}
+
+func BenchmarkDetectXSS_Positive(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_xss",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "<script>alert(document.cookie)</script>")
+	}
+}
+
+func BenchmarkDetectXSS_ImgOnerror(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_xss",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "<img src=x onerror=alert(1)>")
+	}
+}
+
+func BenchmarkDetectXSS_Negative(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "detect_xss",
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "Hello & World <3 from Portland")
+	}
+}
+
+// Comparison: regex-based SQLi detection (CRS-style pattern)
+func BenchmarkRegex_SQLi_Positive(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "regex",
+		Value: `(?i)(?:union\s+(?:all\s+)?select|select\s+.*\s+from|or\s+1\s*=\s*1|'\s*or\s*'|--\s*$)`,
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "1' OR 1=1--")
+	}
+}
+
+func BenchmarkRegex_SQLi_Negative(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "regex",
+		Value: `(?i)(?:union\s+(?:all\s+)?select|select\s+.*\s+from|or\s+1\s*=\s*1|'\s*or\s*'|--\s*$)`,
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "name=John&age=30&city=Portland")
+	}
+}
+
+// Comparison: regex-based XSS detection (CRS-style pattern)
+func BenchmarkRegex_XSS_Positive(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "regex",
+		Value: `(?i)<(?:script|img|iframe|object|embed|svg|math|video|audio|body|input|select|textarea|button|form)\b[^>]*>`,
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "<script>alert(document.cookie)</script>")
+	}
+}
+
+func BenchmarkRegex_XSS_Negative(b *testing.B) {
+	cc, _ := compileCondition(PolicyCondition{
+		Field: "query", Operator: "regex",
+		Value: `(?i)<(?:script|img|iframe|object|embed|svg|math|video|audio|body|input|select|textarea|button|form)\b[^>]*>`,
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		evalOperator(cc, "Hello & World <3 from Portland")
+	}
+}
