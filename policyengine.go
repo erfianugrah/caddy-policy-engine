@@ -201,8 +201,9 @@ type PolicyCondition struct {
 	Field      string   `json:"field"`
 	Operator   string   `json:"operator"`
 	Value      string   `json:"value"`
-	Transforms []string `json:"transforms,omitempty"` // ordered transform chain applied before operator
-	Negate     bool     `json:"negate,omitempty"`     // CRS !@ prefix — inverts operator result
+	Transforms []string `json:"transforms,omitempty"`  // ordered transform chain applied before operator
+	Negate     bool     `json:"negate,omitempty"`      // CRS !@ prefix — inverts operator result
+	MultiMatch bool     `json:"multi_match,omitempty"` // CRS multiMatch — run operator at each transform stage
 	// Phase 2: managed list support
 	ListItems []string `json:"list_items,omitempty"`
 	ListKind  string   `json:"list_kind,omitempty"`
@@ -231,6 +232,7 @@ type compiledCondition struct {
 	ipSet        map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
 	stringSet    map[string]bool
 	negate       bool
+	multiMatch   bool            // true: run operator at each transform stage (CRS multiMatch)
 	isExists     bool            // true for "exists" operator (field presence check)
 	transforms   []transformFunc // ordered transform chain applied before operator evaluation
 	acMatcher    *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
@@ -803,10 +805,7 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 	if cc.isMulti {
 		values := extractMultiField(cc, r, pb)
 		for _, val := range values {
-			if len(cc.transforms) > 0 {
-				val = applyTransforms(val, cc.transforms)
-			}
-			if evalOperator(cc, val) {
+			if evalMultiMatchOrPlain(cc, val) {
 				if cc.negate {
 					return false // negate + any match = fail (NOT-ANY = ALL-NOT)
 				}
@@ -832,16 +831,62 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 
 	target := extractField(cc, r, pb)
 
-	// Apply transforms before operator evaluation.
-	if len(cc.transforms) > 0 {
-		target = applyTransforms(target, cc.transforms)
-	}
-
-	result := evalOperator(cc, target)
+	result := evalMultiMatchOrPlain(cc, target)
 	if cc.negate {
 		return !result
 	}
 	return result
+}
+
+// evalMultiMatchOrPlain runs the operator against a value, handling multiMatch semantics.
+// When multiMatch is true: test operator on the raw value first, then after each transform
+// in the chain. If any stage matches, return true. This implements CRS multiMatch where
+// the operator runs at each transform stage, not just the final one.
+// When multiMatch is false (default): apply all transforms then run operator once.
+func evalMultiMatchOrPlain(cc compiledCondition, value string) bool {
+	if cc.multiMatch {
+		// Stage 0: raw value before any transforms.
+		if evalOperator(cc, value) {
+			return true
+		}
+		// Stages 1..N: after each successive transform.
+		for _, fn := range cc.transforms {
+			value = fn(value)
+			if evalOperator(cc, value) {
+				return true
+			}
+		}
+		return false
+	}
+	// Default: apply all transforms, then eval once.
+	if len(cc.transforms) > 0 {
+		value = applyTransforms(value, cc.transforms)
+	}
+	return evalOperator(cc, value)
+}
+
+// evalMultiMatchOrPlainDetailed is the observability variant of evalMultiMatchOrPlain.
+// Returns (matched bool, matchedData string) for the first matching stage.
+func evalMultiMatchOrPlainDetailed(cc compiledCondition, value string) (bool, string) {
+	if cc.multiMatch {
+		// Stage 0: raw value.
+		if matched, data := evalOperatorDetailed(cc, value); matched {
+			return true, data
+		}
+		// Stages 1..N: after each successive transform.
+		for _, fn := range cc.transforms {
+			value = fn(value)
+			if matched, data := evalOperatorDetailed(cc, value); matched {
+				return true, data
+			}
+		}
+		return false, ""
+	}
+	// Default: apply all transforms, then eval once.
+	if len(cc.transforms) > 0 {
+		value = applyTransforms(value, cc.transforms)
+	}
+	return evalOperatorDetailed(cc, value)
 }
 
 // extractField gets the request value for a condition's field.
@@ -1855,11 +1900,7 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	if cc.isMulti {
 		kvs := extractMultiFieldKeyed(cc, r, pb)
 		for _, kv := range kvs {
-			val := kv.val
-			if len(cc.transforms) > 0 {
-				val = applyTransforms(val, cc.transforms)
-			}
-			matched, matchedData := evalOperatorDetailed(cc, val)
+			matched, matchedData := evalMultiMatchOrPlainDetailed(cc, kv.val)
 			if matched {
 				if cc.negate {
 					return false, nil // negate + any match = fail
@@ -1893,11 +1934,7 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	target := extractField(cc, r, pb)
 	origTarget := target
 
-	if len(cc.transforms) > 0 {
-		target = applyTransforms(target, cc.transforms)
-	}
-
-	matched, matchedData := evalOperatorDetailed(cc, target)
+	matched, matchedData := evalMultiMatchOrPlainDetailed(cc, target)
 	if cc.negate {
 		matched = !matched
 	}
@@ -2461,6 +2498,10 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		}
 		cc.transforms = append(cc.transforms, fn)
 	}
+
+	// multiMatch: run operator at each stage of the transform pipeline.
+	// Only meaningful when there are transforms to iterate over.
+	cc.multiMatch = cond.MultiMatch && len(cc.transforms) > 0
 
 	return cc, nil
 }

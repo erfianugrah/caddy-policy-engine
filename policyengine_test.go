@@ -3668,6 +3668,165 @@ func TestMatchCondition_MultiField_WithTransforms(t *testing.T) {
 	}
 }
 
+// ─── multiMatch: Operator at Each Transform Stage ──────────────────
+
+func TestMultiMatch_MatchesBeforeTransform(t *testing.T) {
+	// Without multiMatch: lowercase("SELECT") → "select", contains("SELECT") → false.
+	// With multiMatch: raw "SELECT" matches before lowercase runs.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "SELECT",
+		Transforms: []string{"lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=SELECT+1", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("multiMatch should match raw value before transforms")
+	}
+}
+
+func TestMultiMatch_MatchesAfterTransform(t *testing.T) {
+	// The raw value "S%45LECT" doesn't contain "select", but after urlDecode+lowercase it does.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "select",
+		Transforms: []string{"urlDecode", "lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=S%45LECT+1", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("multiMatch should match after urlDecode+lowercase")
+	}
+}
+
+func TestMultiMatch_NoMatchAtAnyStage(t *testing.T) {
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "DROP",
+		Transforms: []string{"lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "hello" → "hello" at every stage, never contains "DROP".
+	r := makeRequest("GET", "/search?q=hello", "")
+	if matchCondition(cc, r, nil) {
+		t.Error("multiMatch should not match when no stage matches")
+	}
+}
+
+func TestMultiMatch_MatchesAtIntermediateStage(t *testing.T) {
+	// Transform chain: urlDecode → lowercase.
+	// Raw value: "s%45LECT" → after urlDecode: "sELECT" → after lowercase: "select".
+	// Match target: "sELECT" — matches only after urlDecode (stage 1), not raw or final.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "sELECT",
+		Transforms: []string{"urlDecode", "lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=s%45LECT", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("multiMatch should match at intermediate transform stage (after urlDecode)")
+	}
+}
+
+func TestMultiMatch_DisabledBehavior(t *testing.T) {
+	// Without multiMatch, only the final transformed value is tested.
+	// "SELECT" after lowercase → "select", contains("SELECT") → false.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "SELECT",
+		Transforms: []string{"lowercase"},
+		MultiMatch: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=SELECT+1", "")
+	if matchCondition(cc, r, nil) {
+		t.Error("without multiMatch, lowercase should transform SELECT→select, no match for 'SELECT'")
+	}
+}
+
+func TestMultiMatch_WithMultiField(t *testing.T) {
+	// multiMatch on aggregate fields — should match at raw stage.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "all_args_values",
+		Operator:   "contains",
+		Value:      "SELECT",
+		Transforms: []string{"lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=SELECT+1&other=clean", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("multiMatch on multi-field should match raw value before transform")
+	}
+}
+
+func TestMultiMatch_DetailedReportsMatch(t *testing.T) {
+	// Verify matchConditionDetailed works with multiMatch.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "SELECT",
+		Transforms: []string{"lowercase"},
+		MultiMatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/search?q=SELECT+1", "")
+	matched, detail := matchConditionDetailed(cc, r, nil)
+	if !matched {
+		t.Fatal("multiMatch detailed should match")
+	}
+	if detail == nil {
+		t.Fatal("expected non-nil match detail")
+	}
+	if detail.MatchedData == "" {
+		t.Error("expected matchedData to be populated")
+	}
+}
+
+func TestMultiMatch_NoTransforms_Ignored(t *testing.T) {
+	// multiMatch without transforms should behave identically to normal.
+	cc, err := compileCondition(PolicyCondition{
+		Field:      "query",
+		Operator:   "contains",
+		Value:      "hello",
+		MultiMatch: true, // no transforms — flag should be false after compile
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.multiMatch {
+		t.Error("multiMatch should be false when no transforms are present")
+	}
+	r := makeRequest("GET", "/search?q=hello+world", "")
+	if !matchCondition(cc, r, nil) {
+		t.Error("should still match normally")
+	}
+}
+
 // ─── v0.9.0: phrase_match Operator ─────────────────────────────────
 
 func TestCompileCondition_PhraseMatch(t *testing.T) {
