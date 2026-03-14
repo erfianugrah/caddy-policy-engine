@@ -71,9 +71,14 @@ type PolicyEngine struct {
 	// ReloadInterval is how often to check RulesFile for changes. Default 5s.
 	ReloadInterval caddy.Duration `json:"reload_interval,omitempty"`
 
-	// BodyMaxSize is the maximum bytes to buffer for body field matching.
+	// BodyMaxSize is the maximum bytes to buffer for request body field matching.
 	// Default 13 MiB (matching Coraza WAF request_body_limit).
 	BodyMaxSize int64 `json:"body_max_size,omitempty"`
+
+	// ResponseBodyMaxSize is the maximum bytes to buffer for response body matching
+	// (outbound detect rules). Default 1 MiB. Only text/json/xml responses are buffered.
+	// Set to 0 to disable response body buffering (header-only outbound rules still work).
+	ResponseBodyMaxSize int64 `json:"response_body_max_size,omitempty"`
 
 	// HideHeaders suppresses debug response headers (X-Blocked-By,
 	// X-Blocked-Rule, X-Policy-Tags, X-RateLimit-Monitor) in responses.
@@ -814,13 +819,19 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// (block/rate_limit return early above) and before next.ServeHTTP().
 	w = applyResponseHeaders(w, r.Host, respHeaders)
 
-	// Check if any outbound detect rules exist for this request.
+	// Check if any outbound detect rules exist for this request,
+	// and whether any of them need response body buffering.
 	hasOutbound := false
+	needsResponseBody := false
 	for _, cr := range rules {
 		if cr.outbound && cr.rule.Type == "detect" && cr.rule.Enabled {
 			if cr.rule.ParanoiaLevel == 0 || cr.rule.ParanoiaLevel <= servicePL {
 				hasOutbound = true
-				break
+				for _, cc := range cr.conditions {
+					if isResponseBodyField(cc.field) {
+						needsResponseBody = true
+					}
+				}
 			}
 		}
 	}
@@ -830,60 +841,48 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return next.ServeHTTP(w, r)
 	}
 
-	// Outbound path: ensure w is wrapped so we capture the response status code.
-	// applyResponseHeaders may have already wrapped it; if not, wrap now.
-	rhw, isWrapped := w.(*responseHeaderWriter)
-	if !isWrapped {
-		rhw = &responseHeaderWriter{ResponseWriter: w}
-		w = rhw
+	// Determine response body max size for buffering.
+	respBodyMax := pe.ResponseBodyMaxSize
+	if respBodyMax == 0 {
+		respBodyMax = 1 * 1024 * 1024 // default 1 MiB
 	}
 
-	err := next.ServeHTTP(w, r)
-
-	// Build response context from the captured status + headers.
+	// Choose outbound capture strategy based on whether body rules exist.
 	var resp *responseContext
-	if rhw.wroteHeader {
-		resp = &responseContext{
-			statusCode: rhw.statusCode,
-			headers:    rhw.Header(),
-		}
-	}
+	var upstreamErr error
 
-	// Evaluate outbound detect rules.
-	if resp != nil {
-		for _, cr := range rules {
-			if !cr.outbound || cr.rule.Type != "detect" || !cr.rule.Enabled {
-				continue
-			}
-			if cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
-				continue
-			}
-			if !matchService(cr.rule.Service, r) {
-				continue
-			}
+	if needsResponseBody && respBodyMax > 0 {
+		// Body buffering path: use Caddy ResponseRecorder to capture status + headers + body.
+		buf := bufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufPool.Put(buf)
 
-			// Evaluate conditions against response context.
-			matched := true
-			for _, cc := range cr.conditions {
-				val := extractResponseField(cc, resp)
-				if !evalOperator(cc, val) {
-					matched = false
-					break
-				}
-			}
+		rec := caddyhttp.NewResponseRecorder(w, buf, shouldBufferResponse)
+		upstreamErr = next.ServeHTTP(rec, r)
 
-			if matched {
-				scorer.outbound += cr.score
-				scorer.matched = append(scorer.matched, matchedRule{
-					ruleID:   cr.rule.ID,
-					ruleName: cr.rule.Name,
-					severity: cr.rule.Severity,
-					score:    cr.score,
-				})
+		if rec.Buffered() {
+			// Body was buffered — build full response context.
+			body := buf.Bytes()
+			if int64(len(body)) > respBodyMax {
+				body = body[:respBodyMax]
+			}
+			resp = &responseContext{
+				statusCode: rec.Status(),
+				headers:    rec.Header(),
+				body:       body,
+			}
+		} else {
+			// Not buffered (binary content, streaming, etc.) — header-only context.
+			resp = &responseContext{
+				statusCode: rec.Status(),
+				headers:    rec.Header(),
 			}
 		}
 
-		// Outbound threshold check.
+		// Evaluate outbound rules before writing the response.
+		pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+
+		// Outbound threshold check — can block before response is sent to client.
 		if scorer.outbound >= serviceOutThreshold {
 			pe.logger.Warn("outbound anomaly threshold exceeded",
 				zap.Int("score", scorer.outbound),
@@ -891,13 +890,99 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("host", host),
 				zap.String("uri", r.RequestURI),
 				zap.String("client_ip", clientIP(r)))
-			// Set Caddy vars for logging (response already sent, can't block).
+			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_score", strconv.Itoa(scorer.outbound))
+			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_block")
+			// Block the response — return 403 instead of the upstream response.
+			w.Header().Set("X-Blocked-By", "policy-engine-outbound")
+			w.WriteHeader(http.StatusForbidden)
+			return nil
+		}
+
+		// Score below threshold — write the original buffered response to client.
+		if rec.Buffered() {
+			return rec.WriteResponse()
+		}
+		return upstreamErr
+	}
+
+	// Header-only outbound path: wrap writer to capture status code.
+	rhw, isWrapped := w.(*responseHeaderWriter)
+	if !isWrapped {
+		rhw = &responseHeaderWriter{ResponseWriter: w}
+		w = rhw
+	}
+
+	upstreamErr = next.ServeHTTP(w, r)
+
+	// Build response context from captured status + headers (no body).
+	if rhw.wroteHeader {
+		resp = &responseContext{
+			statusCode: rhw.statusCode,
+			headers:    rhw.Header(),
+		}
+	}
+
+	// Evaluate outbound rules (response already streamed to client — can only log, not block).
+	if resp != nil {
+		pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+
+		if scorer.outbound >= serviceOutThreshold {
+			pe.logger.Warn("outbound anomaly threshold exceeded",
+				zap.Int("score", scorer.outbound),
+				zap.Int("threshold", serviceOutThreshold),
+				zap.String("host", host),
+				zap.String("uri", r.RequestURI),
+				zap.String("client_ip", clientIP(r)))
 			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_score", strconv.Itoa(scorer.outbound))
 			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_block")
 		}
 	}
 
-	return err
+	return upstreamErr
+}
+
+// ─── Outbound Rule Evaluation ───────────────────────────────────────
+
+// bufPool is a pool of bytes.Buffer for response body buffering.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// evaluateOutbound runs all outbound detect rules against the response context
+// and accumulates scores in the scorer.
+func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseContext, scorer *scoreAccumulator, servicePL int, r *http.Request) {
+	for _, cr := range rules {
+		if !cr.outbound || cr.rule.Type != "detect" || !cr.rule.Enabled {
+			continue
+		}
+		if cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
+			continue
+		}
+		if !matchService(cr.rule.Service, r) {
+			continue
+		}
+
+		matched := true
+		for _, cc := range cr.conditions {
+			val := extractResponseField(cc, resp)
+			if !evalOperator(cc, val) {
+				matched = false
+				break
+			}
+		}
+
+		if matched {
+			scorer.outbound += cr.score
+			scorer.matched = append(scorer.matched, matchedRule{
+				ruleID:   cr.rule.ID,
+				ruleName: cr.rule.Name,
+				severity: cr.rule.Severity,
+				score:    cr.score,
+			})
+		}
+	}
 }
 
 // ─── Body Reading ───────────────────────────────────────────────────
@@ -1198,6 +1283,7 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 type responseContext struct {
 	statusCode int
 	headers    http.Header
+	body       []byte // nil when body buffering is disabled or not applicable
 }
 
 // extractResponseField extracts a field value from the response context.
@@ -1221,6 +1307,11 @@ func extractResponseField(cc compiledCondition, resp *responseContext) string {
 		return strings.Join(parts, " ")
 	case "response_content_type":
 		return resp.headers.Get("Content-Type")
+	case "response_body":
+		if resp.body != nil {
+			return string(resp.body)
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -1229,7 +1320,42 @@ func extractResponseField(cc compiledCondition, resp *responseContext) string {
 // isResponseField returns true if the field requires response-phase context.
 func isResponseField(field string) bool {
 	switch field {
-	case "response_status", "response_header", "response_content_type":
+	case "response_status", "response_header", "response_content_type", "response_body":
+		return true
+	}
+	return false
+}
+
+// isResponseBodyField returns true if the field requires response body buffering.
+func isResponseBodyField(field string) bool {
+	return field == "response_body"
+}
+
+// shouldBufferResponse returns true if the response Content-Type indicates
+// textual content worth inspecting (HTML, JSON, XML, etc.).
+// Binary content (images, video, octet-stream) is never buffered.
+func shouldBufferResponse(status int, header http.Header) bool {
+	// Don't buffer informational or redirect responses.
+	if status < 200 || (status >= 300 && status < 400) {
+		return false
+	}
+	ct := header.Get("Content-Type")
+	if ct == "" {
+		return false
+	}
+	ct = strings.ToLower(ct)
+	// Buffer text/*, application/json, application/xml, application/javascript.
+	if strings.HasPrefix(ct, "text/") {
+		// Skip event streams (SSE).
+		if strings.Contains(ct, "event-stream") {
+			return false
+		}
+		return true
+	}
+	if strings.HasPrefix(ct, "application/json") ||
+		strings.HasPrefix(ct, "application/xml") ||
+		strings.HasPrefix(ct, "application/javascript") ||
+		strings.HasPrefix(ct, "application/xhtml") {
 		return true
 	}
 	return false

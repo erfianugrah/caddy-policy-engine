@@ -7030,3 +7030,115 @@ func TestResolveWafConfig_OutboundThresholdInheritsDefault(t *testing.T) {
 		t.Errorf("expected outbound threshold=15 (inherited), got %d", oth)
 	}
 }
+
+// ─── Phase B: Response Body Tests ───────────────────────────────────
+
+func TestExtractResponseField_Body(t *testing.T) {
+	resp := &responseContext{
+		statusCode: 200,
+		headers:    http.Header{"Content-Type": {"text/html"}},
+		body:       []byte("<html><body>Error: ORA-12154: TNS:could not resolve</body></html>"),
+	}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "ORA-12154"})
+	val := extractResponseField(cc, resp)
+	if !strings.Contains(val, "ORA-12154") {
+		t.Errorf("expected body to contain 'ORA-12154', got %q", val[:min(len(val), 50)])
+	}
+}
+
+func TestExtractResponseField_BodyNil(t *testing.T) {
+	resp := &responseContext{statusCode: 200, headers: http.Header{}}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "test"})
+	val := extractResponseField(cc, resp)
+	if val != "" {
+		t.Errorf("expected empty for nil body, got %q", val)
+	}
+}
+
+func TestIsResponseBodyField(t *testing.T) {
+	if !isResponseBodyField("response_body") {
+		t.Error("response_body should be a body field")
+	}
+	if isResponseBodyField("response_status") {
+		t.Error("response_status should not be a body field")
+	}
+	if isResponseBodyField("response_header") {
+		t.Error("response_header should not be a body field")
+	}
+}
+
+func TestShouldBufferResponse(t *testing.T) {
+	tests := []struct {
+		status int
+		ct     string
+		want   bool
+	}{
+		{200, "text/html; charset=utf-8", true},
+		{200, "text/plain", true},
+		{200, "application/json", true},
+		{200, "application/xml", true},
+		{200, "application/javascript", true},
+		{200, "application/xhtml+xml", true},
+		{200, "image/png", false},
+		{200, "video/mp4", false},
+		{200, "application/octet-stream", false},
+		{200, "text/event-stream", false}, // SSE — never buffer
+		{200, "", false},                  // no Content-Type
+		{301, "text/html", false},         // redirect
+		{101, "text/html", false},         // switching protocols
+		{500, "text/html", true},          // error page — should buffer
+		{403, "application/json", true},   // error response
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d_%s", tt.status, tt.ct), func(t *testing.T) {
+			h := http.Header{"Content-Type": {tt.ct}}
+			got := shouldBufferResponse(tt.status, h)
+			if got != tt.want {
+				t.Errorf("shouldBufferResponse(%d, %q) = %v, want %v", tt.status, tt.ct, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateOutbound(t *testing.T) {
+	rules := []compiledRule{
+		{
+			rule:     PolicyRule{ID: "ob-1", Name: "SQL Error", Type: "detect", Phase: "outbound", Severity: "CRITICAL", ParanoiaLevel: 1, Enabled: true},
+			outbound: true,
+			score:    5,
+			conditions: func() []compiledCondition {
+				cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "ORA-"})
+				return []compiledCondition{cc}
+			}(),
+		},
+		{
+			rule:     PolicyRule{ID: "inbound-1", Name: "Path Check", Type: "detect", Severity: "CRITICAL", ParanoiaLevel: 1, Enabled: true},
+			outbound: false, // inbound rule — should be skipped
+			score:    5,
+			conditions: func() []compiledCondition {
+				cc, _ := compileCondition(PolicyCondition{Field: "path", Operator: "contains", Value: "/admin"})
+				return []compiledCondition{cc}
+			}(),
+		},
+	}
+	pe := &PolicyEngine{}
+	resp := &responseContext{
+		statusCode: 500,
+		headers:    http.Header{"Content-Type": {"text/html"}},
+		body:       []byte("Error: ORA-12154: TNS:could not resolve"),
+	}
+	scorer := &scoreAccumulator{}
+	req := httptest.NewRequest("GET", "/", nil)
+
+	pe.evaluateOutbound(rules, resp, scorer, 1, req)
+
+	if scorer.outbound != 5 {
+		t.Errorf("expected outbound score=5, got %d", scorer.outbound)
+	}
+	if len(scorer.matched) != 1 {
+		t.Errorf("expected 1 matched rule, got %d", len(scorer.matched))
+	}
+	if scorer.matched[0].ruleID != "ob-1" {
+		t.Errorf("expected matched rule ob-1, got %s", scorer.matched[0].ruleID)
+	}
+}
