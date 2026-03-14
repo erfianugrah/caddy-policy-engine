@@ -3506,26 +3506,29 @@ func TestCompileWafConfig_PerService(t *testing.T) {
 		t.Fatal("expected non-nil")
 	}
 	// Default lookup.
-	pl, th := resolveWafConfig(c, "unknown.example.com")
+	pl, th, oth := resolveWafConfig(c, "unknown.example.com")
 	if pl != 2 || th != 10 {
 		t.Errorf("default: expected PL=2 threshold=10, got PL=%d threshold=%d", pl, th)
 	}
+	if oth != 10 {
+		t.Errorf("default: expected outbound threshold=10, got %d", oth)
+	}
 	// Strict override.
-	pl, th = resolveWafConfig(c, "strict.example.com")
+	pl, th, _ = resolveWafConfig(c, "strict.example.com")
 	if pl != 1 || th != 5 {
 		t.Errorf("strict: expected PL=1 threshold=5, got PL=%d threshold=%d", pl, th)
 	}
 	// Relaxed override (PL inherits, threshold overridden).
-	pl, th = resolveWafConfig(c, "relaxed.example.com")
+	pl, th, _ = resolveWafConfig(c, "relaxed.example.com")
 	if pl != 2 || th != 20 {
 		t.Errorf("relaxed: expected PL=2 threshold=20, got PL=%d threshold=%d", pl, th)
 	}
 }
 
 func TestResolveWafConfig_Nil(t *testing.T) {
-	pl, th := resolveWafConfig(nil, "example.com")
-	if pl != 1 || th != 0 {
-		t.Errorf("nil config: expected PL=1 threshold=0, got PL=%d threshold=%d", pl, th)
+	pl, th, oth := resolveWafConfig(nil, "example.com")
+	if pl != 1 || th != 0 || oth != 0 {
+		t.Errorf("nil config: expected PL=1 in=0 out=0, got PL=%d in=%d out=%d", pl, th, oth)
 	}
 }
 
@@ -6905,5 +6908,237 @@ func BenchmarkRegex_XSS_Negative(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		evalOperator(cc, "Hello & World <3 from Portland")
+	}
+}
+
+// ─── Outbound / Response-Phase Tests ────────────────────────────────
+
+func TestExtractResponseField_Status(t *testing.T) {
+	resp := &responseContext{statusCode: 403, headers: http.Header{"Content-Type": {"text/html"}}}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_status", Operator: "eq", Value: "403"})
+	val := extractResponseField(cc, resp)
+	if val != "403" {
+		t.Errorf("expected '403', got %q", val)
+	}
+}
+
+func TestExtractResponseField_ContentType(t *testing.T) {
+	resp := &responseContext{statusCode: 200, headers: http.Header{"Content-Type": {"application/json"}}}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_content_type", Operator: "contains", Value: "json"})
+	val := extractResponseField(cc, resp)
+	if val != "application/json" {
+		t.Errorf("expected 'application/json', got %q", val)
+	}
+}
+
+func TestExtractResponseField_Header(t *testing.T) {
+	resp := &responseContext{statusCode: 200, headers: http.Header{"Server": {"nginx/1.24"}, "X-Powered-By": {"PHP/8.1"}}}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_header", Operator: "contains", Value: "Server:nginx"})
+	val := extractResponseField(cc, resp)
+	if val != "nginx/1.24" {
+		t.Errorf("expected 'nginx/1.24', got %q", val)
+	}
+}
+
+func TestExtractResponseField_Nil(t *testing.T) {
+	cc, _ := compileCondition(PolicyCondition{Field: "response_status", Operator: "eq", Value: "200"})
+	val := extractResponseField(cc, nil)
+	if val != "" {
+		t.Errorf("expected empty for nil context, got %q", val)
+	}
+}
+
+func TestIsResponseField(t *testing.T) {
+	if !isResponseField("response_status") {
+		t.Error("response_status should be a response field")
+	}
+	if !isResponseField("response_header") {
+		t.Error("response_header should be a response field")
+	}
+	if !isResponseField("response_content_type") {
+		t.Error("response_content_type should be a response field")
+	}
+	if isResponseField("path") {
+		t.Error("path should not be a response field")
+	}
+}
+
+func TestCompileRule_OutboundPhase(t *testing.T) {
+	cr, err := compileRule(PolicyRule{
+		ID: "outbound-1", Name: "Server Header Check", Type: "detect",
+		Phase: "outbound", Severity: "WARNING", ParanoiaLevel: 1,
+		Conditions: []PolicyCondition{
+			{Field: "response_header", Operator: "contains", Value: "Server:nginx"},
+		},
+		Enabled: true, Priority: 400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cr.outbound {
+		t.Error("expected outbound=true for phase=outbound detect rule")
+	}
+}
+
+func TestCompileRule_InboundPhaseDefault(t *testing.T) {
+	cr, err := compileRule(PolicyRule{
+		ID: "inbound-1", Name: "Path Check", Type: "detect",
+		Severity: "CRITICAL", ParanoiaLevel: 1,
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "contains", Value: "/admin"},
+		},
+		Enabled: true, Priority: 400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cr.outbound {
+		t.Error("expected outbound=false for default (inbound) detect rule")
+	}
+}
+
+func TestResolveWafConfig_OutboundThreshold(t *testing.T) {
+	c := compileWafConfig(&WafConfig{
+		ParanoiaLevel:     2,
+		InboundThreshold:  10,
+		OutboundThreshold: 8,
+		PerService: map[string]WafServiceConfig{
+			"strict.example.com": {ParanoiaLevel: 1, InboundThreshold: 5, OutboundThreshold: 4},
+		},
+	})
+	_, _, oth := resolveWafConfig(c, "unknown.example.com")
+	if oth != 8 {
+		t.Errorf("default: expected outbound threshold=8, got %d", oth)
+	}
+	_, _, oth = resolveWafConfig(c, "strict.example.com")
+	if oth != 4 {
+		t.Errorf("strict: expected outbound threshold=4, got %d", oth)
+	}
+}
+
+func TestResolveWafConfig_OutboundThresholdInheritsDefault(t *testing.T) {
+	c := compileWafConfig(&WafConfig{
+		ParanoiaLevel:     1,
+		InboundThreshold:  10,
+		OutboundThreshold: 15,
+		PerService: map[string]WafServiceConfig{
+			"svc.example.com": {ParanoiaLevel: 2, InboundThreshold: 20},
+		},
+	})
+	_, _, oth := resolveWafConfig(c, "svc.example.com")
+	if oth != 15 {
+		t.Errorf("expected outbound threshold=15 (inherited), got %d", oth)
+	}
+}
+
+// ─── Phase B: Response Body Tests ───────────────────────────────────
+
+func TestExtractResponseField_Body(t *testing.T) {
+	resp := &responseContext{
+		statusCode: 200,
+		headers:    http.Header{"Content-Type": {"text/html"}},
+		body:       []byte("<html><body>Error: ORA-12154: TNS:could not resolve</body></html>"),
+	}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "ORA-12154"})
+	val := extractResponseField(cc, resp)
+	if !strings.Contains(val, "ORA-12154") {
+		t.Errorf("expected body to contain 'ORA-12154', got %q", val[:min(len(val), 50)])
+	}
+}
+
+func TestExtractResponseField_BodyNil(t *testing.T) {
+	resp := &responseContext{statusCode: 200, headers: http.Header{}}
+	cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "test"})
+	val := extractResponseField(cc, resp)
+	if val != "" {
+		t.Errorf("expected empty for nil body, got %q", val)
+	}
+}
+
+func TestIsResponseBodyField(t *testing.T) {
+	if !isResponseBodyField("response_body") {
+		t.Error("response_body should be a body field")
+	}
+	if isResponseBodyField("response_status") {
+		t.Error("response_status should not be a body field")
+	}
+	if isResponseBodyField("response_header") {
+		t.Error("response_header should not be a body field")
+	}
+}
+
+func TestShouldBufferResponse(t *testing.T) {
+	tests := []struct {
+		status int
+		ct     string
+		want   bool
+	}{
+		{200, "text/html; charset=utf-8", true},
+		{200, "text/plain", true},
+		{200, "application/json", true},
+		{200, "application/xml", true},
+		{200, "application/javascript", true},
+		{200, "application/xhtml+xml", true},
+		{200, "image/png", false},
+		{200, "video/mp4", false},
+		{200, "application/octet-stream", false},
+		{200, "text/event-stream", false}, // SSE — never buffer
+		{200, "", false},                  // no Content-Type
+		{301, "text/html", false},         // redirect
+		{101, "text/html", false},         // switching protocols
+		{500, "text/html", true},          // error page — should buffer
+		{403, "application/json", true},   // error response
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d_%s", tt.status, tt.ct), func(t *testing.T) {
+			h := http.Header{"Content-Type": {tt.ct}}
+			got := shouldBufferResponse(tt.status, h)
+			if got != tt.want {
+				t.Errorf("shouldBufferResponse(%d, %q) = %v, want %v", tt.status, tt.ct, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateOutbound(t *testing.T) {
+	rules := []compiledRule{
+		{
+			rule:     PolicyRule{ID: "ob-1", Name: "SQL Error", Type: "detect", Phase: "outbound", Severity: "CRITICAL", ParanoiaLevel: 1, Enabled: true},
+			outbound: true,
+			score:    5,
+			conditions: func() []compiledCondition {
+				cc, _ := compileCondition(PolicyCondition{Field: "response_body", Operator: "contains", Value: "ORA-"})
+				return []compiledCondition{cc}
+			}(),
+		},
+		{
+			rule:     PolicyRule{ID: "inbound-1", Name: "Path Check", Type: "detect", Severity: "CRITICAL", ParanoiaLevel: 1, Enabled: true},
+			outbound: false, // inbound rule — should be skipped
+			score:    5,
+			conditions: func() []compiledCondition {
+				cc, _ := compileCondition(PolicyCondition{Field: "path", Operator: "contains", Value: "/admin"})
+				return []compiledCondition{cc}
+			}(),
+		},
+	}
+	pe := &PolicyEngine{}
+	resp := &responseContext{
+		statusCode: 500,
+		headers:    http.Header{"Content-Type": {"text/html"}},
+		body:       []byte("Error: ORA-12154: TNS:could not resolve"),
+	}
+	scorer := &scoreAccumulator{}
+	req := httptest.NewRequest("GET", "/", nil)
+
+	pe.evaluateOutbound(rules, resp, scorer, 1, req)
+
+	if scorer.outbound != 5 {
+		t.Errorf("expected outbound score=5, got %d", scorer.outbound)
+	}
+	if len(scorer.matched) != 1 {
+		t.Errorf("expected 1 matched rule, got %d", len(scorer.matched))
+	}
+	if scorer.matched[0].ruleID != "ob-1" {
+		t.Errorf("expected matched rule ob-1, got %s", scorer.matched[0].ruleID)
 	}
 }
