@@ -7142,3 +7142,95 @@ func TestEvaluateOutbound(t *testing.T) {
 		t.Errorf("expected matched rule ob-1, got %s", scorer.matched[0].ruleID)
 	}
 }
+
+// ─── Per-Service Category Mask Tests ────────────────────────────────
+
+func TestIsRuleDisabledByCategory(t *testing.T) {
+	disabled := map[string]bool{"942": true, "941": true}
+
+	tests := []struct {
+		ruleID string
+		want   bool
+	}{
+		{"942100", true},   // SQLi — disabled
+		{"941100", true},   // XSS — disabled
+		{"932100", false},  // RCE — not disabled
+		{"920300", false},  // Protocol — not disabled
+		{"9100032", false}, // Custom — not disabled (4-digit prefix)
+		{"", false},        // empty
+		{"12", false},      // too short
+	}
+	for _, tt := range tests {
+		t.Run(tt.ruleID, func(t *testing.T) {
+			got := isRuleDisabledByCategory(tt.ruleID, disabled)
+			if got != tt.want {
+				t.Errorf("isRuleDisabledByCategory(%q, {942,941}) = %v, want %v", tt.ruleID, got, tt.want)
+			}
+		})
+	}
+
+	// nil/empty disabled map → never disabled
+	if isRuleDisabledByCategory("942100", nil) {
+		t.Error("nil disabled map should never disable")
+	}
+	if isRuleDisabledByCategory("942100", map[string]bool{}) {
+		t.Error("empty disabled map should never disable")
+	}
+}
+
+func TestIsRuleDisabledByCategory_CustomPrefix(t *testing.T) {
+	disabled := map[string]bool{"9100": true}
+	if !isRuleDisabledByCategory("9100032", disabled) {
+		t.Error("expected 9100032 disabled with 4-digit prefix 9100")
+	}
+	if isRuleDisabledByCategory("913100", disabled) {
+		t.Error("expected 913100 NOT disabled (913 != 9100)")
+	}
+}
+
+func TestResolveDisabledCategories(t *testing.T) {
+	c := compileWafConfig(&WafConfig{
+		ParanoiaLevel:      1,
+		InboundThreshold:   10,
+		OutboundThreshold:  10,
+		DisabledCategories: []string{"942", "941"},
+		PerService: map[string]WafServiceConfig{
+			"strict.example.com": {
+				ParanoiaLevel:      1,
+				InboundThreshold:   5,
+				DisabledCategories: []string{"932"}, // override: only disable RCE
+			},
+			"default.example.com": {
+				ParanoiaLevel:    2,
+				InboundThreshold: 15,
+				// no DisabledCategories → inherits global {942, 941}
+			},
+		},
+	})
+
+	// Unknown host → global defaults
+	cats := resolveDisabledCategories(c, "unknown.example.com")
+	if !cats["942"] || !cats["941"] {
+		t.Error("unknown host should get global disabled categories {942, 941}")
+	}
+
+	// Strict → per-service override {932}
+	cats = resolveDisabledCategories(c, "strict.example.com")
+	if !cats["932"] {
+		t.Error("strict should have 932 disabled")
+	}
+	if cats["942"] {
+		t.Error("strict should NOT have 942 disabled (per-service overrides global)")
+	}
+
+	// Default → inherits global {942, 941}
+	cats = resolveDisabledCategories(c, "default.example.com")
+	if !cats["942"] || !cats["941"] {
+		t.Error("default.example.com should inherit global {942, 941}")
+	}
+
+	// Nil config → nil
+	if resolveDisabledCategories(nil, "example.com") != nil {
+		t.Error("nil config should return nil disabled categories")
+	}
+}

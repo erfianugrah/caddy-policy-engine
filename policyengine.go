@@ -125,31 +125,35 @@ type DefaultRulesFile struct {
 
 // WafConfig controls the anomaly scoring engine's behavior.
 type WafConfig struct {
-	ParanoiaLevel     int                         `json:"paranoia_level"`
-	InboundThreshold  int                         `json:"inbound_threshold"`
-	OutboundThreshold int                         `json:"outbound_threshold"`
-	PerService        map[string]WafServiceConfig `json:"per_service,omitempty"`
+	ParanoiaLevel      int                         `json:"paranoia_level"`
+	InboundThreshold   int                         `json:"inbound_threshold"`
+	OutboundThreshold  int                         `json:"outbound_threshold"`
+	DisabledCategories []string                    `json:"disabled_categories,omitempty"` // global: CRS rule ID prefixes to skip (e.g., "942" for SQLi)
+	PerService         map[string]WafServiceConfig `json:"per_service,omitempty"`
 }
 
-// WafServiceConfig allows per-service threshold and PL overrides.
+// WafServiceConfig allows per-service threshold, PL, and category overrides.
 type WafServiceConfig struct {
-	ParanoiaLevel     int `json:"paranoia_level,omitempty"`
-	InboundThreshold  int `json:"inbound_threshold,omitempty"`
-	OutboundThreshold int `json:"outbound_threshold,omitempty"`
+	ParanoiaLevel      int      `json:"paranoia_level,omitempty"`
+	InboundThreshold   int      `json:"inbound_threshold,omitempty"`
+	OutboundThreshold  int      `json:"outbound_threshold,omitempty"`
+	DisabledCategories []string `json:"disabled_categories,omitempty"` // per-service: CRS rule ID prefixes to skip
 }
 
 // compiledWafConfig is the pre-compiled WAF config for O(1) per-request lookup.
 type compiledWafConfig struct {
-	defaultPL           int
-	defaultInThreshold  int
-	defaultOutThreshold int
-	services            map[string]compiledWafServiceConfig
+	defaultPL                 int
+	defaultInThreshold        int
+	defaultOutThreshold       int
+	defaultDisabledCategories map[string]bool // global disabled categories
+	services                  map[string]compiledWafServiceConfig
 }
 
 type compiledWafServiceConfig struct {
-	paranoiaLevel     int
-	inboundThreshold  int
-	outboundThreshold int
+	paranoiaLevel      int
+	inboundThreshold   int
+	outboundThreshold  int
+	disabledCategories map[string]bool // rule ID prefix set for O(1) lookup
 }
 
 // scoreAccumulator tracks per-request anomaly scores during detect rule evaluation.
@@ -494,6 +498,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// Resolve per-service WAF config for this request.
 	host := stripPort(r.Host)
 	servicePL, serviceThreshold, serviceOutThreshold := resolveWafConfig(wafCfg, host)
+	disabledCats := resolveDisabledCategories(wafCfg, host)
 
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
@@ -536,6 +541,11 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		// Detect rules: skip if paranoia level is too high for this service.
 		if cr.rule.Type == "detect" && cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
+			continue
+		}
+
+		// Detect rules: skip if rule's category is disabled for this service.
+		if cr.rule.Type == "detect" && isRuleDisabledByCategory(cr.rule.ID, disabledCats) {
 			continue
 		}
 
@@ -2666,6 +2676,13 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 		defaultInThreshold:  cfg.InboundThreshold,
 		defaultOutThreshold: cfg.OutboundThreshold,
 	}
+	// Compile global disabled categories into a set.
+	if len(cfg.DisabledCategories) > 0 {
+		c.defaultDisabledCategories = make(map[string]bool, len(cfg.DisabledCategories))
+		for _, cat := range cfg.DisabledCategories {
+			c.defaultDisabledCategories[cat] = true
+		}
+	}
 	// Sensible defaults.
 	if c.defaultPL == 0 {
 		c.defaultPL = 1
@@ -2683,6 +2700,15 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 				paranoiaLevel:     svc.ParanoiaLevel,
 				inboundThreshold:  svc.InboundThreshold,
 				outboundThreshold: svc.OutboundThreshold,
+			}
+			// Compile per-service disabled categories; inherit global if empty.
+			if len(svc.DisabledCategories) > 0 {
+				cs.disabledCategories = make(map[string]bool, len(svc.DisabledCategories))
+				for _, cat := range svc.DisabledCategories {
+					cs.disabledCategories[cat] = true
+				}
+			} else {
+				cs.disabledCategories = c.defaultDisabledCategories
 			}
 			// Zero means "inherit from defaults".
 			if cs.paranoiaLevel == 0 {
@@ -2714,6 +2740,37 @@ func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inbou
 		}
 	}
 	return cfg.defaultPL, cfg.defaultInThreshold, cfg.defaultOutThreshold
+}
+
+// resolveDisabledCategories returns the disabled category set for a host.
+// Returns nil if no categories are disabled (zero overhead in the hot path).
+func resolveDisabledCategories(cfg *compiledWafConfig, host string) map[string]bool {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.services != nil {
+		if svc, ok := cfg.services[strings.ToLower(host)]; ok {
+			return svc.disabledCategories
+		}
+	}
+	return cfg.defaultDisabledCategories
+}
+
+// isRuleDisabledByCategory checks if a rule's ID prefix matches any disabled category.
+// Category prefixes are 3-digit CRS ranges like "942" (SQLi), "941" (XSS), "932" (RCE).
+func isRuleDisabledByCategory(ruleID string, disabled map[string]bool) bool {
+	if len(disabled) == 0 || len(ruleID) < 3 {
+		return false
+	}
+	// Check 3-digit prefix (e.g., "942" matches "942100")
+	if disabled[ruleID[:3]] {
+		return true
+	}
+	// Check 4-digit prefix for custom rules (e.g., "9100" matches "9100032")
+	if len(ruleID) >= 4 && disabled[ruleID[:4]] {
+		return true
+	}
+	return false
 }
 
 // stripPort removes the port from a host:port string.
