@@ -735,10 +735,41 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		caddyhttp.SetVar(r.Context(), "policy_engine.matched_rules", strconv.Itoa(len(scorer.matched)))
 
 		// Always emit match details for all detect events (both blocking and logged).
-		// This enables observability for below-threshold events too.
+		// This enables observability for below-threshold events in tuning/log-only mode.
 		matchesJSON := serializeDetectMatches(scorer.matched)
 		if matchesJSON != "" {
 			caddyhttp.SetVar(r.Context(), "policy_engine.detect_matches", matchesJSON)
+		}
+
+		// Build matched-rule detail strings — needed for both block and logged events.
+		ruleNames := make([]string, 0, len(scorer.matched))
+		ruleDetails := make([]string, 0, len(scorer.matched))
+		var tags []string
+		tagSeen := map[string]bool{}
+		for _, m := range scorer.matched {
+			ruleNames = append(ruleNames, m.ruleID)
+			// Format: "920350:WARNING:3" (id:severity:score)
+			ruleDetails = append(ruleDetails, m.ruleID+":"+m.severity+":"+strconv.Itoa(m.score))
+		}
+		// Look up tags from compiled rules for all matched detect rules.
+		for _, m := range scorer.matched {
+			for _, cr := range rules {
+				if cr.rule.ID == m.ruleID {
+					for _, t := range cr.rule.Tags {
+						if !tagSeen[t] {
+							tagSeen[t] = true
+							tags = append(tags, t)
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// Always set detect_rules and tags — logged events need them for visibility.
+		caddyhttp.SetVar(r.Context(), "policy_engine.detect_rules", strings.Join(ruleDetails, ","))
+		if len(tags) > 0 {
+			caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(tags, ","))
 		}
 
 		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
@@ -746,43 +777,10 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			// Capture full request context for investigation.
 			captureRequestContext(r, pb)
 
-			// Build matched-rule detail strings for logging and access log capture.
-			ruleNames := make([]string, 0, len(scorer.matched))
-			ruleDetails := make([]string, 0, len(scorer.matched))
-			var tags []string
-			tagSeen := map[string]bool{}
-			for _, m := range scorer.matched {
-				ruleNames = append(ruleNames, m.ruleID)
-				// Format: "PE-920350:WARNING:3" (id:severity:score)
-				ruleDetails = append(ruleDetails, m.ruleID+":"+m.severity+":"+strconv.Itoa(m.score))
-				// Collect unique tags from all matched detect rules.
-				// Tags aren't stored on matchedRule, so we look them up from compiled rules.
-			}
-			// Look up tags from compiled rules for all matched detect rules.
-			// Use the local `rules` snapshot (captured at function start) —
-			// no lock needed since it's already a slice copy.
-			for _, m := range scorer.matched {
-				for _, cr := range rules {
-					if cr.rule.ID == m.ruleID {
-						for _, t := range cr.rule.Tags {
-							if !tagSeen[t] {
-								tagSeen[t] = true
-								tags = append(tags, t)
-							}
-						}
-						break
-					}
-				}
-			}
-
 			// Set Caddy vars for access log capture (matches block/allow pattern).
 			summary := fmt.Sprintf("Detect Block (score %d/%d, %d rules)", scorer.inbound, serviceThreshold, len(scorer.matched))
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", summary)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", strings.Join(ruleNames, ","))
-			caddyhttp.SetVar(r.Context(), "policy_engine.detect_rules", strings.Join(ruleDetails, ","))
-			if len(tags) > 0 {
-				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(tags, ","))
-			}
 
 			if !pe.HideHeaders {
 				w.Header().Set("X-Blocked-By", "policy-engine")
