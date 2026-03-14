@@ -348,6 +348,7 @@ type responseHeaderWriter struct {
 	cspHeaderName string // "Content-Security-Policy" or "Content-Security-Policy-Report-Only"
 	removeHeaders []string
 	wroteHeader   bool
+	statusCode    int // captured status code for outbound rule evaluation
 }
 
 func (rw *responseHeaderWriter) WriteHeader(code int) {
@@ -355,6 +356,7 @@ func (rw *responseHeaderWriter) WriteHeader(code int) {
 		return
 	}
 	rw.wroteHeader = true
+	rw.statusCode = code
 
 	// Remove unwanted upstream headers.
 	for _, h := range rw.removeHeaders {

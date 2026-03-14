@@ -142,14 +142,16 @@ type compiledWafConfig struct {
 }
 
 type compiledWafServiceConfig struct {
-	paranoiaLevel    int
-	inboundThreshold int
+	paranoiaLevel     int
+	inboundThreshold  int
+	outboundThreshold int
 }
 
 // scoreAccumulator tracks per-request anomaly scores during detect rule evaluation.
 type scoreAccumulator struct {
-	inbound int
-	matched []matchedRule
+	inbound  int
+	outbound int
+	matched  []matchedRule
 }
 
 // matchedRule records a detect rule that fired for audit logging.
@@ -194,6 +196,7 @@ type PolicyRule struct {
 	// Detect rule fields (anomaly scoring)
 	Severity      string `json:"severity,omitempty"`       // CRITICAL(5), ERROR(4), WARNING(3), NOTICE(2)
 	ParanoiaLevel int    `json:"paranoia_level,omitempty"` // 1-4; rule only evaluates if configured PL >= this
+	Phase         string `json:"phase,omitempty"`          // "inbound" (default) or "outbound" — outbound rules evaluate after upstream response
 
 	// Skip rule fields (selective bypass)
 	SkipTargets *SkipTargets `json:"skip_targets,omitempty"`
@@ -230,6 +233,7 @@ type compiledRule struct {
 	rlConfig    *compiledRLConfig    // non-nil for rate_limit rules
 	score       int                  // severity-derived score for detect rules (0 for non-detect)
 	skipTargets *compiledSkipTargets // non-nil for skip rules
+	outbound    bool                 // true if this rule evaluates in the response phase (post-upstream)
 }
 
 // compiledSkipTargets is the pre-compiled form of SkipTargets.
@@ -484,7 +488,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// Resolve per-service WAF config for this request.
 	host := stripPort(r.Host)
-	servicePL, serviceThreshold := resolveWafConfig(wafCfg, host)
+	servicePL, serviceThreshold, serviceOutThreshold := resolveWafConfig(wafCfg, host)
 
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
@@ -518,6 +522,11 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			if skipAllRemaining || skipDetect || skipRuleIDs[cr.rule.ID] {
 				continue
 			}
+		}
+
+		// Outbound rules: skip in the inbound loop — evaluated after upstream response.
+		if cr.outbound {
+			continue
 		}
 
 		// Detect rules: skip if paranoia level is too high for this service.
@@ -805,9 +814,90 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// (block/rate_limit return early above) and before next.ServeHTTP().
 	w = applyResponseHeaders(w, r.Host, respHeaders)
 
-	// Pass through to next handler. If a skip rule matched, the Caddyfile
-	// @needs_waf matcher will see policy_engine.action=skip.
-	return next.ServeHTTP(w, r)
+	// Check if any outbound detect rules exist for this request.
+	hasOutbound := false
+	for _, cr := range rules {
+		if cr.outbound && cr.rule.Type == "detect" && cr.rule.Enabled {
+			if cr.rule.ParanoiaLevel == 0 || cr.rule.ParanoiaLevel <= servicePL {
+				hasOutbound = true
+				break
+			}
+		}
+	}
+
+	// Fast path: no outbound rules, pass through directly.
+	if !hasOutbound || serviceOutThreshold <= 0 {
+		return next.ServeHTTP(w, r)
+	}
+
+	// Outbound path: ensure w is wrapped so we capture the response status code.
+	// applyResponseHeaders may have already wrapped it; if not, wrap now.
+	rhw, isWrapped := w.(*responseHeaderWriter)
+	if !isWrapped {
+		rhw = &responseHeaderWriter{ResponseWriter: w}
+		w = rhw
+	}
+
+	err := next.ServeHTTP(w, r)
+
+	// Build response context from the captured status + headers.
+	var resp *responseContext
+	if rhw.wroteHeader {
+		resp = &responseContext{
+			statusCode: rhw.statusCode,
+			headers:    rhw.Header(),
+		}
+	}
+
+	// Evaluate outbound detect rules.
+	if resp != nil {
+		for _, cr := range rules {
+			if !cr.outbound || cr.rule.Type != "detect" || !cr.rule.Enabled {
+				continue
+			}
+			if cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
+				continue
+			}
+			if !matchService(cr.rule.Service, r) {
+				continue
+			}
+
+			// Evaluate conditions against response context.
+			matched := true
+			for _, cc := range cr.conditions {
+				val := extractResponseField(cc, resp)
+				if !evalOperator(cc, val) {
+					matched = false
+					break
+				}
+			}
+
+			if matched {
+				scorer.outbound += cr.score
+				scorer.matched = append(scorer.matched, matchedRule{
+					ruleID:   cr.rule.ID,
+					ruleName: cr.rule.Name,
+					severity: cr.rule.Severity,
+					score:    cr.score,
+				})
+			}
+		}
+
+		// Outbound threshold check.
+		if scorer.outbound >= serviceOutThreshold {
+			pe.logger.Warn("outbound anomaly threshold exceeded",
+				zap.Int("score", scorer.outbound),
+				zap.Int("threshold", serviceOutThreshold),
+				zap.String("host", host),
+				zap.String("uri", r.RequestURI),
+				zap.String("client_ip", clientIP(r)))
+			// Set Caddy vars for logging (response already sent, can't block).
+			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_score", strconv.Itoa(scorer.outbound))
+			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_block")
+		}
+	}
+
+	return err
 }
 
 // ─── Body Reading ───────────────────────────────────────────────────
@@ -1102,6 +1192,47 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 	default:
 		return ""
 	}
+}
+
+// responseContext holds captured response data for outbound rule evaluation.
+type responseContext struct {
+	statusCode int
+	headers    http.Header
+}
+
+// extractResponseField extracts a field value from the response context.
+// Used for outbound detect rules that inspect response_status, response_header, etc.
+func extractResponseField(cc compiledCondition, resp *responseContext) string {
+	if resp == nil {
+		return ""
+	}
+	switch cc.field {
+	case "response_status":
+		return strconv.Itoa(resp.statusCode)
+	case "response_header":
+		if cc.name != "" {
+			return resp.headers.Get(cc.name)
+		}
+		// No name → concatenate all header values.
+		var parts []string
+		for _, vals := range resp.headers {
+			parts = append(parts, vals...)
+		}
+		return strings.Join(parts, " ")
+	case "response_content_type":
+		return resp.headers.Get("Content-Type")
+	default:
+		return ""
+	}
+}
+
+// isResponseField returns true if the field requires response-phase context.
+func isResponseField(field string) bool {
+	switch field {
+	case "response_status", "response_header", "response_content_type":
+		return true
+	}
+	return false
 }
 
 // extractFieldExists checks whether a body_json field exists (for the "exists" operator).
@@ -2344,6 +2475,11 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		}
 	}
 
+	// Tag outbound detect rules (evaluated after upstream response).
+	if rule.Type == "detect" && rule.Phase == "outbound" {
+		cr.outbound = true
+	}
+
 	// Compile skip targets if this is a skip rule.
 	if rule.Type == "skip" {
 		st, err := compileSkipTargets(rule.SkipTargets)
@@ -2418,8 +2554,9 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 		c.services = make(map[string]compiledWafServiceConfig, len(cfg.PerService))
 		for host, svc := range cfg.PerService {
 			cs := compiledWafServiceConfig{
-				paranoiaLevel:    svc.ParanoiaLevel,
-				inboundThreshold: svc.InboundThreshold,
+				paranoiaLevel:     svc.ParanoiaLevel,
+				inboundThreshold:  svc.InboundThreshold,
+				outboundThreshold: svc.OutboundThreshold,
 			}
 			// Zero means "inherit from defaults".
 			if cs.paranoiaLevel == 0 {
@@ -2427,6 +2564,9 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 			}
 			if cs.inboundThreshold == 0 {
 				cs.inboundThreshold = c.defaultInThreshold
+			}
+			if cs.outboundThreshold == 0 {
+				cs.outboundThreshold = c.defaultOutThreshold
 			}
 			c.services[strings.ToLower(host)] = cs
 		}
@@ -2436,18 +2576,18 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 
 // resolveWafConfig returns the effective paranoia level and inbound threshold
 // for a given host. Falls back to defaults if no per-service override exists.
-// Returns (1, 0) if wafConfig is nil (scoring disabled — PL 1, threshold 0
+// Returns (1, 0, 0) if wafConfig is nil (scoring disabled — PL 1, thresholds 0
 // meaning no blocking).
-func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inboundThreshold int) {
+func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inboundThreshold, outboundThreshold int) {
 	if cfg == nil {
-		return 1, 0
+		return 1, 0, 0
 	}
 	if cfg.services != nil {
 		if svc, ok := cfg.services[strings.ToLower(host)]; ok {
-			return svc.paranoiaLevel, svc.inboundThreshold
+			return svc.paranoiaLevel, svc.inboundThreshold, svc.outboundThreshold
 		}
 	}
-	return cfg.defaultPL, cfg.defaultInThreshold
+	return cfg.defaultPL, cfg.defaultInThreshold, cfg.defaultOutThreshold
 }
 
 // stripPort removes the port from a host:port string.
@@ -2490,7 +2630,7 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 	value := cond.Value
 	if cc.name == "" {
 		switch cond.Field {
-		case "header", "cookie", "args", "body_form":
+		case "header", "cookie", "args", "body_form", "response_header":
 			if idx := strings.IndexByte(value, ':'); idx >= 0 {
 				cc.name = value[:idx]
 				value = value[idx+1:]
