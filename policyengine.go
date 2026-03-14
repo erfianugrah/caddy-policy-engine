@@ -182,8 +182,8 @@ type keyedValue struct {
 type PolicyRule struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
-	Type       string            `json:"type"`              // "allow", "block", "honeypot", "rate_limit", "detect"
-	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit and detect rules)
+	Type       string            `json:"type"`              // "allow", "block", "honeypot", "skip", "rate_limit", "detect"
+	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit, detect, and skip rules)
 	Conditions []PolicyCondition `json:"conditions"`
 	GroupOp    string            `json:"group_op"` // "and" or "or"
 	RateLimit  *RateLimitConfig  `json:"rate_limit,omitempty"`
@@ -194,6 +194,18 @@ type PolicyRule struct {
 	// Detect rule fields (anomaly scoring)
 	Severity      string `json:"severity,omitempty"`       // CRITICAL(5), ERROR(4), WARNING(3), NOTICE(2)
 	ParanoiaLevel int    `json:"paranoia_level,omitempty"` // 1-4; rule only evaluates if configured PL >= this
+
+	// Skip rule fields (selective bypass)
+	SkipTargets *SkipTargets `json:"skip_targets,omitempty"`
+}
+
+// SkipTargets specifies what a skip rule bypasses.
+// Rules: specific rule IDs to skip. Phases: entire evaluation phases.
+// AllRemaining: skip everything (equivalent to the old allow behavior).
+type SkipTargets struct {
+	Rules        []string `json:"rules,omitempty"`         // specific rule IDs to skip
+	Phases       []string `json:"phases,omitempty"`        // "detect", "rate_limit", "block"
+	AllRemaining bool     `json:"all_remaining,omitempty"` // skip all downstream evaluation
 }
 
 // PolicyCondition is a single match condition.
@@ -212,11 +224,22 @@ type PolicyCondition struct {
 // ─── Compiled State ─────────────────────────────────────────────────
 
 type compiledRule struct {
-	rule       PolicyRule
-	conditions []compiledCondition
-	needsBody  bool              // true if any condition or RL key uses body/body_json/body_form
-	rlConfig   *compiledRLConfig // non-nil for rate_limit rules
-	score      int               // severity-derived score for detect rules (0 for non-detect)
+	rule        PolicyRule
+	conditions  []compiledCondition
+	needsBody   bool                 // true if any condition or RL key uses body/body_json/body_form
+	rlConfig    *compiledRLConfig    // non-nil for rate_limit rules
+	score       int                  // severity-derived score for detect rules (0 for non-detect)
+	skipTargets *compiledSkipTargets // non-nil for skip rules
+}
+
+// compiledSkipTargets is the pre-compiled form of SkipTargets.
+// Rule IDs are stored in a hash set for O(1) lookup during evaluation.
+type compiledSkipTargets struct {
+	ruleIDs      map[string]bool // specific rule IDs to skip
+	skipDetect   bool            // true if "detect" phase should be skipped
+	skipRL       bool            // true if "rate_limit" phase should be skipped
+	skipBlock    bool            // true if "block" phase should be skipped
+	allRemaining bool            // skip everything below this rule
 }
 
 type compiledCondition struct {
@@ -426,18 +449,20 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	respHeaders := pe.respHeaders
 	pe.mu.RUnlock()
 
-	// ── 4-pass evaluation ──────────────────────────────────────────
+	// ── 5-pass evaluation ──────────────────────────────────────────
 	//
-	// Pass 1 — Deny list: block/honeypot rules terminate immediately (403).
-	// Pass 2 — Allow: first allow match sets the "skip WAF" flag but does NOT
-	//          terminate — evaluation continues to passes 3 & 4.
-	// Pass 3 — Detect: accumulate anomaly scores. Skipped if allow matched.
-	// Pass 4 — Rate limit: always evaluates regardless of allow. Counters
-	//          always tick. Exceeded deny-action → 429.
+	// Pass 1 — Allow (50-99):   full bypass, terminates immediately.
+	// Pass 2 — Block (100-199): deny list, terminates with 403. Skippable.
+	// Pass 3 — Skip (200-299):  selective bypass, accumulates skip flags.
+	//          Non-terminating (evaluation continues for non-skipped types).
+	// Pass 4 — Rate limit (300-399): sliding window counters. Skippable.
+	// Pass 5 — Detect (400-499): CRS anomaly scoring. Skippable.
 	//
-	// Rules are sorted by priority (block < detect < allow < rate_limit), so a
-	// single loop handles all four passes in order. Allow skips further detect
-	// rules (allowed traffic isn't scored). Rate limits apply independently.
+	// Rules are sorted by priority so a single loop handles all passes.
+	// Skip rules accumulate flags that suppress downstream evaluation:
+	//   - skip_targets.all_remaining: skip everything below
+	//   - skip_targets.phases: skip entire phases (detect, rate_limit, block)
+	//   - skip_targets.rules: skip specific rule IDs
 	//
 	// After the loop: if accumulated score > threshold → 403 (detect_block).
 
@@ -450,6 +475,13 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	var allowMatched bool
 	var scorer scoreAccumulator
 
+	// Skip state — accumulated from skip rules (pass 3).
+	var skipAllRemaining bool
+	var skipDetect bool
+	var skipRL bool
+	var skipBlock bool
+	skipRuleIDs := map[string]bool{}
+
 	// Resolve per-service WAF config for this request.
 	host := stripPort(r.Host)
 	servicePL, serviceThreshold := resolveWafConfig(wafCfg, host)
@@ -459,15 +491,33 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			continue
 		}
 
-		// Rate limit and detect rules may have service matching.
-		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect") && !matchService(cr.rule.Service, r) {
+		// Service matching for service-scoped rule types.
+		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect" || cr.rule.Type == "skip") && !matchService(cr.rule.Service, r) {
 			continue
 		}
 
-		// If an allow already matched, skip further allow AND detect rules.
-		// Allowed traffic bypasses scoring entirely.
-		if allowMatched && (cr.rule.Type == "allow" || cr.rule.Type == "detect") {
+		// Allow terminates: if allow already matched, skip everything
+		// except rate limits (which always evaluate for allow — see below).
+		if allowMatched {
 			continue
+		}
+
+		// Skip flag checks: block, rate_limit, and detect rules can be
+		// suppressed by upstream skip rules.
+		if cr.rule.Type == "block" || cr.rule.Type == "honeypot" {
+			if skipAllRemaining || skipBlock || skipRuleIDs[cr.rule.ID] {
+				continue
+			}
+		}
+		if cr.rule.Type == "rate_limit" {
+			if skipAllRemaining || skipRL || skipRuleIDs[cr.rule.ID] {
+				continue
+			}
+		}
+		if cr.rule.Type == "detect" {
+			if skipAllRemaining || skipDetect || skipRuleIDs[cr.rule.ID] {
+				continue
+			}
 		}
 
 		// Detect rules: skip if paranoia level is too high for this service.
@@ -507,8 +557,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// Rule matched — take action.
 		switch cr.rule.Type {
 		case "allow":
-			// Pass 2: set allow flag and Caddy vars, but do NOT return.
-			// Rate limit rules (pass 4) still need to be evaluated.
+			// Pass 1: full bypass — terminate immediately.
+			// No blocks, CRS, or rate limits below fire. Trusted traffic.
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "allow")
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -522,10 +572,13 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 			allowMatched = true
-			// Continue — don't return. Rate limits still apply.
+
+			// Apply response headers even for allowed traffic.
+			w = applyResponseHeaders(w, r.Host, respHeaders)
+			return next.ServeHTTP(w, r)
 
 		case "block", "honeypot":
-			// Pass 1: deny list — hard terminate.
+			// Pass 2: deny list — hard terminate.
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -549,6 +602,41 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 			return caddyhttp.Error(http.StatusForbidden, nil)
+
+		case "skip":
+			// Pass 3: selective bypass — accumulate skip flags, non-terminating.
+			// Merge this rule's skip_targets into the running skip state.
+			if cr.skipTargets != nil {
+				if cr.skipTargets.allRemaining {
+					skipAllRemaining = true
+				}
+				if cr.skipTargets.skipDetect {
+					skipDetect = true
+				}
+				if cr.skipTargets.skipRL {
+					skipRL = true
+				}
+				if cr.skipTargets.skipBlock {
+					skipBlock = true
+				}
+				for id := range cr.skipTargets.ruleIDs {
+					skipRuleIDs[id] = true
+				}
+			}
+			caddyhttp.SetVar(r.Context(), "policy_engine.action", "skip")
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+			if len(cr.rule.Tags) > 0 {
+				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+			}
+			pe.logger.Info("policy skip",
+				zap.String("rule_id", cr.rule.ID),
+				zap.String("rule_name", cr.rule.Name),
+				zap.Strings("tags", cr.rule.Tags),
+				zap.Bool("all_remaining", cr.skipTargets != nil && cr.skipTargets.allRemaining),
+				zap.String("client_ip", clientIP(r)),
+				zap.String("uri", r.RequestURI))
+			// Continue — non-terminating. Evaluation continues for non-skipped types.
 
 		case "detect":
 			// Pass 3: anomaly scoring — accumulate score, don't terminate.
@@ -639,9 +727,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// ── Post-loop: anomaly threshold check ─────────────────────────
 	// If detect rules fired and the accumulated score exceeds the threshold,
-	// block the request. This happens after all rules (including rate limits)
-	// have been evaluated, so rate limit counters are always ticked.
-	if scorer.inbound > 0 && !allowMatched {
+	// block the request. Skipped if detect phase was bypassed by a skip rule.
+	if scorer.inbound > 0 {
 		// Set score variables regardless of whether threshold is exceeded.
 		caddyhttp.SetVar(r.Context(), "policy_engine.anomaly_score", strconv.Itoa(scorer.inbound))
 		caddyhttp.SetVar(r.Context(), "policy_engine.anomaly_threshold", strconv.Itoa(serviceThreshold))
@@ -720,8 +807,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// (block/rate_limit return early above) and before next.ServeHTTP().
 	w = applyResponseHeaders(w, r.Host, respHeaders)
 
-	// Pass through to next handler. If allowMatched is true, the Caddyfile
-	// @needs_waf matcher will see policy_engine.action=allow and skip WAF.
+	// Pass through to next handler. If a skip rule matched, the Caddyfile
+	// @needs_waf matcher will see policy_engine.action=skip.
 	return next.ServeHTTP(w, r)
 }
 
@@ -2191,8 +2278,16 @@ var validRuleTypes = map[string]bool{
 	"allow":      true,
 	"block":      true,
 	"honeypot":   true,
+	"skip":       true,
 	"rate_limit": true,
 	"detect":     true,
+}
+
+// validSkipPhases is the set of phases that can be targeted by skip rules.
+var validSkipPhases = map[string]bool{
+	"detect":     true,
+	"rate_limit": true,
+	"block":      true,
 }
 
 // severityScores maps severity strings to anomaly score points.
@@ -2210,7 +2305,7 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 	// Validate rule type early — unknown types would silently match
 	// conditions but take no action in ServeHTTP.
 	if !validRuleTypes[rule.Type] {
-		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, rate_limit, or detect)", rule.Type)
+		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, skip, rate_limit, or detect)", rule.Type)
 	}
 
 	for _, cond := range rule.Conditions {
@@ -2251,7 +2346,51 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		}
 	}
 
+	// Compile skip targets if this is a skip rule.
+	if rule.Type == "skip" {
+		st, err := compileSkipTargets(rule.SkipTargets)
+		if err != nil {
+			return cr, fmt.Errorf("skip_targets: %w", err)
+		}
+		cr.skipTargets = st
+	}
+
 	return cr, nil
+}
+
+// compileSkipTargets validates and pre-compiles skip targets for O(1) evaluation.
+func compileSkipTargets(st *SkipTargets) (*compiledSkipTargets, error) {
+	if st == nil {
+		return nil, fmt.Errorf("skip rules must have skip_targets")
+	}
+	if !st.AllRemaining && len(st.Rules) == 0 && len(st.Phases) == 0 {
+		return nil, fmt.Errorf("skip_targets must specify at least one of: rules, phases, or all_remaining")
+	}
+	for _, phase := range st.Phases {
+		if !validSkipPhases[phase] {
+			return nil, fmt.Errorf("invalid skip phase %q (must be detect, rate_limit, or block)", phase)
+		}
+	}
+	cst := &compiledSkipTargets{
+		allRemaining: st.AllRemaining,
+	}
+	if len(st.Rules) > 0 {
+		cst.ruleIDs = make(map[string]bool, len(st.Rules))
+		for _, id := range st.Rules {
+			cst.ruleIDs[id] = true
+		}
+	}
+	for _, phase := range st.Phases {
+		switch phase {
+		case "detect":
+			cst.skipDetect = true
+		case "rate_limit":
+			cst.skipRL = true
+		case "block":
+			cst.skipBlock = true
+		}
+	}
+	return cst, nil
 }
 
 // ─── WAF Config Compilation ─────────────────────────────────────────

@@ -1304,22 +1304,22 @@ func TestDisabledRule_Skipped(t *testing.T) {
 
 // ─── Priority Ordering: first match wins ────────────────────────────
 
-func TestPriority_BlockAlwaysWins(t *testing.T) {
-	// In the 3-pass evaluation model, block/honeypot rules always terminate
-	// even if an allow rule matched earlier. Blocks are the "deny list" —
-	// they cannot be overridden by allows.
+func TestPriority_AllowTerminatesBeforeBlock(t *testing.T) {
+	// In the 5-pass model, allow (priority 50-99) terminates immediately
+	// before block rules (priority 100-199) are evaluated. Allow is the
+	// "I trust this traffic completely" escape hatch.
 	pe := &PolicyEngine{
 		Rules: []PolicyRule{
-			// Allow has lower priority number (100) — evaluated first.
+			// Allow at priority 50 — evaluated first, terminates.
 			{
-				ID: "a1", Type: "allow", Enabled: true, Priority: 100,
+				ID: "a1", Type: "allow", Enabled: true, Priority: 50,
 				Conditions: []PolicyCondition{
 					{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
 				},
 			},
-			// Block has higher priority number (200) — evaluated second.
+			// Block at priority 100 — never reached because allow terminated.
 			{
-				ID: "b1", Type: "block", Enabled: true, Priority: 200,
+				ID: "b1", Type: "block", Enabled: true, Priority: 100,
 				Conditions: []PolicyCondition{
 					{Field: "uri_path", Operator: "eq", Value: "/admin"},
 				},
@@ -1328,35 +1328,72 @@ func TestPriority_BlockAlwaysWins(t *testing.T) {
 	}
 	mustProvision(t, pe)
 
-	// Request matches both rules — block should win (blocks always terminate).
+	// Request matches both rules — allow terminates first, block never fires.
+	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: allow should terminate cleanly, got %v", err)
+	}
+	if !next.called {
+		t.Error("next handler should be called (allow terminates with pass-through)")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "allow" {
+		t.Errorf("expected allow action, got %q", action)
+	}
+}
+
+func TestPriority_SkipDoesNotOverrideBlock(t *testing.T) {
+	// Skip rules (priority 200-299) can suppress blocks below them, but
+	// block rules above the skip rule's priority still fire.
+	// Here: block at 100 fires before skip at 200 is reached.
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "b1", Type: "block", Enabled: true, Priority: 100,
+				Conditions: []PolicyCondition{
+					{Field: "uri_path", Operator: "eq", Value: "/admin"},
+				},
+			},
+			{
+				ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+				},
+				SkipTargets: &SkipTargets{AllRemaining: true},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
 	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
 	w := httptest.NewRecorder()
 	next := &nextHandler{}
 
 	err := pe.ServeHTTP(w, r, next)
 	if err == nil {
-		t.Fatal("expected error from block rule")
+		t.Fatal("expected 403 from block rule")
 	}
 	httpErr, ok := err.(caddyhttp.HandlerError)
 	if !ok || httpErr.StatusCode != 403 {
-		t.Errorf("want 403 from block rule, got %v", err)
+		t.Errorf("want 403, got %v", err)
 	}
 	if next.called {
 		t.Error("next handler should NOT be called when block fires")
 	}
-	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
-	if action != "block" {
-		t.Errorf("expected block action, got %q", action)
-	}
 }
 
-func TestPriority_AllowDoesNotShortCircuitRateLimit(t *testing.T) {
-	// Allow rules set the WAF-bypass flag but do not prevent rate limit
-	// evaluation. If a rate limit is exceeded, 429 takes precedence.
+func TestPriority_AllowTerminatesBeforeRateLimit(t *testing.T) {
+	// In the 5-pass model, allow terminates immediately. Rate limit
+	// counters do NOT tick for allowed traffic. Use skip to selectively
+	// bypass detect while still respecting rate limits.
 	pe := newTestPolicyEngine(t, []PolicyRule{
 		{
-			ID: "a1", Name: "Allow Office", Type: "allow", Enabled: true,
-			Priority: 200,
+			ID: "a1", Name: "Allow Trusted", Type: "allow", Enabled: true,
+			Priority: 50,
 			Conditions: []PolicyCondition{
 				{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
 			},
@@ -1373,7 +1410,49 @@ func TestPriority_AllowDoesNotShortCircuitRateLimit(t *testing.T) {
 		},
 	})
 
-	// First request — allow matches, RL counter ticks (1/1), passes through.
+	// Both requests — allow terminates, RL never evaluated, both pass.
+	for i := 0; i < 3; i++ {
+		r := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+		next := &nextHandler{}
+		err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+		if err != nil {
+			t.Fatalf("request %d: unexpected error: %v", i+1, err)
+		}
+		if !next.called {
+			t.Errorf("request %d: next should be called (allow terminates)", i+1)
+		}
+		action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+		if action != "allow" {
+			t.Errorf("request %d: action = %q, want allow", i+1, action)
+		}
+	}
+}
+
+func TestPriority_SkipDetectStillRateLimits(t *testing.T) {
+	// Skip rules that skip the detect phase still allow rate limits to fire.
+	// This is the replacement for the old "allow + rate limit" interaction.
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "s1", Name: "Skip CRS for Office", Type: "skip", Enabled: true,
+			Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"detect"}},
+		},
+		{
+			ID: "rl1", Name: "Global RL", Type: "rate_limit", Enabled: true,
+			Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key:    "client_ip",
+				Events: 1,
+				Window: "1m",
+				Action: "deny",
+			},
+		},
+	})
+
+	// First request — skip matches, RL counter ticks (1/1), passes through.
 	r1 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
 	next1 := &nextHandler{}
 	err := pe.ServeHTTP(httptest.NewRecorder(), r1, next1)
@@ -1381,14 +1460,14 @@ func TestPriority_AllowDoesNotShortCircuitRateLimit(t *testing.T) {
 		t.Fatalf("first request: unexpected error: %v", err)
 	}
 	if !next1.called {
-		t.Error("first request: next handler should be called (allow + under RL limit)")
+		t.Error("first request: next handler should be called")
 	}
 	action1, _ := caddyhttp.GetVar(r1.Context(), "policy_engine.action").(string)
-	if action1 != "allow" {
-		t.Errorf("first request: action = %q, want allow", action1)
+	if action1 != "skip" {
+		t.Errorf("first request: action = %q, want skip", action1)
 	}
 
-	// Second request — same IP, rate limit exceeded. 429 overrides allow.
+	// Second request — same IP, rate limit exceeded. 429 fires.
 	r2 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
 	next2 := &nextHandler{}
 	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
@@ -1402,20 +1481,14 @@ func TestPriority_AllowDoesNotShortCircuitRateLimit(t *testing.T) {
 	if next2.called {
 		t.Error("second request: next handler should NOT be called when rate limited")
 	}
-	// The final action should be rate_limit (overrides earlier allow).
-	action2, _ := caddyhttp.GetVar(r2.Context(), "policy_engine.action").(string)
-	if action2 != "rate_limit" {
-		t.Errorf("second request: action = %q, want rate_limit", action2)
-	}
 }
 
-func TestPriority_AllowPassesThroughWhenUnderRateLimit(t *testing.T) {
-	// When an allow matches and rate limit is under the threshold,
-	// the request passes through with action=allow (WAF bypass).
+func TestPriority_AllowPassesThroughImmediately(t *testing.T) {
+	// Allow terminates immediately — rate limits are never evaluated.
 	pe := newTestPolicyEngine(t, []PolicyRule{
 		{
 			ID: "a1", Name: "Allow Health", Type: "allow", Enabled: true,
-			Priority: 200,
+			Priority: 50,
 			Conditions: []PolicyCondition{
 				{Field: "path", Operator: "eq", Value: "/health"},
 			},
@@ -1440,11 +1513,347 @@ func TestPriority_AllowPassesThroughWhenUnderRateLimit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !next.called {
-		t.Error("next handler should be called (allow + under RL limit)")
+		t.Error("next handler should be called (allow terminates immediately)")
 	}
 	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
 	if action != "allow" {
-		t.Errorf("action = %q, want allow (RL under limit shouldn't override)", action)
+		t.Errorf("action = %q, want allow", action)
+	}
+}
+
+// ─── Skip Action Tests ──────────────────────────────────────────────
+
+func TestSkip_SpecificRuleIDs(t *testing.T) {
+	// Skip specific detect rule IDs. Other detect rules still fire.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "host", Operator: "eq", Value: "authelia.example.com"},
+			},
+			SkipTargets: &SkipTargets{Rules: []string{"d1", "d2"}},
+		},
+		{
+			ID: "d1", Type: "detect", Enabled: true, Priority: 400,
+			Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+		},
+		{
+			ID: "d2", Type: "detect", Enabled: true, Priority: 400,
+			Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+		},
+		{
+			ID: "d3", Type: "detect", Enabled: true, Priority: 400,
+			Severity: "NOTICE", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 2, InboundThreshold: 5})
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Request to authelia — d1 and d2 are skipped, only d3 fires (score 2, threshold 5).
+	r := makeRequest("GET", "/", "10.0.0.1:1234")
+	r.Host = "authelia.example.com"
+	next := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (d1+d2 skipped, d3 score=2 < threshold 5)", err)
+	}
+	if !next.called {
+		t.Error("next should be called (below threshold after skipping d1+d2)")
+	}
+	action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
+	if action != "skip" {
+		t.Errorf("action = %q, want skip", action)
+	}
+
+	// Request to other host — no skip, all 3 rules fire (5+5+2=12 > threshold 5).
+	r2 := makeRequest("GET", "/", "10.0.0.1:1234")
+	r2.Host = "other.example.com"
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err == nil {
+		t.Fatal("expected 403 (all detect rules fire, score 12 > threshold 5)")
+	}
+	httpErr, ok := err.(caddyhttp.HandlerError)
+	if !ok || httpErr.StatusCode != 403 {
+		t.Errorf("want 403, got %v", err)
+	}
+}
+
+func TestSkip_DetectPhase(t *testing.T) {
+	// Skip the entire detect phase. No CRS anomaly scoring occurs.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "host", Operator: "eq", Value: "trusted.example.com"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"detect"}},
+		},
+		{
+			ID: "d1", Type: "detect", Enabled: true, Priority: 400,
+			Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 2, InboundThreshold: 3})
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/", "10.0.0.1:1234")
+	r.Host = "trusted.example.com"
+	next := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (detect phase skipped)", err)
+	}
+	if !next.called {
+		t.Error("next should be called (detect phase skipped)")
+	}
+}
+
+func TestSkip_RateLimitPhase(t *testing.T) {
+	// Skip the rate_limit phase. RL counters don't tick.
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"rate_limit"}},
+		},
+		{
+			ID: "rl1", Type: "rate_limit", Enabled: true, Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key: "client_ip", Events: 1, Window: "1m", Action: "deny",
+			},
+		},
+	})
+
+	// Multiple requests — RL phase is skipped, all pass.
+	for i := 0; i < 3; i++ {
+		r := makeRequest("GET", "/", "10.0.0.1:1234")
+		next := &nextHandler{}
+		err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+		if err != nil {
+			t.Fatalf("request %d: unexpected error: %v (RL phase skipped)", i+1, err)
+		}
+		if !next.called {
+			t.Errorf("request %d: next should be called", i+1)
+		}
+	}
+}
+
+func TestSkip_AllRemaining(t *testing.T) {
+	// Skip all remaining rules — equivalent to old allow behavior but
+	// non-terminating in the sense it sets flags rather than returning.
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/health"},
+			},
+			SkipTargets: &SkipTargets{AllRemaining: true},
+		},
+		{
+			ID: "rl1", Type: "rate_limit", Enabled: true, Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key: "client_ip", Events: 1, Window: "1m", Action: "deny",
+			},
+		},
+	})
+
+	// Multiple requests to /health — all skipped, no 429.
+	for i := 0; i < 3; i++ {
+		r := makeRequest("GET", "/health", "10.0.0.1:1234")
+		next := &nextHandler{}
+		err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+		if err != nil {
+			t.Fatalf("request %d: unexpected error: %v", i+1, err)
+		}
+	}
+
+	// Request to /other — not skipped, RL fires on second request.
+	r1 := makeRequest("GET", "/other", "10.0.0.1:1234")
+	if err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{}); err != nil {
+		t.Fatalf("unexpected error on /other: %v", err)
+	}
+	r2 := makeRequest("GET", "/other", "10.0.0.1:1234")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r2, &nextHandler{})
+	if err == nil {
+		t.Fatal("expected 429 on second /other request")
+	}
+}
+
+func TestSkip_MultipleSkipRulesMerge(t *testing.T) {
+	// Two skip rules match the same request. Their targets are merged.
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Conditions: []PolicyCondition{
+				{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"detect"}},
+		},
+		{
+			ID: "s2", Type: "skip", Enabled: true, Priority: 201,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/api"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"rate_limit"}},
+		},
+		{
+			ID: "rl1", Type: "rate_limit", Enabled: true, Priority: 300,
+			RateLimit: &RateLimitConfig{
+				Key: "client_ip", Events: 1, Window: "1m", Action: "deny",
+			},
+		},
+	})
+
+	// Request matches both skip rules — detect AND rate_limit both skipped.
+	for i := 0; i < 3; i++ {
+		r := makeRequest("GET", "/api", "10.0.0.1:1234")
+		next := &nextHandler{}
+		err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+		if err != nil {
+			t.Fatalf("request %d: unexpected error: %v (both phases skipped)", i+1, err)
+		}
+	}
+}
+
+func TestSkip_BlockPhase(t *testing.T) {
+	// Skip the block phase — block rules below the skip are suppressed.
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{
+				ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+				Conditions: []PolicyCondition{
+					{Field: "ip", Operator: "ip_match", Value: "10.0.0.0/8"},
+				},
+				SkipTargets: &SkipTargets{Phases: []string{"block"}},
+			},
+			// This block rule would normally fire, but skip suppresses it.
+			// Note: blocks at priority < skip (100 < 200) still fire — only
+			// blocks AFTER the skip in priority order are affected. Since
+			// block rules are typically at 100-199, they fire before skip at
+			// 200-299. This test uses priority 250 to test a block after skip.
+			{
+				ID: "b1", Type: "block", Enabled: true, Priority: 250,
+				Conditions: []PolicyCondition{
+					{Field: "path", Operator: "eq", Value: "/admin"},
+				},
+			},
+		},
+	}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
+	next := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (block phase skipped by skip rule)", err)
+	}
+	if !next.called {
+		t.Error("next should be called (block suppressed)")
+	}
+}
+
+func TestSkip_CompileValidation(t *testing.T) {
+	ctx, cancel := testContext()
+	defer cancel()
+
+	// Skip rules must have skip_targets.
+	pe := &PolicyEngine{
+		Rules: []PolicyRule{
+			{ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+				Conditions: []PolicyCondition{{Field: "path", Operator: "eq", Value: "/"}},
+			},
+		},
+	}
+	if err := pe.Provision(ctx); err == nil {
+		t.Error("expected compile error for skip rule without skip_targets")
+	}
+
+	// Empty skip_targets should fail.
+	pe2 := &PolicyEngine{
+		Rules: []PolicyRule{
+			{ID: "s2", Type: "skip", Enabled: true, Priority: 200,
+				Conditions:  []PolicyCondition{{Field: "path", Operator: "eq", Value: "/"}},
+				SkipTargets: &SkipTargets{},
+			},
+		},
+	}
+	if err := pe2.Provision(ctx); err == nil {
+		t.Error("expected compile error for skip rule with empty skip_targets")
+	}
+
+	// Invalid phase should fail.
+	pe3 := &PolicyEngine{
+		Rules: []PolicyRule{
+			{ID: "s3", Type: "skip", Enabled: true, Priority: 200,
+				Conditions:  []PolicyCondition{{Field: "path", Operator: "eq", Value: "/"}},
+				SkipTargets: &SkipTargets{Phases: []string{"invalid_phase"}},
+			},
+		},
+	}
+	if err := pe3.Provision(ctx); err == nil {
+		t.Error("expected compile error for invalid skip phase")
+	}
+}
+
+func TestSkip_ServiceScoped(t *testing.T) {
+	// Skip rule scoped to api.example.com; detect rule applies to ALL hosts.
+	// On api.example.com: skip fires → detect phase skipped → passes.
+	// On other.example.com: skip doesn't fire → detect fires → 403.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "s1", Type: "skip", Enabled: true, Priority: 200,
+			Service: "api.example.com",
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+			SkipTargets: &SkipTargets{Phases: []string{"detect"}},
+		},
+		{
+			ID: "d1", Type: "detect", Enabled: true, Priority: 400,
+			Severity: "CRITICAL", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "eq", Value: "/"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 2, InboundThreshold: 3})
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	// Request to api.example.com — skip matches, detect skipped.
+	r1 := makeRequest("GET", "/", "10.0.0.1:1234")
+	r1.Host = "api.example.com"
+	next1 := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, next1)
+	if err != nil {
+		t.Fatalf("unexpected error for api host: %v", err)
+	}
+	if !next1.called {
+		t.Error("next should be called for api host")
+	}
+
+	// Request to other.example.com — skip doesn't match (wrong service),
+	// detect rule fires (unscoped), score 5 > threshold 3 → 403.
+	r2 := makeRequest("GET", "/", "10.0.0.1:1234")
+	r2.Host = "other.example.com"
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err == nil {
+		t.Fatal("expected 403 for other host (detect fires, score 5 > threshold 3)")
 	}
 }
 
