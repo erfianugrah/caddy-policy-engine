@@ -1504,20 +1504,20 @@ func evalOperator(cc compiledCondition, target string) bool {
 		// This two-step pattern keeps evalOperator focused on positive
 		// matching while matchCondition handles all negation uniformly.
 		return target == cc.exactVal
-	case "contains":
+	case "contains", "not_contains":
 		return strings.Contains(target, cc.contains)
-	case "begins_with":
+	case "begins_with", "not_begins_with":
 		return strings.HasPrefix(target, cc.prefix)
-	case "ends_with":
+	case "ends_with", "not_ends_with":
 		return strings.HasSuffix(target, cc.suffix)
-	case "regex":
+	case "regex", "not_regex":
 		if cc.regex != nil {
 			return cc.regex.MatchString(target)
 		}
 		return false
 	case "ip_match", "not_ip_match":
 		return evalIPMatch(cc, target)
-	case "in", "in_list":
+	case "in", "not_in", "in_list":
 		// in_list with ip kind uses IP-aware matching.
 		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
 			return evalIPMatch(cc, target)
@@ -1528,7 +1528,7 @@ func evalOperator(cc compiledCondition, target string) bool {
 			return evalIPMatch(cc, target)
 		}
 		return cc.stringSet[target]
-	case "phrase_match":
+	case "phrase_match", "not_phrase_match":
 		if cc.acMatcher != nil {
 			return cc.acMatcher.ContainsAny(target)
 		}
@@ -1811,22 +1811,22 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 			return true, target
 		}
 		return false, ""
-	case "contains":
+	case "contains", "not_contains":
 		if strings.Contains(target, cc.contains) {
 			return true, cc.contains
 		}
 		return false, ""
-	case "begins_with":
+	case "begins_with", "not_begins_with":
 		if strings.HasPrefix(target, cc.prefix) {
 			return true, cc.prefix
 		}
 		return false, ""
-	case "ends_with":
+	case "ends_with", "not_ends_with":
 		if strings.HasSuffix(target, cc.suffix) {
 			return true, cc.suffix
 		}
 		return false, ""
-	case "regex":
+	case "regex", "not_regex":
 		if cc.regex != nil {
 			m := cc.regex.FindString(target)
 			if m != "" {
@@ -1843,7 +1843,7 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 			return true, target
 		}
 		return false, ""
-	case "in", "in_list":
+	case "in", "not_in", "in_list":
 		if cc.ipSet != nil || (cc.ipNets != nil && cc.stringSet == nil) {
 			if evalIPMatch(cc, target) {
 				return true, target
@@ -1865,7 +1865,7 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 			return true, target
 		}
 		return false, ""
-	case "phrase_match":
+	case "phrase_match", "not_phrase_match":
 		if cc.acMatcher != nil {
 			if pattern, found := cc.acMatcher.FindFirst(target); found {
 				return true, pattern
@@ -2507,7 +2507,9 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 
 	// Handle negate operators (from operator name or explicit negate field).
 	switch cond.Operator {
-	case "neq", "not_ip_match", "not_in_list":
+	case "neq", "not_ip_match", "not_in_list",
+		"not_contains", "not_begins_with", "not_ends_with",
+		"not_regex", "not_in", "not_phrase_match":
 		cc.negate = true
 	}
 	// CRS !@ prefix: explicit negate field from converter output.
@@ -2520,16 +2522,16 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 	case "eq", "neq":
 		cc.exactVal = value
 
-	case "contains":
+	case "contains", "not_contains":
 		cc.contains = value
 
-	case "begins_with":
+	case "begins_with", "not_begins_with":
 		cc.prefix = value
 
-	case "ends_with":
+	case "ends_with", "not_ends_with":
 		cc.suffix = value
 
-	case "regex":
+	case "regex", "not_regex":
 		if len(value) > maxRegexLen {
 			return cc, fmt.Errorf("regex pattern too long (%d bytes, max %d)", len(value), maxRegexLen)
 		}
@@ -2546,7 +2548,7 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		}
 		cc.ipNets = nets
 
-	case "in":
+	case "in", "not_in":
 		// Accept both pipe-separated ("a|b|c") and space-separated ("a b c") values.
 		// The wafctl frontend stores "in" values with pipes (PipeTagInput convention),
 		// while some seeded rules use spaces. Normalize pipes to spaces, then split.
@@ -2580,11 +2582,11 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 		// No value comparison needed.
 		cc.isExists = true
 
-	case "phrase_match":
+	case "phrase_match", "not_phrase_match":
 		// Aho-Corasick multi-pattern substring search.
 		// Patterns come from ListItems (resolved by wafctl from managed lists or inline).
 		if len(cond.ListItems) == 0 {
-			return cc, fmt.Errorf("phrase_match requires list_items (pattern list)")
+			return cc, fmt.Errorf("%s requires list_items (pattern list)", cond.Operator)
 		}
 		cc.acMatcher = CompileAC(cond.ListItems)
 

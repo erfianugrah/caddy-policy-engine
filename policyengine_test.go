@@ -1857,6 +1857,223 @@ func TestSkip_ServiceScoped(t *testing.T) {
 	}
 }
 
+// ─── Negated Operators ──────────────────────────────────────────────
+
+func TestNegate_NotContains(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "not_contains", Value: "/safe"},
+			},
+		},
+	})
+
+	// Path WITHOUT /safe — not_contains matches → block.
+	r1 := makeRequest("GET", "/evil/path", "10.0.0.1:1234")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: path does not contain /safe")
+	}
+
+	// Path WITH /safe — not_contains does not match → pass.
+	r2 := makeRequest("GET", "/safe/page", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (path contains /safe)", err)
+	}
+	if !next2.called {
+		t.Error("next should be called")
+	}
+}
+
+func TestNegate_NotBeginsWith(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "not_begins_with", Value: "/api/"},
+			},
+		},
+	})
+
+	// Path NOT starting with /api/ → block.
+	r1 := makeRequest("GET", "/admin/users", "10.0.0.1:1234")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: path does not begin with /api/")
+	}
+
+	// Path starting with /api/ → pass.
+	r2 := makeRequest("GET", "/api/v1/data", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next2.called {
+		t.Error("next should be called")
+	}
+}
+
+func TestNegate_NotEndsWith(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "not_ends_with", Value: ".json"},
+			},
+		},
+	})
+
+	// Path NOT ending with .json → block.
+	r1 := makeRequest("GET", "/data.xml", "10.0.0.1:1234")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: path does not end with .json")
+	}
+
+	// Path ending with .json → pass.
+	r2 := makeRequest("GET", "/api/data.json", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next2.called {
+		t.Error("next should be called")
+	}
+}
+
+func TestNegate_NotRegex(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "not_regex", Value: "^Mozilla/"},
+			},
+		},
+	})
+
+	// UA NOT matching ^Mozilla/ → block.
+	r1 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "curl/7.68.0",
+	})
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: UA does not match ^Mozilla/")
+	}
+
+	// UA matching ^Mozilla/ → pass.
+	r2 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "Mozilla/5.0 (X11; Linux)",
+	})
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next2.called {
+		t.Error("next should be called")
+	}
+}
+
+func TestNegate_NotIn(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "method", Operator: "not_in", Value: "GET|HEAD|OPTIONS"},
+			},
+		},
+	})
+
+	// Method NOT in {GET, HEAD, OPTIONS} → block.
+	r1 := makeRequest("POST", "/api/data", "10.0.0.1:1234")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: POST not in allowed methods")
+	}
+
+	// Method in {GET, HEAD, OPTIONS} → pass.
+	r2 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next2.called {
+		t.Error("next should be called")
+	}
+
+	// HEAD also in set → pass.
+	r3 := makeRequest("HEAD", "/api/data", "10.0.0.1:1234")
+	next3 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r3, next3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next3.called {
+		t.Error("next should be called for HEAD")
+	}
+}
+
+func TestNegate_NotPhraseMatch(t *testing.T) {
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "not_phrase_match", Value: "",
+					ListItems: []string{"Googlebot", "Bingbot", "DuckDuckBot"}},
+			},
+		},
+	})
+
+	// UA contains none of the known bots → not_phrase_match matches → block.
+	r1 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "EvilScraper/1.0",
+	})
+	err := pe.ServeHTTP(httptest.NewRecorder(), r1, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: UA contains none of the allowed bot phrases")
+	}
+
+	// UA contains "Googlebot" → phrase_match would match, so not_phrase_match doesn't → pass.
+	r2 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)",
+	})
+	next2 := &nextHandler{}
+	err = pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next2.called {
+		t.Error("next should be called (Googlebot matched phrase list)")
+	}
+}
+
+func TestNegate_FieldAbsent(t *testing.T) {
+	// When the field is absent (e.g., no User-Agent header), negated operators
+	// should return true (absent field "does not contain" anything).
+	pe := newTestPolicyEngine(t, []PolicyRule{
+		{
+			ID: "b1", Type: "block", Enabled: true, Priority: 100,
+			Conditions: []PolicyCondition{
+				{Field: "user_agent", Operator: "not_contains", Value: "Bot"},
+			},
+		},
+	})
+
+	// No User-Agent header → field absent → not_contains returns true → block.
+	r := makeRequest("GET", "/", "10.0.0.1:1234")
+	r.Header.Del("User-Agent")
+	err := pe.ServeHTTP(httptest.NewRecorder(), r, &nextHandler{})
+	if err == nil {
+		t.Error("expected 403: absent UA does not contain 'Bot'")
+	}
+}
+
 // ─── Hot Reload ─────────────────────────────────────────────────────
 
 func TestHotReload_FileChange(t *testing.T) {
