@@ -7130,7 +7130,8 @@ func TestEvaluateOutbound(t *testing.T) {
 	scorer := &scoreAccumulator{}
 	req := httptest.NewRequest("GET", "/", nil)
 
-	pe.evaluateOutbound(rules, resp, scorer, 1, req)
+	w := httptest.NewRecorder()
+	pe.evaluateOutbound(rules, resp, scorer, 1, req, w)
 
 	if scorer.outbound != 5 {
 		t.Errorf("expected outbound score=5, got %d", scorer.outbound)

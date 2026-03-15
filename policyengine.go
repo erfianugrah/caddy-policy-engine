@@ -908,22 +908,25 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		// Evaluate outbound rules before writing the response.
-		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r, w)
 
 		// Handle non-detect outbound actions (block, response_header).
 		if outAction != nil {
 			switch outAction.action {
-			case "block":
-				pe.logger.Warn("outbound block rule matched",
+			case "block", "rate_limit_block":
+				pe.logger.Warn("outbound rule blocked response",
+					zap.String("action", outAction.action),
 					zap.String("rule_id", outAction.rule.ID),
 					zap.String("rule_name", outAction.rule.Name),
 					zap.String("host", host),
 					zap.String("uri", r.RequestURI))
 				w.Header().Set("X-Blocked-By", "policy-engine-outbound")
-				w.WriteHeader(http.StatusForbidden)
+				if outAction.action == "rate_limit_block" {
+					w.WriteHeader(http.StatusTooManyRequests)
+				} else {
+					w.WriteHeader(http.StatusForbidden)
+				}
 				return nil
-			case "response_header":
-				applyRuleHeaders(w, outAction.rule)
 			case "allow":
 				// Skip remaining outbound evaluation — write through.
 			}
@@ -971,13 +974,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// Evaluate outbound rules (response already streamed to client — can only log, not block).
 	if resp != nil {
-		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r, w)
 
-		// In header-only path, response is already streamed. We can apply
-		// response_header actions (headers not yet flushed if WriteHeader was
-		// intercepted), but block actions can only log (too late to block).
-		if outAction != nil && outAction.action == "response_header" {
-			applyRuleHeaders(w, outAction.rule)
+		// In header-only path, response is already streamed.
+		// Block/rate_limit_block actions can only log (too late to block).
+		// response_header rules were already applied inside evaluateOutbound.
+		if outAction != nil && (outAction.action == "block" || outAction.action == "rate_limit_block") {
+			pe.logger.Warn("outbound rule matched after response streamed (too late to block)",
+				zap.String("action", outAction.action),
+				zap.String("rule_id", outAction.rule.ID),
+				zap.String("host", host))
 		}
 
 		if scorer.outbound >= serviceOutThreshold {
@@ -1005,9 +1011,10 @@ var bufPool = sync.Pool{
 }
 
 // evaluateOutbound runs all outbound rules against the response context.
-// Detect rules accumulate scores in the scorer. Other outbound rule types
-// (block, response_header) are handled via the returned action.
-func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseContext, scorer *scoreAccumulator, servicePL int, r *http.Request) *outboundAction {
+// Detect rules accumulate scores. Block/allow terminate. Response_header
+// rules accumulate (all matching ones apply). Rate_limit rules count
+// against response-phase sliding windows (e.g., rate limit on 401s).
+func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseContext, scorer *scoreAccumulator, servicePL int, r *http.Request, w http.ResponseWriter) *outboundAction {
 	for _, cr := range rules {
 		if !cr.outbound || !cr.rule.Enabled {
 			continue
@@ -1037,9 +1044,25 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 		case "block", "honeypot":
 			return &outboundAction{action: "block", rule: cr.rule}
 		case "response_header":
-			return &outboundAction{action: "response_header", rule: cr.rule}
+			// Apply immediately — multiple response_header rules can all fire.
+			applyRuleHeaders(w, cr.rule)
+		case "rate_limit":
+			// Outbound rate limiting (e.g., count 401 responses per client).
+			if cr.rlConfig != nil && pe.rlState != nil {
+				zone := pe.rlState.getZone(cr.rule.ID)
+				if zone != nil {
+					key := resolveRateLimitKey(cr.rlConfig.Key, r, nil)
+					now := time.Now()
+					allowed, _, _ := zone.allow(key, now)
+					if !allowed {
+						if cr.rlConfig.Action != "log_only" {
+							return &outboundAction{action: "rate_limit_block", rule: cr.rule}
+						}
+						// log_only: continue evaluation, just record
+					}
+				}
+			}
 		case "allow":
-			// Allow in outbound means skip remaining outbound evaluation.
 			return &outboundAction{action: "allow", rule: cr.rule}
 		}
 	}
