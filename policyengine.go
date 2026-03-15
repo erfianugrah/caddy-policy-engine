@@ -468,7 +468,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	respHeaders := pe.respHeaders
 	pe.mu.RUnlock()
 
-	// ── 5-pass evaluation ──────────────────────────────────────────
+	// ── CORS Preflight ─────────────────────────────────────────────
+	// Handle OPTIONS preflight before any rule evaluation.
+	// Preflight requests get 204 + CORS headers without reaching upstream.
+	if respHeaders != nil && respHeaders.HandlePreflight(w, r) {
+		return nil
+	}
+
+	// ── 6-pass evaluation ──────────────────────────────────────────
 	//
 	// Pass 1 — Allow (50-99):   full bypass, terminates immediately.
 	// Pass 2 — Block (100-199): deny list, terminates with 403. Skippable.
@@ -604,7 +611,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			allowMatched = true
 
 			// Apply response headers even for allowed traffic.
-			w = applyResponseHeaders(w, r.Host, respHeaders)
+			w = applyResponseHeaders(w, r.Host, r, respHeaders)
 			return next.ServeHTTP(w, r)
 
 		case "block", "honeypot":
@@ -833,7 +840,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// This wraps the ResponseWriter when "default" mode CSP or header removal
 	// requires intercepting WriteHeader(). Must happen after rule evaluation
 	// (block/rate_limit return early above) and before next.ServeHTTP().
-	w = applyResponseHeaders(w, r.Host, respHeaders)
+	w = applyResponseHeaders(w, r.Host, r, respHeaders)
 
 	// Check if any outbound rules exist for this request,
 	// and whether any of them need response body buffering.

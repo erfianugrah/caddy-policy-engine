@@ -603,7 +603,7 @@ func TestResponseHeaderWriter_Unwrap(t *testing.T) {
 
 func TestApplyResponseHeaders_NilConfig(t *testing.T) {
 	rec := httptest.NewRecorder()
-	w := applyResponseHeaders(rec, "example.com", nil)
+	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), nil)
 	if w != rec {
 		t.Error("expected original writer for nil config")
 	}
@@ -618,7 +618,7 @@ func TestApplyResponseHeaders_CSPSetMode(t *testing.T) {
 	crh := compileResponseHeaders(cfg)
 
 	rec := httptest.NewRecorder()
-	w := applyResponseHeaders(rec, "example.com", crh)
+	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	// "set" mode (default fallback) should set header directly — no wrapper needed.
 	got := rec.Header().Get("Content-Security-Policy")
@@ -647,7 +647,7 @@ func TestApplyResponseHeaders_CSPDefaultMode(t *testing.T) {
 	crh := compileResponseHeaders(cfg)
 
 	rec := httptest.NewRecorder()
-	w := applyResponseHeaders(rec, "app.example.com", crh)
+	w := applyResponseHeaders(rec, "app.example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	// "default" mode requires wrapper.
 	if w == rec {
@@ -679,7 +679,7 @@ func TestApplyResponseHeaders_CSPNoneMode(t *testing.T) {
 	crh := compileResponseHeaders(cfg)
 
 	rec := httptest.NewRecorder()
-	w := applyResponseHeaders(rec, "api.example.com", crh)
+	w := applyResponseHeaders(rec, "api.example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	if rec.Header().Get("Content-Security-Policy") != "" {
 		t.Error("expected no CSP for none mode")
@@ -701,7 +701,7 @@ func TestApplyResponseHeaders_SecurityHeaders(t *testing.T) {
 	crh := compileResponseHeaders(cfg)
 
 	rec := httptest.NewRecorder()
-	w := applyResponseHeaders(rec, "example.com", crh)
+	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	if rec.Header().Get("Strict-Transport-Security") != "max-age=63072000; includeSubDomains; preload" {
 		t.Error("expected HSTS header")
@@ -729,7 +729,7 @@ func TestApplyResponseHeaders_SecurityHeaderRemoval(t *testing.T) {
 	rec.Header().Set("Server", "caddy")
 	rec.Header().Set("X-Powered-By", "Go")
 
-	w := applyResponseHeaders(rec, "example.com", crh)
+	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
 	if w == rec {
 		t.Error("expected wrapper for header removal")
 	}
@@ -765,7 +765,7 @@ func TestApplyResponseHeaders_CSPReportOnly(t *testing.T) {
 	crh := compileResponseHeaders(cfg)
 
 	rec := httptest.NewRecorder()
-	_ = applyResponseHeaders(rec, "app.example.com", crh)
+	_ = applyResponseHeaders(rec, "app.example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	// Should use Report-Only header name.
 	if rec.Header().Get("Content-Security-Policy-Report-Only") == "" {
@@ -793,7 +793,7 @@ func TestApplyResponseHeaders_Combined(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	rec.Header().Set("Server", "caddy")
-	w := applyResponseHeaders(rec, "example.com", crh)
+	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
 
 	// Security header set immediately.
 	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {

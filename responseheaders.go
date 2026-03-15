@@ -16,6 +16,8 @@ import (
 	"bufio"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +27,24 @@ import (
 type ResponseHeaderConfig struct {
 	CSP      *CSPConfig            `json:"csp,omitempty"`
 	Security *SecurityHeaderConfig `json:"security,omitempty"`
+	CORS     *CORSConfig           `json:"cors,omitempty"`
+}
+
+// CORSConfig holds CORS configuration for the policy engine.
+type CORSConfig struct {
+	Enabled    *bool                   `json:"enabled,omitempty"` // nil = true
+	Global     CORSSettings            `json:"global"`
+	PerService map[string]CORSSettings `json:"per_service,omitempty"`
+}
+
+// CORSSettings holds CORS configuration for a scope (global or per-service).
+type CORSSettings struct {
+	AllowedOrigins   []string `json:"allowed_origins,omitempty"` // exact strings or regex patterns
+	AllowedMethods   []string `json:"allowed_methods,omitempty"` // GET, POST, PUT, etc.
+	AllowedHeaders   []string `json:"allowed_headers,omitempty"` // Content-Type, Authorization, etc.
+	ExposedHeaders   []string `json:"exposed_headers,omitempty"`
+	MaxAge           int      `json:"max_age,omitempty"` // seconds for Access-Control-Max-Age
+	AllowCredentials bool     `json:"allow_credentials,omitempty"`
 }
 
 // CSPConfig holds global and per-service CSP policies.
@@ -86,6 +106,23 @@ type SecurityServiceOverride struct {
 type compiledResponseHeaders struct {
 	csp      *compiledCSP
 	security *compiledSecurity
+	cors     *compiledCORS
+}
+
+type compiledCORS struct {
+	enabled  bool
+	services map[string]*compiledCORSSettings // per-service, keyed by host
+	fallback *compiledCORSSettings            // global defaults
+}
+
+type compiledCORSSettings struct {
+	allowedOrigins   []string         // exact match origins
+	originPatterns   []*regexp.Regexp // regex patterns
+	allowedMethods   string           // pre-joined "GET, POST, PUT"
+	allowedHeaders   string           // pre-joined "Content-Type, Authorization"
+	exposedHeaders   string           // pre-joined
+	maxAge           string           // pre-formatted "3600"
+	allowCredentials bool
 }
 
 type compiledCSP struct {
@@ -301,7 +338,56 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) *compiledResponseHeaders 
 		rh.security = cs
 	}
 
+	// Compile CORS.
+	if cfg.CORS != nil {
+		enabled := cfg.CORS.Enabled == nil || *cfg.CORS.Enabled
+		cc := &compiledCORS{
+			enabled:  enabled,
+			services: make(map[string]*compiledCORSSettings),
+			fallback: compileCORSSettings(cfg.CORS.Global),
+		}
+		for host, settings := range cfg.CORS.PerService {
+			cc.services[strings.ToLower(host)] = compileCORSSettings(settings)
+		}
+		rh.cors = cc
+	}
+
 	return rh
+}
+
+func compileCORSSettings(s CORSSettings) *compiledCORSSettings {
+	cs := &compiledCORSSettings{
+		allowCredentials: s.AllowCredentials,
+	}
+	// Separate exact origins from regex patterns.
+	for _, o := range s.AllowedOrigins {
+		if strings.HasPrefix(o, "^") || strings.Contains(o, ".*") || strings.Contains(o, "[") {
+			if re, err := regexp.Compile(o); err == nil {
+				cs.originPatterns = append(cs.originPatterns, re)
+			}
+		} else {
+			cs.allowedOrigins = append(cs.allowedOrigins, o)
+		}
+	}
+	if len(s.AllowedMethods) > 0 {
+		cs.allowedMethods = strings.Join(s.AllowedMethods, ", ")
+	} else {
+		cs.allowedMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+	}
+	if len(s.AllowedHeaders) > 0 {
+		cs.allowedHeaders = strings.Join(s.AllowedHeaders, ", ")
+	} else {
+		cs.allowedHeaders = "Content-Type, Authorization"
+	}
+	if len(s.ExposedHeaders) > 0 {
+		cs.exposedHeaders = strings.Join(s.ExposedHeaders, ", ")
+	}
+	if s.MaxAge > 0 {
+		cs.maxAge = strconv.Itoa(s.MaxAge)
+	} else {
+		cs.maxAge = "3600"
+	}
+	return cs
 }
 
 // ─── Per-Request Resolution ─────────────────────────────────────────
@@ -407,12 +493,102 @@ func (rw *responseHeaderWriter) Flush() {
 	}
 }
 
+// ─── CORS Resolution ────────────────────────────────────────────────
+
+func (crh *compiledResponseHeaders) resolveCORS(host string) *compiledCORSSettings {
+	if crh.cors == nil || !crh.cors.enabled {
+		return nil
+	}
+	h := strings.ToLower(stripPort(host))
+	if svc, ok := crh.cors.services[h]; ok {
+		return svc
+	}
+	return crh.cors.fallback
+}
+
+// matchOrigin checks if the request Origin matches the allowed origins.
+func (cs *compiledCORSSettings) matchOrigin(origin string) bool {
+	if cs == nil || origin == "" {
+		return false
+	}
+	for _, o := range cs.allowedOrigins {
+		if o == origin {
+			return true
+		}
+	}
+	for _, re := range cs.originPatterns {
+		if re.MatchString(origin) {
+			return true
+		}
+	}
+	return false
+}
+
+// HandlePreflight handles CORS preflight (OPTIONS) requests.
+// Returns true if the request was a preflight and was handled (204 sent).
+// Returns false if the request is not a preflight and should proceed normally.
+func (crh *compiledResponseHeaders) HandlePreflight(w http.ResponseWriter, r *http.Request) bool {
+	if crh == nil || crh.cors == nil || !crh.cors.enabled {
+		return false
+	}
+	if r.Method != http.MethodOptions {
+		return false
+	}
+	// Check for CORS preflight markers.
+	origin := r.Header.Get("Origin")
+	acrm := r.Header.Get("Access-Control-Request-Method")
+	if origin == "" || acrm == "" {
+		return false // Not a CORS preflight, just a normal OPTIONS request.
+	}
+
+	cors := crh.resolveCORS(r.Host)
+	if cors == nil || !cors.matchOrigin(origin) {
+		return false // Origin not allowed — don't add CORS headers.
+	}
+
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", origin)
+	h.Set("Access-Control-Allow-Methods", cors.allowedMethods)
+	h.Set("Access-Control-Allow-Headers", cors.allowedHeaders)
+	h.Set("Access-Control-Max-Age", cors.maxAge)
+	if cors.allowCredentials {
+		h.Set("Access-Control-Allow-Credentials", "true")
+	}
+	h.Set("Vary", "Origin")
+	w.WriteHeader(http.StatusNoContent) // 204
+	return true
+}
+
+// ApplyCORSHeaders adds CORS headers to a normal (non-preflight) response.
+func (crh *compiledResponseHeaders) ApplyCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	if crh == nil || crh.cors == nil || !crh.cors.enabled {
+		return
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return
+	}
+	cors := crh.resolveCORS(r.Host)
+	if cors == nil || !cors.matchOrigin(origin) {
+		return
+	}
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", origin)
+	if cors.allowCredentials {
+		h.Set("Access-Control-Allow-Credentials", "true")
+	}
+	if cors.exposedHeaders != "" {
+		h.Set("Access-Control-Expose-Headers", cors.exposedHeaders)
+	}
+	h.Set("Vary", "Origin")
+}
+
 // ─── Apply Response Headers ─────────────────────────────────────────
 
 // applyResponseHeaders sets security and CSP headers on the response.
 // Returns a possibly-wrapped ResponseWriter (wraps when "default" mode CSP
 // or header removal requires intercepting WriteHeader).
-func applyResponseHeaders(w http.ResponseWriter, host string, crh *compiledResponseHeaders) http.ResponseWriter {
+func applyResponseHeaders(w http.ResponseWriter, host string, r *http.Request, crh *compiledResponseHeaders) http.ResponseWriter {
 	if crh == nil {
 		return w
 	}
@@ -420,6 +596,11 @@ func applyResponseHeaders(w http.ResponseWriter, host string, crh *compiledRespo
 	var needsWrapper bool
 	var cspHeader, cspHeaderName string
 	var removeHeaders []string
+
+	// CORS headers for non-preflight requests (preflight already handled in ServeHTTP).
+	if crh.cors != nil && crh.cors.enabled {
+		crh.ApplyCORSHeaders(w, r)
+	}
 
 	// Security headers — always "set" mode.
 	secHeaders, secRemove := crh.resolveSecurity(host)
