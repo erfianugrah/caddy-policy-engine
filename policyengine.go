@@ -209,6 +209,12 @@ type PolicyRule struct {
 
 	// Skip rule fields (selective bypass)
 	SkipTargets *SkipTargets `json:"skip_targets,omitempty"`
+
+	// Response header rule fields (set/add/remove/default headers)
+	HeaderSet     map[string]string `json:"header_set,omitempty"`
+	HeaderAdd     map[string]string `json:"header_add,omitempty"`
+	HeaderRemove  []string          `json:"header_remove,omitempty"`
+	HeaderDefault map[string]string `json:"header_default,omitempty"`
 }
 
 // SkipTargets specifies what a skip rule bypasses.
@@ -829,25 +835,37 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// (block/rate_limit return early above) and before next.ServeHTTP().
 	w = applyResponseHeaders(w, r.Host, respHeaders)
 
-	// Check if any outbound detect rules exist for this request,
+	// Check if any outbound rules exist for this request,
 	// and whether any of them need response body buffering.
 	hasOutbound := false
 	needsResponseBody := false
 	for _, cr := range rules {
-		if cr.outbound && cr.rule.Type == "detect" && cr.rule.Enabled {
-			if cr.rule.ParanoiaLevel == 0 || cr.rule.ParanoiaLevel <= servicePL {
-				hasOutbound = true
-				for _, cc := range cr.conditions {
-					if isResponseBodyField(cc.field) {
-						needsResponseBody = true
-					}
+		if cr.outbound && cr.rule.Enabled {
+			// For detect rules, check paranoia level.
+			if cr.rule.Type == "detect" {
+				if cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
+					continue
+				}
+			}
+			hasOutbound = true
+			for _, cc := range cr.conditions {
+				if isResponseBodyField(cc.field) {
+					needsResponseBody = true
 				}
 			}
 		}
 	}
 
 	// Fast path: no outbound rules, pass through directly.
-	if !hasOutbound || serviceOutThreshold <= 0 {
+	// For non-detect outbound rules (response_header, block), threshold doesn't apply.
+	hasNonDetectOutbound := false
+	for _, cr := range rules {
+		if cr.outbound && cr.rule.Enabled && cr.rule.Type != "detect" {
+			hasNonDetectOutbound = true
+			break
+		}
+	}
+	if !hasOutbound || (serviceOutThreshold <= 0 && !hasNonDetectOutbound) {
 		return next.ServeHTTP(w, r)
 	}
 
@@ -890,7 +908,26 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		// Evaluate outbound rules before writing the response.
-		pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+
+		// Handle non-detect outbound actions (block, response_header).
+		if outAction != nil {
+			switch outAction.action {
+			case "block":
+				pe.logger.Warn("outbound block rule matched",
+					zap.String("rule_id", outAction.rule.ID),
+					zap.String("rule_name", outAction.rule.Name),
+					zap.String("host", host),
+					zap.String("uri", r.RequestURI))
+				w.Header().Set("X-Blocked-By", "policy-engine-outbound")
+				w.WriteHeader(http.StatusForbidden)
+				return nil
+			case "response_header":
+				applyRuleHeaders(w, outAction.rule)
+			case "allow":
+				// Skip remaining outbound evaluation — write through.
+			}
+		}
 
 		// Outbound threshold check — can block before response is sent to client.
 		if scorer.outbound >= serviceOutThreshold {
@@ -934,7 +971,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// Evaluate outbound rules (response already streamed to client — can only log, not block).
 	if resp != nil {
-		pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+		outAction := pe.evaluateOutbound(rules, resp, &scorer, servicePL, r)
+
+		// In header-only path, response is already streamed. We can apply
+		// response_header actions (headers not yet flushed if WriteHeader was
+		// intercepted), but block actions can only log (too late to block).
+		if outAction != nil && outAction.action == "response_header" {
+			applyRuleHeaders(w, outAction.rule)
+		}
 
 		if scorer.outbound >= serviceOutThreshold {
 			pe.logger.Warn("outbound anomaly threshold exceeded",
@@ -960,11 +1004,12 @@ var bufPool = sync.Pool{
 	},
 }
 
-// evaluateOutbound runs all outbound detect rules against the response context
-// and accumulates scores in the scorer.
-func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseContext, scorer *scoreAccumulator, servicePL int, r *http.Request) {
+// evaluateOutbound runs all outbound rules against the response context.
+// Detect rules accumulate scores in the scorer. Other outbound rule types
+// (block, response_header) are handled via the returned action.
+func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseContext, scorer *scoreAccumulator, servicePL int, r *http.Request) *outboundAction {
 	for _, cr := range rules {
-		if !cr.outbound || cr.rule.Type != "detect" || !cr.rule.Enabled {
+		if !cr.outbound || !cr.rule.Enabled {
 			continue
 		}
 		if cr.rule.ParanoiaLevel > 0 && cr.rule.ParanoiaLevel > servicePL {
@@ -974,16 +1019,14 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 			continue
 		}
 
-		matched := true
-		for _, cc := range cr.conditions {
-			val := extractResponseField(cc, resp)
-			if !evalOperator(cc, val) {
-				matched = false
-				break
-			}
+		matched := matchRuleResponse(cr, resp)
+
+		if !matched {
+			continue
 		}
 
-		if matched {
+		switch cr.rule.Type {
+		case "detect":
 			scorer.outbound += cr.score
 			scorer.matched = append(scorer.matched, matchedRule{
 				ruleID:   cr.rule.ID,
@@ -991,8 +1034,89 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 				severity: cr.rule.Severity,
 				score:    cr.score,
 			})
+		case "block", "honeypot":
+			return &outboundAction{action: "block", rule: cr.rule}
+		case "response_header":
+			return &outboundAction{action: "response_header", rule: cr.rule}
+		case "allow":
+			// Allow in outbound means skip remaining outbound evaluation.
+			return &outboundAction{action: "allow", rule: cr.rule}
 		}
 	}
+	return nil
+}
+
+// outboundAction represents a non-detect action from outbound rule evaluation.
+type outboundAction struct {
+	action string
+	rule   PolicyRule
+}
+
+// applyRuleHeaders applies header_set/header_add/header_remove/header_default
+// from a response_header rule to the response writer.
+func applyRuleHeaders(w http.ResponseWriter, rule PolicyRule) {
+	h := w.Header()
+	// Set (overwrite)
+	for k, v := range rule.HeaderSet {
+		h.Set(k, v)
+	}
+	// Add (append)
+	for k, v := range rule.HeaderAdd {
+		h.Add(k, v)
+	}
+	// Remove
+	for _, k := range rule.HeaderRemove {
+		h.Del(k)
+	}
+	// Default (set-if-absent)
+	for k, v := range rule.HeaderDefault {
+		if h.Get(k) == "" {
+			h.Set(k, v)
+		}
+	}
+}
+
+// matchRuleResponse evaluates a compiled rule against a response context,
+// correctly handling negate, multiMatch, and multi-value fields.
+func matchRuleResponse(cr compiledRule, resp *responseContext) bool {
+	isAnd := cr.rule.GroupOp != "or"
+	for _, cc := range cr.conditions {
+		result := matchConditionResponse(cc, resp)
+		if isAnd && !result {
+			return false
+		}
+		if !isAnd && result {
+			return true
+		}
+	}
+	return isAnd // AND: all matched; OR: none matched
+}
+
+// matchConditionResponse is the response-phase equivalent of matchCondition.
+// It extracts fields from the response context and properly handles negate,
+// multiMatch, transforms, and multi-value fields.
+func matchConditionResponse(cc compiledCondition, resp *responseContext) bool {
+	// exists operator — not meaningful for response fields, but handle for completeness.
+	if cc.isExists {
+		result := resp != nil && extractResponseField(cc, resp) != ""
+		if cc.negate {
+			return !result
+		}
+		return result
+	}
+
+	target := extractResponseField(cc, resp)
+
+	// Absent field check for negated conditions (Coraza semantics).
+	if cc.negate && target == "" {
+		return false
+	}
+
+	result := evalMultiMatchOrPlain(cc, target)
+	if cc.negate {
+		return !result
+	}
+	return result
 }
 
 // ─── Body Reading ───────────────────────────────────────────────────
@@ -2540,12 +2664,13 @@ func compileRules(rules []PolicyRule) ([]compiledRule, error) {
 
 // validRuleTypes is the set of recognized rule types.
 var validRuleTypes = map[string]bool{
-	"allow":      true,
-	"block":      true,
-	"honeypot":   true,
-	"skip":       true,
-	"rate_limit": true,
-	"detect":     true,
+	"allow":           true,
+	"block":           true,
+	"honeypot":        true,
+	"skip":            true,
+	"rate_limit":      true,
+	"detect":          true,
+	"response_header": true,
 }
 
 // validSkipPhases is the set of phases that can be targeted by skip rules.
@@ -2611,8 +2736,10 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		}
 	}
 
-	// Tag outbound detect rules (evaluated after upstream response).
-	if rule.Type == "detect" && rule.Phase == "outbound" {
+	// Tag outbound rules (evaluated after upstream response).
+	// All rule types can now operate in the outbound phase.
+	// response_header rules are implicitly outbound.
+	if rule.Phase == "outbound" || rule.Type == "response_header" {
 		cr.outbound = true
 	}
 
