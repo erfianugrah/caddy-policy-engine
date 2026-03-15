@@ -237,6 +237,9 @@ type PolicyCondition struct {
 	// Phase 2: managed list support
 	ListItems []string `json:"list_items,omitempty"`
 	ListKind  string   `json:"list_kind,omitempty"`
+	// Variable exclusions — patterns like "cookie:__utm" to skip during multi-field extraction.
+	// Used by CRS rules that check ARGS|!ARGS:password or COOKIES|!COOKIES:/__utm/.
+	Excludes []string `json:"excludes,omitempty"`
 }
 
 // ─── Compiled State ─────────────────────────────────────────────────
@@ -283,6 +286,7 @@ type compiledCondition struct {
 	countField   string          // the underlying field for count: (e.g., "all_args")
 	numericVal   float64         // pre-parsed numeric value for gt/ge/lt/le operators
 	byteRangeSet *[256]bool      // allowed byte values for validate_byte_range
+	excludes     map[string]bool // patterns to exclude from multi-field extraction (e.g., "cookie:__utm")
 }
 
 // bodyFields lists condition fields that require reading the request body.
@@ -1538,6 +1542,31 @@ func extractFieldExists(cc compiledCondition, pb *parsedBody) bool {
 	return found
 }
 
+// isExcluded checks if a variable name should be excluded from extraction.
+// Supports exact match (e.g., "cookie:__utm") and prefix match with regex-like
+// patterns (e.g., "cookie:/__utm/" matches cookie names containing "__utm").
+func isExcluded(excludes map[string]bool, category, name string) bool {
+	key := strings.ToLower(category + ":" + name)
+	if excludes[key] {
+		return true
+	}
+	// Check regex-like patterns: /pattern/
+	for ex := range excludes {
+		if !strings.HasPrefix(ex, category+":") {
+			continue
+		}
+		pattern := strings.TrimPrefix(ex, category+":")
+		if len(pattern) > 2 && pattern[0] == '/' && pattern[len(pattern)-1] == '/' {
+			// Regex pattern — use substring match for simplicity.
+			substr := pattern[1 : len(pattern)-1]
+			if strings.Contains(strings.ToLower(name), substr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // extractMultiField returns all values for an aggregate field.
 // Used by matchCondition when cc.isMulti is true.
 func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []string {
@@ -1603,6 +1632,9 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 		// All cookie values (matches CRS REQUEST_COOKIES)
 		var vals []string
 		for _, c := range r.Cookies() {
+			if cc.excludes != nil && isExcluded(cc.excludes, "cookie", c.Name) {
+				continue
+			}
 			vals = append(vals, c.Value)
 		}
 		return vals
@@ -1611,6 +1643,9 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 		// All cookie names (matches CRS REQUEST_COOKIES_NAMES)
 		var vals []string
 		for _, c := range r.Cookies() {
+			if cc.excludes != nil && isExcluded(cc.excludes, "cookie", c.Name) {
+				continue
+			}
 			vals = append(vals, c.Name)
 		}
 		return vals
@@ -1647,12 +1682,18 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 
 		// Cookie names and values (REQUEST_COOKIES + REQUEST_COOKIES_NAMES)
 		for _, c := range r.Cookies() {
+			if cc.excludes != nil && isExcluded(cc.excludes, "cookie", c.Name) {
+				continue
+			}
 			vals = append(vals, c.Name)
 			vals = append(vals, c.Value)
 		}
 
 		// All header values (REQUEST_HEADERS)
-		for _, vs := range r.Header {
+		for k, vs := range r.Header {
+			if cc.excludes != nil && isExcluded(cc.excludes, "header", k) {
+				continue
+			}
 			vals = append(vals, vs...)
 		}
 
@@ -3121,6 +3162,14 @@ func compileCondition(cond PolicyCondition) (compiledCondition, error) {
 	// multiMatch: run operator at each stage of the transform pipeline.
 	// Only meaningful when there are transforms to iterate over.
 	cc.multiMatch = cond.MultiMatch && len(cc.transforms) > 0
+
+	// Compile excludes into a set for O(1) lookup during extraction.
+	if len(cond.Excludes) > 0 {
+		cc.excludes = make(map[string]bool, len(cond.Excludes))
+		for _, ex := range cond.Excludes {
+			cc.excludes[strings.ToLower(ex)] = true
+		}
+	}
 
 	return cc, nil
 }
