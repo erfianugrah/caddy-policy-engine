@@ -227,19 +227,25 @@ type SkipTargets struct {
 }
 
 // PolicyCondition is a single match condition.
+// PolicyCondition can be a simple condition (Field/Operator/Value) or a
+// nested group (Group non-nil). Nested groups allow per-variable OR
+// evaluation within AND chains, matching CRS multi-variable semantics.
 type PolicyCondition struct {
-	Field      string   `json:"field"`
-	Operator   string   `json:"operator"`
-	Value      string   `json:"value"`
-	Transforms []string `json:"transforms,omitempty"`  // ordered transform chain applied before operator
-	Negate     bool     `json:"negate,omitempty"`      // CRS !@ prefix — inverts operator result
-	MultiMatch bool     `json:"multi_match,omitempty"` // CRS multiMatch — run operator at each transform stage
-	// Phase 2: managed list support
-	ListItems []string `json:"list_items,omitempty"`
-	ListKind  string   `json:"list_kind,omitempty"`
-	// Variable exclusions — patterns like "cookie:__utm" to skip during multi-field extraction.
-	// Used by CRS rules that check ARGS|!ARGS:password or COOKIES|!COOKIES:/__utm/.
-	Excludes []string `json:"excludes,omitempty"`
+	// Simple condition fields (when Group is nil)
+	Field      string   `json:"field,omitempty"`
+	Operator   string   `json:"operator,omitempty"`
+	Value      string   `json:"value,omitempty"`
+	Transforms []string `json:"transforms,omitempty"`
+	Negate     bool     `json:"negate,omitempty"`
+	MultiMatch bool     `json:"multi_match,omitempty"`
+	ListItems  []string `json:"list_items,omitempty"`
+	ListKind   string   `json:"list_kind,omitempty"`
+	Excludes   []string `json:"excludes,omitempty"`
+
+	// Nested condition group (when non-nil, this is a group, not a simple condition).
+	// Evaluation: all sub-conditions are evaluated with Group's GroupOp.
+	Group   []PolicyCondition `json:"group,omitempty"`
+	GroupOp string            `json:"group_op,omitempty"` // "and" or "or" — only used when Group is non-nil
 }
 
 // ─── Compiled State ─────────────────────────────────────────────────
@@ -287,6 +293,10 @@ type compiledCondition struct {
 	numericVal   float64         // pre-parsed numeric value for gt/ge/lt/le operators
 	byteRangeSet *[256]bool      // allowed byte values for validate_byte_range
 	excludes     map[string]bool // patterns to exclude from multi-field extraction (e.g., "cookie:__utm")
+	// Nested group support
+	isGroup       bool                // true when this is a group, not a simple condition
+	subConditions []compiledCondition // compiled sub-conditions (when isGroup)
+	subGroupOp    string              // "and" or "or" for sub-condition evaluation
 }
 
 // bodyFields lists condition fields that require reading the request body.
@@ -1207,6 +1217,21 @@ func matchRule(cr compiledRule, r *http.Request, pb *parsedBody) bool {
 }
 
 func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool {
+	// Nested group: recursively evaluate sub-conditions.
+	if cc.isGroup {
+		isAnd := cc.subGroupOp == "and"
+		for _, sub := range cc.subConditions {
+			result := matchCondition(sub, r, pb)
+			if isAnd && !result {
+				return false
+			}
+			if !isAnd && result {
+				return true
+			}
+		}
+		return isAnd
+	}
+
 	// Special handling for "exists" operator on body_json — checks field presence,
 	// not string comparison.
 	if cc.isExists {
@@ -2407,6 +2432,25 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 // For multi-value fields, reports the FIRST matching value (same as Coraza's
 // MATCHED_VAR which captures the first matching variable).
 func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBody) (bool, *matchDetail) {
+	// Nested group: recursively evaluate sub-conditions, return first matching detail.
+	if cc.isGroup {
+		isAnd := cc.subGroupOp == "and"
+		var firstDetail *matchDetail
+		for _, sub := range cc.subConditions {
+			result, detail := matchConditionDetailed(sub, r, pb)
+			if result && firstDetail == nil {
+				firstDetail = detail
+			}
+			if isAnd && !result {
+				return false, nil
+			}
+			if !isAnd && result {
+				return true, detail
+			}
+		}
+		return isAnd, firstDetail
+	}
+
 	// Special handling for "exists" operator on body_json.
 	if cc.isExists {
 		result := extractFieldExists(cc, pb)
@@ -2980,6 +3024,22 @@ func stripPort(host string) string {
 }
 
 func compileCondition(cond PolicyCondition) (compiledCondition, error) {
+	// Handle nested group conditions.
+	if len(cond.Group) > 0 {
+		cc := compiledCondition{isGroup: true, subGroupOp: cond.GroupOp}
+		if cc.subGroupOp == "" {
+			cc.subGroupOp = "or" // default for nested groups
+		}
+		for _, sub := range cond.Group {
+			compiled, err := compileCondition(sub)
+			if err != nil {
+				return compiledCondition{}, fmt.Errorf("group sub-condition: %w", err)
+			}
+			cc.subConditions = append(cc.subConditions, compiled)
+		}
+		return cc, nil
+	}
+
 	cc := compiledCondition{
 		field:    cond.Field,
 		operator: cond.Operator,
