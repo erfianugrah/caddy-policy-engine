@@ -238,3 +238,17 @@ These are always set regardless of `hide_headers`, and are available to downstre
 ```bash
 go test -race -count=1 ./...
 ```
+
+## Security
+
+v0.20.0 includes a comprehensive security audit (March 2026) with 34 fixes:
+- JSON recursion depth limit (64) and value extraction cap (10,000)
+- HTML entity decode: semicolon-less numeric entities, 16 security-critical named entities
+- CORS: null origin rejection, credentials+wildcard validation, auto-anchored regex, origin normalization
+- CSP: RawDirectives validated for injection, mode validated at compile time
+- Rate limiting: empty key falls back to client IP, max keys per zone (100K default)
+- Aho-Corasick: zero-allocation inline ASCII lowering
+- Transforms: jsDecode octal escapes, cmdLine backtick stripping, ES6 \u{} support
+- Security headers: re-asserted in WriteHeader, strict/moderate presets
+- Allow rules no longer bypass rate limits
+- Spoofable allow/skip rule warnings at compile time
