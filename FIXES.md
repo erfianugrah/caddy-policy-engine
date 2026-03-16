@@ -636,7 +636,7 @@ This is a 5-minute fix with zero risk.
 
 ### 14. CORS — Write Unit Tests (Zero Coverage Today)
 
-**Status: OPEN** — Dedicated CORS unit tests not yet added; compile-time validation covers critical cases.
+**Status: FIXED** — 35 CORS unit tests added covering compilation, matching, preflight, headers, nil guards.
 
 **File:** `responseheaders_test.go`
 
@@ -696,7 +696,7 @@ Add a `key_missing` field to `RateLimitConfig`: `"skip"` (current), `"use_ip"`,
 
 ### 16. Rate Limit Memory Exhaustion via Unique Keys
 
-**Status: OPEN** — Requires new max_keys config field; deferred.
+**Status: FIXED** — MaxKeys field added to RateLimitConfig; default 100K per zone; capacity check in allow().
 
 **File:** `ratelimit.go:108-114`
 
@@ -831,7 +831,7 @@ case '0', '1', '2', '3', '4', '5', '6', '7':
 
 ### 19. `compressWhitespace` Only ASCII — Unicode Bypass
 
-**Status: OPEN** — Requires rune-level iteration; CRS compatibility concern. Deferred.
+**Status: FIXED** — normalizeUnicodeWhitespace transform added (U+200B, U+FEFF, unicode.IsSpace).
 
 **File:** `transforms.go:303-320`
 
@@ -981,7 +981,7 @@ h.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Hea
 
 ### 24. CORS Origin Matching Not Normalized
 
-**Status: OPEN** — Requires design for port/case/FQDN normalization. Deferred.
+**Status: FIXED** — normalizeOrigin function applied at compile-time and runtime; strips :443/:80, lowercases.
 
 **File:** `responseheaders.go:510-525`
 
@@ -1015,7 +1015,7 @@ match time).
 
 ### 25. Debug Headers Enabled by Default
 
-**Status: OPEN** — Behavior change requiring user communication. Deferred.
+**Status: FIXED** — Warn log emitted during Provision when HideHeaders is false.
 
 **File:** `policyengine.go:641-646`
 
@@ -1060,7 +1060,7 @@ reload goroutine. Add `const maxConditionDepth = 5`.
 
 ### 29. `url.ParseQuery` Discards Partial Results on Error
 
-**Status: OPEN** — Minor. Deferred.
+**Status: FIXED** — url.ParseQuery partial results now used regardless of error.
 
 **File:** `policyengine.go:380-386`
 
@@ -1128,7 +1128,7 @@ Cross-Origin-Opener-Policy: same-origin
 
 ### 34. Detect Rule Tag Lookup Is O(N*M)
 
-**Status: OPEN** — Performance optimization. Deferred.
+**Status: FIXED** — ruleTagMap built at compile time; O(1) tag lookup during detect scoring.
 
 **File:** `policyengine.go:806-818`
 
