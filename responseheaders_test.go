@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+// mustCompileResponseHeaders is a test helper that compiles response headers
+// and fails the test on error.
+func mustCompileResponseHeaders(t *testing.T, cfg *ResponseHeaderConfig) *compiledResponseHeaders {
+	t.Helper()
+	result, err := compileResponseHeaders(cfg)
+	if err != nil {
+		t.Fatalf("compileResponseHeaders: %v", err)
+	}
+	return result
+}
+
 // ─── buildCSPHeaderString ───────────────────────────────────────────
 
 func TestBuildCSPHeaderString_Empty(t *testing.T) {
@@ -177,7 +188,10 @@ func TestMergeCSPPolicy_RawDirectivesPreservedWhenEmpty(t *testing.T) {
 // ─── compileResponseHeaders ─────────────────────────────────────────
 
 func TestCompileResponseHeaders_Nil(t *testing.T) {
-	result := compileResponseHeaders(nil)
+	result, err := compileResponseHeaders(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if result != nil {
 		t.Error("expected nil for nil config")
 	}
@@ -202,7 +216,7 @@ func TestCompileResponseHeaders_CSPEnabled(t *testing.T) {
 			},
 		},
 	}
-	result := compileResponseHeaders(cfg)
+	result := mustCompileResponseHeaders(t, cfg)
 	if result == nil || result.csp == nil {
 		t.Fatal("expected compiled CSP")
 	}
@@ -237,7 +251,7 @@ func TestCompileResponseHeaders_CSPEnabledNil(t *testing.T) {
 			GlobalDefaults: CSPPolicy{DefaultSrc: []string{"'self'"}},
 		},
 	}
-	result := compileResponseHeaders(cfg)
+	result := mustCompileResponseHeaders(t, cfg)
 	if result == nil || result.csp == nil || !result.csp.enabled {
 		t.Error("expected CSP enabled when Enabled is nil")
 	}
@@ -251,7 +265,7 @@ func TestCompileResponseHeaders_CSPDisabled(t *testing.T) {
 			GlobalDefaults: CSPPolicy{DefaultSrc: []string{"'self'"}},
 		},
 	}
-	result := compileResponseHeaders(cfg)
+	result := mustCompileResponseHeaders(t, cfg)
 	if result == nil || result.csp == nil {
 		t.Fatal("expected compiled CSP struct")
 	}
@@ -278,7 +292,7 @@ func TestCompileResponseHeaders_CSPNoInherit(t *testing.T) {
 			},
 		},
 	}
-	result := compileResponseHeaders(cfg)
+	result := mustCompileResponseHeaders(t, cfg)
 	svc := result.csp.services["api.example.com"]
 	// No inherit: should NOT include script_src from global.
 	if containsSubstr(svc.rendered, "script-src") {
@@ -307,7 +321,7 @@ func TestCompileResponseHeaders_SecurityHeaders(t *testing.T) {
 			},
 		},
 	}
-	result := compileResponseHeaders(cfg)
+	result := mustCompileResponseHeaders(t, cfg)
 	if result == nil || result.security == nil {
 		t.Fatal("expected compiled security")
 	}
@@ -358,7 +372,7 @@ func TestResolveCSP_Disabled(t *testing.T) {
 			GlobalDefaults: CSPPolicy{DefaultSrc: []string{"'self'"}},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 	svc := crh.resolveCSP("example.com")
 	if svc.mode != "none" {
 		t.Errorf("expected none for disabled CSP, got %q", svc.mode)
@@ -380,7 +394,7 @@ func TestResolveCSP_PerService(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	// Exact match.
 	svc := crh.resolveCSP("app.example.com")
@@ -426,7 +440,7 @@ func TestResolveSecurity_GlobalHeaders(t *testing.T) {
 			Remove: []string{"Server"},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 	headers, remove := crh.resolveSecurity("any.example.com")
 	if headers["Strict-Transport-Security"] != "max-age=63072000" {
 		t.Error("expected global HSTS header")
@@ -451,7 +465,7 @@ func TestResolveSecurity_PerServiceOverride(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	// Per-service override.
 	headers, _ := crh.resolveSecurity("immich.example.com")
@@ -477,7 +491,7 @@ func TestResolveSecurity_CaseInsensitiveHost(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 	// The key in PerService is lowercased at compile time.
 	headers, _ := crh.resolveSecurity("app.example.com")
 	if headers["X-Test"] != "override" {
@@ -615,7 +629,7 @@ func TestApplyResponseHeaders_CSPSetMode(t *testing.T) {
 			GlobalDefaults: CSPPolicy{DefaultSrc: []string{"'self'"}},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
@@ -644,7 +658,7 @@ func TestApplyResponseHeaders_CSPDefaultMode(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	w := applyResponseHeaders(rec, "app.example.com", httptest.NewRequest("GET", "/", nil), crh)
@@ -676,7 +690,7 @@ func TestApplyResponseHeaders_CSPNoneMode(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	w := applyResponseHeaders(rec, "api.example.com", httptest.NewRequest("GET", "/", nil), crh)
@@ -698,7 +712,7 @@ func TestApplyResponseHeaders_SecurityHeaders(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	w := applyResponseHeaders(rec, "example.com", httptest.NewRequest("GET", "/", nil), crh)
@@ -722,7 +736,7 @@ func TestApplyResponseHeaders_SecurityHeaderRemoval(t *testing.T) {
 			Remove:  []string{"Server", "X-Powered-By"},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	// Simulate upstream setting these headers.
@@ -762,7 +776,7 @@ func TestApplyResponseHeaders_CSPReportOnly(t *testing.T) {
 			},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	_ = applyResponseHeaders(rec, "app.example.com", httptest.NewRequest("GET", "/", nil), crh)
@@ -789,7 +803,7 @@ func TestApplyResponseHeaders_Combined(t *testing.T) {
 			Remove: []string{"Server"},
 		},
 	}
-	crh := compileResponseHeaders(cfg)
+	crh := mustCompileResponseHeaders(t, cfg)
 
 	rec := httptest.NewRecorder()
 	rec.Header().Set("Server", "caddy")

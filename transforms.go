@@ -185,7 +185,45 @@ func transformHTMLEntityDecode(s string) string {
 		// Find semicolon.
 		end := strings.IndexByte(s[i:], ';')
 		if end < 0 || end > 12 {
-			// No semicolon nearby — pass through.
+			// No semicolon nearby — try semicolon-less numeric entities.
+			if i+2 < len(s) && s[i+1] == '#' {
+				j := i + 2
+				isHex := false
+				if j < len(s) && (s[j] == 'x' || s[j] == 'X') {
+					isHex = true
+					j++
+				}
+				start := j
+				for j < len(s) {
+					if isHex {
+						if (s[j] >= '0' && s[j] <= '9') || (s[j] >= 'a' && s[j] <= 'f') || (s[j] >= 'A' && s[j] <= 'F') {
+							j++
+							continue
+						}
+					} else {
+						if s[j] >= '0' && s[j] <= '9' {
+							j++
+							continue
+						}
+					}
+					break
+				}
+				if j > start {
+					var cp int64
+					var err error
+					if isHex {
+						cp, err = strconv.ParseInt(s[start:j], 16, 32)
+					} else {
+						cp, err = strconv.ParseInt(s[start:j], 10, 32)
+					}
+					if err == nil && cp >= 0 && cp <= 0x10FFFF {
+						b.WriteRune(rune(cp))
+						i = j
+						continue
+					}
+				}
+			}
+			// Not a valid entity — pass through.
 			b.WriteByte('&')
 			i++
 			continue
@@ -239,6 +277,24 @@ var htmlEntities = map[string]string{
 	"mdash":  "\u2014",
 	"ndash":  "\u2013",
 	"hellip": "\u2026",
+	// Security-critical entities — used in URL/injection evasion.
+	"colon":   ":",
+	"sol":     "/",
+	"bsol":    "\\",
+	"lpar":    "(",
+	"rpar":    ")",
+	"lsqb":    "[",
+	"rsqb":    "]",
+	"lcub":    "{",
+	"rcub":    "}",
+	"Tab":     "\t",
+	"NewLine": "\n",
+	"excl":    "!",
+	"num":     "#",
+	"period":  ".",
+	"comma":   ",",
+	"semi":    ";",
+	"equals":  "=",
 }
 
 // transformNormalizePath collapses /../, /./, and // sequences.
@@ -340,13 +396,12 @@ func transformRemoveWhitespace(s string) string {
 func transformBase64Decode(s string) string {
 	decoded, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		// Try URL-safe and raw variants.
+		// Try URL-safe variant only — RawStdEncoding is intentionally excluded
+		// because it accepts arbitrary strings (no padding required), which
+		// causes false-positive decoding of non-base64 input.
 		decoded, err = base64.URLEncoding.DecodeString(s)
 		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(s)
-			if err != nil {
-				return s // invalid base64 — return unchanged
-			}
+			return s // invalid base64 — return unchanged
 		}
 	}
 	return string(decoded)
@@ -395,9 +450,23 @@ func transformJSDecode(s string) string {
 		case '"':
 			b.WriteByte('"')
 			i += 2
-		case '0':
-			b.WriteByte('\x00')
-			i += 2
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			// Octal escape: \0 through \377 (up to 3 octal digits).
+			j := i + 2
+			val := int(next - '0')
+			for k := 0; k < 2 && j < len(s); k++ {
+				d := s[j]
+				if d < '0' || d > '7' {
+					break
+				}
+				val = val*8 + int(d-'0')
+				j++
+			}
+			if val > 255 {
+				val = 255
+			}
+			b.WriteByte(byte(val))
+			i = j
 		case 'x':
 			// \xHH
 			if i+3 < len(s) {
@@ -561,8 +630,8 @@ func transformCmdLine(s string) string {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
-		case '\\', '^', '"', '\'':
-			// Delete evasion characters.
+		case '\\', '^', '"', '\'', '`':
+			// Delete evasion characters (including backtick for shell evasion).
 			continue
 		case '/', '(':
 			// Replace with space (path separator / subshell).

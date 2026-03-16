@@ -184,7 +184,7 @@ func TestTransformBase64Decode(t *testing.T) {
 	tests := []struct{ in, want string }{
 		{"PHNjcmlwdD4=", "<script>"},       // standard
 		{"aGVsbG8=", "hello"},              // standard
-		{"aGVsbG8", "hello"},               // raw (no padding) — fallback
+		{"aGVsbG8", "aGVsbG8"},             // raw (no padding) — no longer decoded (RawStdEncoding removed)
 		{"!!!invalid!!!", "!!!invalid!!!"}, // invalid → return unchanged
 		{"", ""},
 	}

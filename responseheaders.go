@@ -14,6 +14,7 @@ package policyengine
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"net/http"
 	"regexp"
@@ -256,10 +257,18 @@ func mergeCSPPolicy(base, override CSPPolicy) CSPPolicy {
 
 // ─── Compilation ────────────────────────────────────────────────────
 
+// validCSPModes is the set of recognized CSP modes.
+var validCSPModes = map[string]bool{
+	"set":     true,
+	"default": true,
+	"none":    true,
+	"":        true, // empty defaults to "set"
+}
+
 // compileResponseHeaders pre-compiles response header config for O(1) per-request lookup.
-func compileResponseHeaders(cfg *ResponseHeaderConfig) *compiledResponseHeaders {
+func compileResponseHeaders(cfg *ResponseHeaderConfig) (*compiledResponseHeaders, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 	rh := &compiledResponseHeaders{}
 
@@ -271,6 +280,11 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) *compiledResponseHeaders 
 			services: make(map[string]compiledCSPService),
 		}
 
+		// Validate global defaults RawDirectives.
+		if err := validateCSPPolicy(cfg.CSP.GlobalDefaults); err != nil {
+			return nil, fmt.Errorf("CSP global_defaults: %w", err)
+		}
+
 		// Build fallback from global defaults.
 		fallbackHeader := buildCSPHeaderString(cfg.CSP.GlobalDefaults)
 		cc.fallback = compiledCSPService{
@@ -280,11 +294,18 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) *compiledResponseHeaders 
 
 		// Build per-service compiled configs.
 		for host, svc := range cfg.CSP.Services {
+			// Validate CSP mode.
+			if !validCSPModes[svc.Mode] {
+				return nil, fmt.Errorf("CSP service %q: unknown mode %q (must be set, default, or none)", host, svc.Mode)
+			}
 			var policy CSPPolicy
 			if svc.Inherit {
 				policy = mergeCSPPolicy(cfg.CSP.GlobalDefaults, svc.Policy)
 			} else {
 				policy = svc.Policy
+			}
+			if err := validateCSPPolicy(policy); err != nil {
+				return nil, fmt.Errorf("CSP service %q: %w", host, err)
 			}
 			rendered := buildCSPHeaderString(policy)
 			cc.services[strings.ToLower(host)] = compiledCSPService{
@@ -341,34 +362,78 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) *compiledResponseHeaders 
 	// Compile CORS.
 	if cfg.CORS != nil {
 		enabled := cfg.CORS.Enabled == nil || *cfg.CORS.Enabled
+		fallback, err := compileCORSSettings(cfg.CORS.Global)
+		if err != nil {
+			return nil, fmt.Errorf("CORS global: %w", err)
+		}
 		cc := &compiledCORS{
 			enabled:  enabled,
 			services: make(map[string]*compiledCORSSettings),
-			fallback: compileCORSSettings(cfg.CORS.Global),
+			fallback: fallback,
 		}
 		for host, settings := range cfg.CORS.PerService {
-			cc.services[strings.ToLower(host)] = compileCORSSettings(settings)
+			cs, err := compileCORSSettings(settings)
+			if err != nil {
+				return nil, fmt.Errorf("CORS service %q: %w", host, err)
+			}
+			cc.services[strings.ToLower(host)] = cs
 		}
 		rh.cors = cc
 	}
 
-	return rh
+	return rh, nil
 }
 
-func compileCORSSettings(s CORSSettings) *compiledCORSSettings {
+// validateCSPPolicy checks that RawDirectives don't contain injection characters.
+func validateCSPPolicy(p CSPPolicy) error {
+	if p.RawDirectives != "" {
+		raw := strings.TrimSpace(p.RawDirectives)
+		if strings.ContainsAny(raw, ";\r\n") {
+			return fmt.Errorf("raw_directives must not contain semicolons or control characters (potential header injection)")
+		}
+	}
+	return nil
+}
+
+func compileCORSSettings(s CORSSettings) (*compiledCORSSettings, error) {
 	cs := &compiledCORSSettings{
 		allowCredentials: s.AllowCredentials,
 	}
 	// Separate exact origins from regex patterns.
 	for _, o := range s.AllowedOrigins {
+		// Reject "null" origin — allowing it enables credential theft via
+		// sandboxed iframes and data: URLs.
+		if strings.EqualFold(o, "null") {
+			return nil, fmt.Errorf("CORS: \"null\" origin must not be allowed (enables credential theft via sandboxed iframes)")
+		}
 		if strings.HasPrefix(o, "^") || strings.Contains(o, ".*") || strings.Contains(o, "[") {
-			if re, err := regexp.Compile(o); err == nil {
-				cs.originPatterns = append(cs.originPatterns, re)
+			// Auto-anchor regex patterns to prevent partial matches.
+			pattern := o
+			if !strings.HasPrefix(pattern, "^") {
+				pattern = "^" + pattern
 			}
+			if !strings.HasSuffix(pattern, "$") {
+				pattern = pattern + "$"
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("CORS: invalid origin regex %q: %w", o, err)
+			}
+			cs.originPatterns = append(cs.originPatterns, re)
 		} else {
 			cs.allowedOrigins = append(cs.allowedOrigins, o)
 		}
 	}
+
+	// Validate AllowCredentials + broad regex patterns.
+	if cs.allowCredentials {
+		for _, re := range cs.originPatterns {
+			if re.MatchString("https://evil.example.com") {
+				return nil, fmt.Errorf("CORS: AllowCredentials with broad regex %q allows credential theft; use exact origins or narrow patterns", re.String())
+			}
+		}
+	}
+
 	if len(s.AllowedMethods) > 0 {
 		cs.allowedMethods = strings.Join(s.AllowedMethods, ", ")
 	} else {
@@ -387,7 +452,7 @@ func compileCORSSettings(s CORSSettings) *compiledCORSSettings {
 	} else {
 		cs.maxAge = "3600"
 	}
-	return cs
+	return cs, nil
 }
 
 // ─── Per-Request Resolution ─────────────────────────────────────────
@@ -430,11 +495,12 @@ func (crh *compiledResponseHeaders) resolveSecurity(host string) (headers map[st
 // 2. Remove unwanted upstream headers (Server, X-Powered-By, etc.)
 type responseHeaderWriter struct {
 	http.ResponseWriter
-	cspHeader     string // CSP header value to inject
-	cspHeaderName string // "Content-Security-Policy" or "Content-Security-Policy-Report-Only"
-	removeHeaders []string
-	wroteHeader   bool
-	statusCode    int // captured status code for outbound rule evaluation
+	cspHeader       string // CSP header value to inject
+	cspHeaderName   string // "Content-Security-Policy" or "Content-Security-Policy-Report-Only"
+	removeHeaders   []string
+	securityHeaders map[string]string // security headers to re-assert in WriteHeader
+	wroteHeader     bool
+	statusCode      int // captured status code for outbound rule evaluation
 }
 
 func (rw *responseHeaderWriter) WriteHeader(code int) {
@@ -447,6 +513,11 @@ func (rw *responseHeaderWriter) WriteHeader(code int) {
 	// Remove unwanted upstream headers.
 	for _, h := range rw.removeHeaders {
 		rw.Header().Del(h)
+	}
+
+	// Re-assert security headers in case upstream overwrote them.
+	for k, v := range rw.securityHeaders {
+		rw.Header().Set(k, v)
 	}
 
 	// Inject CSP only if upstream didn't set it ("default" mode).
@@ -496,7 +567,7 @@ func (rw *responseHeaderWriter) Flush() {
 // ─── CORS Resolution ────────────────────────────────────────────────
 
 func (crh *compiledResponseHeaders) resolveCORS(host string) *compiledCORSSettings {
-	if crh.cors == nil || !crh.cors.enabled {
+	if crh == nil || crh.cors == nil || !crh.cors.enabled {
 		return nil
 	}
 	h := strings.ToLower(stripPort(host))
@@ -554,7 +625,7 @@ func (crh *compiledResponseHeaders) HandlePreflight(w http.ResponseWriter, r *ht
 	if cors.allowCredentials {
 		h.Set("Access-Control-Allow-Credentials", "true")
 	}
-	h.Set("Vary", "Origin")
+	h.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
 	w.WriteHeader(http.StatusNoContent) // 204
 	return true
 }
@@ -565,11 +636,16 @@ func (crh *compiledResponseHeaders) ApplyCORSHeaders(w http.ResponseWriter, r *h
 		return
 	}
 	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return
-	}
 	cors := crh.resolveCORS(r.Host)
-	if cors == nil || !cors.matchOrigin(origin) {
+
+	// Always set Vary: Origin when CORS is configured, even when origin
+	// doesn't match. This prevents cache poisoning where a CDN caches a
+	// response without CORS headers and serves it to a cross-origin request.
+	if cors != nil {
+		w.Header().Set("Vary", "Origin")
+	}
+
+	if origin == "" || cors == nil || !cors.matchOrigin(origin) {
 		return
 	}
 	h := w.Header()
@@ -580,7 +656,6 @@ func (crh *compiledResponseHeaders) ApplyCORSHeaders(w http.ResponseWriter, r *h
 	if cors.exposedHeaders != "" {
 		h.Set("Access-Control-Expose-Headers", cors.exposedHeaders)
 	}
-	h.Set("Vary", "Origin")
 }
 
 // ─── Apply Response Headers ─────────────────────────────────────────
@@ -637,10 +712,11 @@ func applyResponseHeaders(w http.ResponseWriter, host string, r *http.Request, c
 
 	if needsWrapper {
 		return &responseHeaderWriter{
-			ResponseWriter: w,
-			cspHeader:      cspHeader,
-			cspHeaderName:  cspHeaderName,
-			removeHeaders:  removeHeaders,
+			ResponseWriter:  w,
+			cspHeader:       cspHeader,
+			cspHeaderName:   cspHeaderName,
+			removeHeaders:   removeHeaders,
+			securityHeaders: secHeaders,
 		}
 	}
 

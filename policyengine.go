@@ -44,6 +44,18 @@ const defaultBodyMaxSize = 13 * 1024 * 1024
 // 128 KiB provides ample headroom for current and future CRS versions.
 const maxRegexLen = 128 * 1024
 
+// maxJSONDepth is the maximum nesting depth for JSON flattening.
+// Prevents stack overflow from deeply nested payloads.
+const maxJSONDepth = 64
+
+// maxJSONValues is the maximum number of leaf values extracted from JSON.
+// Prevents memory exhaustion from extremely wide/deep JSON structures.
+const maxJSONValues = 10000
+
+// maxConditionDepth is the maximum nesting depth for condition groups.
+// Prevents unbounded recursion from deeply nested condition definitions.
+const maxConditionDepth = 10
+
 func init() {
 	caddy.RegisterModule(PolicyEngine{})
 	httpcaddyfile.RegisterHandlerDirective("policy_engine", parseCaddyfilePolicyEngine)
@@ -480,6 +492,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	rules := pe.rules
 	globalCfg := pe.rlGlobalConfig
 	respHeaders := pe.respHeaders
+	wafCfg := pe.wafConfig
 	pe.mu.RUnlock()
 
 	// ── CORS Preflight ─────────────────────────────────────────────
@@ -505,10 +518,6 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	//   - skip_targets.rules: skip specific rule IDs
 	//
 	// After the loop: if accumulated score > threshold → 403 (detect_block).
-
-	pe.mu.RLock()
-	wafCfg := pe.wafConfig
-	pe.mu.RUnlock()
 
 	var pb *parsedBody
 	var bodyRead bool
@@ -722,7 +731,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 			key := resolveRateLimitKey(cr.rlConfig.Key, r, pb)
 			if key == "" {
-				continue
+				key = clientIP(r)
 			}
 
 			allowed, count, limit := z.allow(key, time.Now())
@@ -1750,21 +1759,31 @@ func flattenJSONValues(pb *parsedBody) []string {
 		return nil
 	}
 	var vals []string
-	flattenJSONNode(root, &vals)
+	flattenJSONNode(root, &vals, 0)
 	return vals
 }
 
 // flattenJSONNode recursively extracts string values from a JSON structure.
-func flattenJSONNode(node interface{}, vals *[]string) {
+// depth tracks recursion depth; vals count is capped at maxJSONValues.
+func flattenJSONNode(node interface{}, vals *[]string, depth int) {
+	if depth > maxJSONDepth || len(*vals) >= maxJSONValues {
+		return
+	}
 	switch v := node.(type) {
 	case map[string]interface{}:
 		for key, child := range v {
+			if len(*vals) >= maxJSONValues {
+				return
+			}
 			*vals = append(*vals, key) // JSON key as ARGS_NAME
-			flattenJSONNode(child, vals)
+			flattenJSONNode(child, vals, depth+1)
 		}
 	case []interface{}:
 		for _, child := range v {
-			flattenJSONNode(child, vals)
+			if len(*vals) >= maxJSONValues {
+				return
+			}
+			flattenJSONNode(child, vals, depth+1)
 		}
 	case string:
 		*vals = append(*vals, v)
@@ -1929,26 +1948,36 @@ func flattenJSONKeyed(pb *parsedBody) []keyedValue {
 		return nil
 	}
 	var kvs []keyedValue
-	flattenJSONNodeKeyed(root, "", &kvs)
+	flattenJSONNodeKeyed(root, "", &kvs, 0)
 	return kvs
 }
 
 // flattenJSONNodeKeyed recursively extracts keyed values from a JSON structure.
-func flattenJSONNodeKeyed(node interface{}, path string, kvs *[]keyedValue) {
+// depth tracks recursion depth; kvs count is capped at maxJSONValues.
+func flattenJSONNodeKeyed(node interface{}, path string, kvs *[]keyedValue, depth int) {
+	if depth > maxJSONDepth || len(*kvs) >= maxJSONValues {
+		return
+	}
 	switch v := node.(type) {
 	case map[string]interface{}:
 		for key, child := range v {
+			if len(*kvs) >= maxJSONValues {
+				return
+			}
 			childPath := key
 			if path != "" {
 				childPath = path + "." + key
 			}
 			*kvs = append(*kvs, keyedValue{key: "ARGS_JSON_NAMES:" + childPath, val: key})
-			flattenJSONNodeKeyed(child, childPath, kvs)
+			flattenJSONNodeKeyed(child, childPath, kvs, depth+1)
 		}
 	case []interface{}:
 		for i, child := range v {
+			if len(*kvs) >= maxJSONValues {
+				return
+			}
 			childPath := path + "." + strconv.Itoa(i)
-			flattenJSONNodeKeyed(child, childPath, kvs)
+			flattenJSONNodeKeyed(child, childPath, kvs, depth+1)
 		}
 	case string:
 		key := "ARGS_JSON"
@@ -2757,12 +2786,17 @@ func clientIP(r *http.Request) string {
 // ─── Rule Compilation ───────────────────────────────────────────────
 
 func compileRules(rules []PolicyRule) ([]compiledRule, error) {
+	return compileRulesWithLogger(rules, nil)
+}
+
+func compileRulesWithLogger(rules []PolicyRule, logger *zap.Logger) ([]compiledRule, error) {
 	var compiled []compiledRule
 	for _, rule := range rules {
 		cr, err := compileRule(rule)
 		if err != nil {
 			return nil, fmt.Errorf("rule %q (%s): %w", rule.Name, rule.ID, err)
 		}
+		warnSpoofableAllowRule(rule, logger)
 		compiled = append(compiled, cr)
 	}
 
@@ -3024,14 +3058,21 @@ func stripPort(host string) string {
 }
 
 func compileCondition(cond PolicyCondition) (compiledCondition, error) {
+	return compileConditionDepth(cond, 0)
+}
+
+func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, error) {
 	// Handle nested group conditions.
 	if len(cond.Group) > 0 {
+		if depth >= maxConditionDepth {
+			return compiledCondition{}, fmt.Errorf("condition group nesting exceeds maximum depth (%d)", maxConditionDepth)
+		}
 		cc := compiledCondition{isGroup: true, subGroupOp: cond.GroupOp}
 		if cc.subGroupOp == "" {
 			cc.subGroupOp = "or" // default for nested groups
 		}
 		for _, sub := range cond.Group {
-			compiled, err := compileCondition(sub)
+			compiled, err := compileConditionDepth(sub, depth+1)
 			if err != nil {
 				return compiledCondition{}, fmt.Errorf("group sub-condition: %w", err)
 			}
@@ -3443,7 +3484,7 @@ func (pe *PolicyEngine) loadFromFile() error {
 	// Merge default rules with user rules.
 	merged := mergeDefaultAndUserRules(defaultRules, file.Rules, file.DisabledDefaultRules)
 
-	compiled, err := compileRules(merged)
+	compiled, err := compileRulesWithLogger(merged, pe.logger)
 	if err != nil {
 		return fmt.Errorf("compiling rules: %w", err)
 	}
@@ -3452,7 +3493,10 @@ func (pe *PolicyEngine) loadFromFile() error {
 	globalCfg := compileRLGlobalConfig(file.RateLimitConfig)
 
 	// Compile response headers (CSP + security) for O(1) per-request lookup.
-	respHeaders := compileResponseHeaders(file.ResponseHeaders)
+	respHeaders, err := compileResponseHeaders(file.ResponseHeaders)
+	if err != nil {
+		return fmt.Errorf("compiling response headers: %w", err)
+	}
 
 	// Compile WAF config (anomaly scoring thresholds + paranoia levels).
 	wafCfg := compileWafConfig(file.WafConfig)
@@ -3467,12 +3511,12 @@ func (pe *PolicyEngine) loadFromFile() error {
 	pe.wafConfig = wafCfg
 	pe.lastMod = info.ModTime()
 	pe.lastDefaultMod = defaultMod
-	pe.mu.Unlock()
-
-	// Update rate limit zones — preserves counters for unchanged rules.
+	// Update rate limit zones inside the write lock to prevent concurrent
+	// reads from seeing rules for zones that don't exist yet (or vice versa).
 	if pe.rlState != nil {
 		pe.rlState.updateZones(compiled)
 	}
+	pe.mu.Unlock()
 
 	// Restart sweep goroutine if the sweep interval changed.
 	newSweepInterval := pe.sweepInterval()
@@ -3653,6 +3697,45 @@ func parseCaddyfilePolicyEngine(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHan
 	pe := new(PolicyEngine)
 	err := pe.UnmarshalCaddyfile(h.Dispenser)
 	return pe, err
+}
+
+// ─── Spoofable Condition Warning ─────────────────────────────────────
+
+// spoofableFields are fields whose values come from client-controlled headers.
+// Rules that grant access (allow/skip) based solely on these fields are fragile
+// because an attacker can trivially forge the values.
+var spoofableFields = map[string]bool{
+	"user_agent": true,
+	"referer":    true,
+	"country":    true, // Cf-Ipcountry can be set by client when not behind CF
+}
+
+// warnSpoofableAllowRule logs a warning if an allow or skip rule's conditions
+// all use spoofable fields. Called during rule compilation for awareness.
+func warnSpoofableAllowRule(rule PolicyRule, logger *zap.Logger) {
+	if logger == nil {
+		return
+	}
+	if rule.Type != "allow" && rule.Type != "skip" {
+		return
+	}
+	if len(rule.Conditions) == 0 {
+		return
+	}
+	for _, cond := range rule.Conditions {
+		field := cond.Field
+		// Strip named field prefix (e.g., "header:X-Forwarded-For" → "header").
+		if idx := strings.IndexByte(field, ':'); idx >= 0 {
+			field = field[:idx]
+		}
+		if !spoofableFields[field] {
+			return // at least one non-spoofable condition
+		}
+	}
+	logger.Warn("allow/skip rule uses only spoofable conditions — attacker can forge these fields",
+		zap.String("rule_id", rule.ID),
+		zap.String("rule_name", rule.Name),
+		zap.String("type", rule.Type))
 }
 
 // ─── Interface Assertions ───────────────────────────────────────────

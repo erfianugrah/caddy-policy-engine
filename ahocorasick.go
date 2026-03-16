@@ -1,7 +1,5 @@
 package policyengine
 
-import "strings"
-
 // Aho-Corasick automaton for case-insensitive multi-pattern substring matching.
 //
 // Used by the phrase_match operator to scan input against wordlists (SQL keywords,
@@ -12,6 +10,15 @@ import "strings"
 // pattern set, computes failure links (BFS), and scans input with a single pass.
 // Returns the first matched pattern for observability; callers needing only a
 // boolean can ignore the matched value.
+
+// toLowerASCII lowercases an ASCII byte without allocation.
+// Non-ASCII bytes are returned unchanged.
+func toLowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
 
 // acNode is a node in the Aho-Corasick trie.
 type acNode struct {
@@ -43,10 +50,9 @@ func CompileAC(patterns []string) *ACMatcher {
 			continue
 		}
 		count++
-		lowerPat := strings.ToLower(pat)
 		cur := root
-		for i := 0; i < len(lowerPat); i++ {
-			b := lowerPat[i]
+		for i := 0; i < len(pat); i++ {
+			b := toLowerASCII(pat[i])
 			next, ok := cur.children[b]
 			if !ok {
 				next = &acNode{children: make(map[byte]*acNode)}
@@ -113,10 +119,9 @@ func (m *ACMatcher) ContainsAny(input string) bool {
 		return false
 	}
 
-	lower := strings.ToLower(input)
 	cur := m.root
-	for i := 0; i < len(lower); i++ {
-		b := lower[i]
+	for i := 0; i < len(input); i++ {
+		b := toLowerASCII(input[i])
 
 		// Follow fail links until we find a transition or reach root.
 		for cur != m.root && cur.children[b] == nil {
@@ -145,10 +150,9 @@ func (m *ACMatcher) FindFirst(input string) (string, bool) {
 		return "", false
 	}
 
-	lower := strings.ToLower(input)
 	cur := m.root
-	for i := 0; i < len(lower); i++ {
-		b := lower[i]
+	for i := 0; i < len(input); i++ {
+		b := toLowerASCII(input[i])
 
 		for cur != m.root && cur.children[b] == nil {
 			cur = cur.fail
