@@ -515,8 +515,8 @@ func TestApplyTransforms_Empty(t *testing.T) {
 
 func TestValidTransformNames(t *testing.T) {
 	names := validTransformNames()
-	if len(names) != 20 {
-		t.Errorf("expected 20 transforms, got %d: %v", len(names), names)
+	if len(names) != 21 {
+		t.Errorf("expected 21 transforms, got %d: %v", len(names), names)
 	}
 	// Verify sorted.
 	for i := 1; i < len(names); i++ {

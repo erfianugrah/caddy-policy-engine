@@ -30,10 +30,11 @@ import (
 
 // RateLimitConfig holds per-rule rate limit parameters.
 type RateLimitConfig struct {
-	Key    string `json:"key"`    // "client_ip", "path", "header:X-API-Key", etc.
-	Events int    `json:"events"` // Max events per window
-	Window string `json:"window"` // Duration string: "1s", "1m", "1h"
-	Action string `json:"action"` // "deny" (default, 429) or "log_only"
+	Key     string `json:"key"`                // "client_ip", "path", "header:X-API-Key", etc.
+	Events  int    `json:"events"`             // Max events per window
+	Window  string `json:"window"`             // Duration string: "1s", "1m", "1h"
+	Action  string `json:"action"`             // "deny" (default, 429) or "log_only"
+	MaxKeys int    `json:"max_keys,omitempty"` // Max unique keys per zone; 0 = default (100000)
 }
 
 // RateLimitGlobalConfig holds global settings for the rate limit subsystem.
@@ -54,11 +55,16 @@ type rateLimitState struct {
 	zones map[string]*zone // rule ID → zone
 }
 
+// defaultMaxKeys is the default maximum number of unique keys per zone.
+// Prevents unbounded memory growth from large numbers of unique client keys.
+const defaultMaxKeys = 100000
+
 // zone is a single rate limit zone (one per rate_limit rule).
 type zone struct {
-	events int
-	window time.Duration
-	shards [numShards]shard
+	events  int
+	window  time.Duration
+	maxKeys int // max unique keys across all shards
+	shards  [numShards]shard
 }
 
 // shard is one of numShards partitions of the counter map.
@@ -78,10 +84,14 @@ type counter struct {
 }
 
 // newZone creates a zone with the given parameters and initialized shards.
-func newZone(events int, window time.Duration) *zone {
+func newZone(events int, window time.Duration, maxKeys int) *zone {
+	if maxKeys <= 0 {
+		maxKeys = defaultMaxKeys
+	}
 	z := &zone{
-		events: events,
-		window: window,
+		events:  events,
+		window:  window,
+		maxKeys: maxKeys,
 	}
 	for i := range z.shards {
 		z.shards[i].counters = make(map[string]*counter)
@@ -107,6 +117,11 @@ func (z *zone) allow(key string, now time.Time) (bool, int64, int) {
 
 	c, ok := s.counters[key]
 	if !ok {
+		// Reject new keys when the shard is at capacity to prevent
+		// unbounded memory growth from key-flooding attacks.
+		if len(s.counters) >= z.maxKeys/numShards {
+			return false, int64(z.events), z.events
+		}
 		c = &counter{
 			currStart: now.UnixNano(),
 		}
@@ -202,15 +217,19 @@ func (rls *rateLimitState) updateZones(rules []compiledRule) {
 		cfg := cr.rlConfig
 
 		// Preserve existing zone if config hasn't changed.
+		maxKeys := cfg.MaxKeys
+		if maxKeys <= 0 {
+			maxKeys = defaultMaxKeys
+		}
 		if existing, ok := rls.zones[id]; ok {
-			if existing.events == cfg.Events && existing.window == cfg.parsedWindow {
+			if existing.events == cfg.Events && existing.window == cfg.parsedWindow && existing.maxKeys == maxKeys {
 				newZones[id] = existing
 				continue
 			}
 		}
 
 		// New or changed — create fresh zone.
-		newZones[id] = newZone(cfg.Events, cfg.parsedWindow)
+		newZones[id] = newZone(cfg.Events, cfg.parsedWindow, cfg.MaxKeys)
 	}
 
 	rls.zones = newZones
@@ -373,6 +392,7 @@ type compiledRLConfig struct {
 	Events       int
 	parsedWindow time.Duration
 	Action       string // "deny" or "log_only"
+	MaxKeys      int    // max unique keys per zone; 0 = use default
 	needsBody    bool   // true if key requires body reading
 }
 
@@ -420,6 +440,7 @@ func compileRLConfig(cfg *RateLimitConfig) (*compiledRLConfig, error) {
 		Events:       cfg.Events,
 		parsedWindow: window,
 		Action:       action,
+		MaxKeys:      cfg.MaxKeys,
 		needsBody:    needsBodyForKey(key),
 	}, nil
 }

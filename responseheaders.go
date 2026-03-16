@@ -50,7 +50,9 @@ type CORSSettings struct {
 
 // CSPConfig holds global and per-service CSP policies.
 type CSPConfig struct {
-	Enabled        *bool                       `json:"enabled,omitempty"` // nil = true
+	Enabled        *bool                       `json:"enabled,omitempty"`     // nil = true
+	Mode           string                      `json:"mode,omitempty"`        // fallback mode: "set" (default), "default", "none"
+	ReportOnly     bool                        `json:"report_only,omitempty"` // fallback report-only flag
 	GlobalDefaults CSPPolicy                   `json:"global_defaults"`
 	Services       map[string]CSPServiceConfig `json:"services"`
 }
@@ -88,9 +90,27 @@ type CSPPolicy struct {
 // SecurityHeaderConfig holds static security headers applied to all responses.
 type SecurityHeaderConfig struct {
 	Enabled    *bool                              `json:"enabled,omitempty"` // nil = true
+	Preset     string                             `json:"preset,omitempty"`  // "strict", "moderate", or "" (none)
 	Headers    map[string]string                  `json:"headers,omitempty"`
 	Remove     []string                           `json:"remove,omitempty"`
 	PerService map[string]SecurityServiceOverride `json:"per_service,omitempty"`
+}
+
+// strictPreset defines security headers applied when Preset is "strict".
+// Explicit Headers entries override preset values.
+var strictPreset = map[string]string{
+	"Strict-Transport-Security":  "max-age=63072000; includeSubDomains; preload",
+	"X-Content-Type-Options":     "nosniff",
+	"X-Frame-Options":            "DENY",
+	"Referrer-Policy":            "strict-origin-when-cross-origin",
+	"Permissions-Policy":         "camera=(), microphone=(), geolocation=()",
+	"Cross-Origin-Opener-Policy": "same-origin",
+}
+
+// moderatePreset defines security headers applied when Preset is "moderate".
+var moderatePreset = map[string]string{
+	"X-Content-Type-Options": "nosniff",
+	"Referrer-Policy":        "strict-origin-when-cross-origin",
 }
 
 // SecurityServiceOverride holds per-service security header overrides.
@@ -285,11 +305,20 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) (*compiledResponseHeaders
 			return nil, fmt.Errorf("CSP global_defaults: %w", err)
 		}
 
-		// Build fallback from global defaults.
+		// Build fallback from global defaults. Mode and ReportOnly are
+		// configurable on the CSPConfig level; default is "set"/false.
+		fallbackMode := cfg.CSP.Mode
+		if fallbackMode == "" {
+			fallbackMode = "set"
+		}
+		if !validCSPModes[fallbackMode] {
+			return nil, fmt.Errorf("CSP global mode %q: unknown (must be set, default, or none)", fallbackMode)
+		}
 		fallbackHeader := buildCSPHeaderString(cfg.CSP.GlobalDefaults)
 		cc.fallback = compiledCSPService{
-			mode:     "set",
-			rendered: fallbackHeader,
+			mode:       fallbackMode,
+			reportOnly: cfg.CSP.ReportOnly,
+			rendered:   fallbackHeader,
 		}
 
 		// Build per-service compiled configs.
@@ -321,17 +350,48 @@ func compileResponseHeaders(cfg *ResponseHeaderConfig) (*compiledResponseHeaders
 	// Compile security headers.
 	if cfg.Security != nil {
 		enabled := cfg.Security.Enabled == nil || *cfg.Security.Enabled
+
+		// Validate preset value early — unknown presets silently produce
+		// zero security headers, which is a misconfiguration trap.
+		switch cfg.Security.Preset {
+		case "", "strict", "moderate":
+			// valid
+		default:
+			return nil, fmt.Errorf("security headers: unknown preset %q (must be \"strict\", \"moderate\", or empty)", cfg.Security.Preset)
+		}
+
+		// Apply preset headers first, then let explicit Headers override.
+		var baseHeaders map[string]string
+		switch cfg.Security.Preset {
+		case "strict":
+			baseHeaders = make(map[string]string, len(strictPreset)+len(cfg.Security.Headers))
+			for k, v := range strictPreset {
+				baseHeaders[k] = v
+			}
+		case "moderate":
+			baseHeaders = make(map[string]string, len(moderatePreset)+len(cfg.Security.Headers))
+			for k, v := range moderatePreset {
+				baseHeaders[k] = v
+			}
+		default:
+			baseHeaders = make(map[string]string, len(cfg.Security.Headers))
+		}
+		// Explicit headers override preset values.
+		for k, v := range cfg.Security.Headers {
+			baseHeaders[k] = v
+		}
+
 		cs := &compiledSecurity{
 			enabled:  enabled,
-			headers:  cfg.Security.Headers,
+			headers:  baseHeaders,
 			remove:   cfg.Security.Remove,
 			services: make(map[string]compiledSecSvc),
 		}
 
 		// Pre-merge per-service overrides.
 		for host, override := range cfg.Security.PerService {
-			merged := make(map[string]string, len(cfg.Security.Headers))
-			for k, v := range cfg.Security.Headers {
+			merged := make(map[string]string, len(baseHeaders))
+			for k, v := range baseHeaders {
 				merged[k] = v
 			}
 			// Override-specific headers replace global ones.
@@ -421,7 +481,8 @@ func compileCORSSettings(s CORSSettings) (*compiledCORSSettings, error) {
 			}
 			cs.originPatterns = append(cs.originPatterns, re)
 		} else {
-			cs.allowedOrigins = append(cs.allowedOrigins, o)
+			// Normalize exact origins at compile time for consistent matching.
+			cs.allowedOrigins = append(cs.allowedOrigins, normalizeOrigin(o))
 		}
 	}
 
@@ -564,6 +625,22 @@ func (rw *responseHeaderWriter) Flush() {
 	}
 }
 
+// ─── CORS Origin Normalization ──────────────────────────────────────
+
+// normalizeOrigin lowercases and strips default ports from an origin string.
+// This prevents bypass via "https://EXAMPLE.COM:443" vs "https://example.com".
+func normalizeOrigin(origin string) string {
+	origin = strings.ToLower(origin)
+	// Strip default ports.
+	for _, suffix := range []string{":443", ":80"} {
+		if strings.HasSuffix(origin, suffix) {
+			origin = strings.TrimSuffix(origin, suffix)
+			break
+		}
+	}
+	return origin
+}
+
 // ─── CORS Resolution ────────────────────────────────────────────────
 
 func (crh *compiledResponseHeaders) resolveCORS(host string) *compiledCORSSettings {
@@ -578,17 +655,20 @@ func (crh *compiledResponseHeaders) resolveCORS(host string) *compiledCORSSettin
 }
 
 // matchOrigin checks if the request Origin matches the allowed origins.
+// The incoming origin is normalized (lowercased, default ports stripped)
+// before matching against the pre-normalized allowed origins.
 func (cs *compiledCORSSettings) matchOrigin(origin string) bool {
 	if cs == nil || origin == "" {
 		return false
 	}
+	normalized := normalizeOrigin(origin)
 	for _, o := range cs.allowedOrigins {
-		if o == origin {
+		if o == normalized {
 			return true
 		}
 	}
 	for _, re := range cs.originPatterns {
-		if re.MatchString(origin) {
+		if re.MatchString(normalized) {
 			return true
 		}
 	}

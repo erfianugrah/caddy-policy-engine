@@ -100,6 +100,7 @@ type PolicyEngine struct {
 
 	// compiled state (not serialized)
 	rules          []compiledRule
+	ruleTagMap     map[string][]string // rule ID → tags, for O(1) detect tag lookup
 	logger         *zap.Logger
 	mu             *sync.RWMutex
 	lastMod        time.Time
@@ -365,6 +366,27 @@ type parsedBody struct {
 	jsonDone bool        // true if JSON parsing was attempted
 	formVals url.Values  // lazily parsed on first body_form access
 	formDone bool        // true if form parsing was attempted
+
+	// Query string cache — avoids re-parsing r.URL.Query() per condition.
+	query     url.Values
+	queryDone bool
+
+	// Multi-field extraction cache — avoids re-extracting the same aggregate
+	// field (e.g., request_combined) across multiple rules in the same request.
+	multiFieldCache   map[string][]string     // field name → extracted values
+	multiFieldKVCache map[string][]keyedValue // field name → extracted keyed values
+}
+
+// getQuery returns the cached URL query parameters, parsing lazily on first call.
+func (pb *parsedBody) getQuery(r *http.Request) url.Values {
+	if pb == nil {
+		return r.URL.Query()
+	}
+	if !pb.queryDone {
+		pb.queryDone = true
+		pb.query = r.URL.Query()
+	}
+	return pb.query
 }
 
 // getJSON returns the pre-parsed JSON root, parsing lazily on first call.
@@ -384,16 +406,16 @@ func (pb *parsedBody) getJSON() (interface{}, bool) {
 }
 
 // getForm returns the pre-parsed form values, parsing lazily on first call.
+// Go 1.17+ guarantees url.ParseQuery returns partial results on error,
+// so we always store the result.
 func (pb *parsedBody) getForm() url.Values {
 	if pb == nil || len(pb.raw) == 0 {
 		return nil
 	}
 	if !pb.formDone {
 		pb.formDone = true
-		vals, err := url.ParseQuery(string(pb.raw))
-		if err == nil {
-			pb.formVals = vals
-		}
+		vals, _ := url.ParseQuery(string(pb.raw))
+		pb.formVals = vals // Go 1.17+ guarantees partial results are usable
 	}
 	return pb.formVals
 }
@@ -437,6 +459,7 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("compiling inline rules: %w", err)
 		}
 		pe.rules = compiled
+		pe.ruleTagMap = buildRuleTagMap(compiled)
 		pe.rlState.updateZones(compiled)
 	}
 
@@ -454,6 +477,11 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 			rlCount++
 		}
 	}
+
+	if !pe.HideHeaders {
+		pe.logger.Warn("policy_engine: debug headers (X-Blocked-By, X-Blocked-Rule, X-Policy-Tags) are visible to clients; set hide_headers to true in production")
+	}
+
 	pe.logger.Info("policy engine provisioned",
 		zap.Int("rules", ruleCount),
 		zap.Int("enabled", enabledCount),
@@ -490,6 +518,7 @@ func (pe *PolicyEngine) Cleanup() error {
 func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	pe.mu.RLock()
 	rules := pe.rules
+	ruleTagMap := pe.ruleTagMap
 	globalCfg := pe.rlGlobalConfig
 	respHeaders := pe.respHeaders
 	wafCfg := pe.wafConfig
@@ -547,8 +576,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		// Allow terminates: if allow already matched, skip everything
-		// except rate limits (which always evaluate for allow — see below).
-		if allowMatched {
+		// except rate limits (which still evaluate for allowed traffic to
+		// enforce rate limits regardless of allow status — H-4 fix).
+		if allowMatched && cr.rule.Type != "rate_limit" {
 			continue
 		}
 
@@ -617,8 +647,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// Rule matched — take action.
 		switch cr.rule.Type {
 		case "allow":
-			// Pass 1: full bypass — terminate immediately.
-			// No blocks, CRS, or rate limits below fire. Trusted traffic.
+			// Pass 1: allow matched — set flag but continue loop to evaluate
+			// rate_limit rules. Block/detect/skip/honeypot rules are skipped
+			// via the allowMatched guard at the top of the loop.
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "allow")
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -632,10 +663,6 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("client_ip", clientIP(r)),
 				zap.String("uri", r.RequestURI))
 			allowMatched = true
-
-			// Apply response headers even for allowed traffic.
-			w = applyResponseHeaders(w, r.Host, r, respHeaders)
-			return next.ServeHTTP(w, r)
 
 		case "block", "honeypot":
 			// Pass 2: deny list — hard terminate.
@@ -785,6 +812,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 
+	// ── Post-loop: allow matched → bypass remaining evaluation ────
+	// If an allow rule matched, skip anomaly scoring and pass through.
+	// Rate limit rules were still evaluated in the loop above.
+	if allowMatched {
+		w = applyResponseHeaders(w, r.Host, r, respHeaders)
+		return next.ServeHTTP(w, r)
+	}
+
 	// ── Post-loop: anomaly threshold check ─────────────────────────
 	// If detect rules fired and the accumulated score exceeds the threshold,
 	// block the request. Skipped if detect phase was bypassed by a skip rule.
@@ -811,17 +846,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			// Format: "920350:WARNING:3" (id:severity:score)
 			ruleDetails = append(ruleDetails, m.ruleID+":"+m.severity+":"+strconv.Itoa(m.score))
 		}
-		// Look up tags from compiled rules for all matched detect rules.
+		// Look up tags via O(1) map instead of scanning all rules.
 		for _, m := range scorer.matched {
-			for _, cr := range rules {
-				if cr.rule.ID == m.ruleID {
-					for _, t := range cr.rule.Tags {
-						if !tagSeen[t] {
-							tagSeen[t] = true
-							tags = append(tags, t)
-						}
-					}
-					break
+			for _, t := range ruleTagMap[m.ruleID] {
+				if !tagSeen[t] {
+					tagSeen[t] = true
+					tags = append(tags, t)
 				}
 			}
 		}
@@ -1265,7 +1295,7 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 	// Multi-value fields (all_args, all_headers, all_cookies, etc.) —
 	// iterate all values, return true if ANY matches (OR semantics).
 	if cc.isMulti {
-		values := extractMultiField(cc, r, pb)
+		values := cachedExtractMultiField(cc, r, pb)
 		for _, val := range values {
 			if evalMultiMatchOrPlain(cc, val) {
 				if cc.negate {
@@ -1438,7 +1468,7 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 		return ""
 	case "args":
 		if cc.name != "" {
-			return r.URL.Query().Get(cc.name)
+			return pb.getQuery(r).Get(cc.name)
 		}
 		return ""
 	case "body":
@@ -1601,6 +1631,43 @@ func isExcluded(excludes map[string]bool, category, name string) bool {
 	return false
 }
 
+// cachedExtractMultiField returns cached multi-field values, extracting on first call.
+// Prevents re-extraction of the same aggregate field across multiple rules.
+func cachedExtractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []string {
+	if pb != nil {
+		if pb.multiFieldCache != nil {
+			if cached, ok := pb.multiFieldCache[cc.field]; ok {
+				return cached
+			}
+		}
+		vals := extractMultiField(cc, r, pb)
+		if pb.multiFieldCache == nil {
+			pb.multiFieldCache = make(map[string][]string)
+		}
+		pb.multiFieldCache[cc.field] = vals
+		return vals
+	}
+	return extractMultiField(cc, r, pb)
+}
+
+// cachedExtractMultiFieldKeyed returns cached keyed multi-field values.
+func cachedExtractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBody) []keyedValue {
+	if pb != nil {
+		if pb.multiFieldKVCache != nil {
+			if cached, ok := pb.multiFieldKVCache[cc.field]; ok {
+				return cached
+			}
+		}
+		kvs := extractMultiFieldKeyed(cc, r, pb)
+		if pb.multiFieldKVCache == nil {
+			pb.multiFieldKVCache = make(map[string][]keyedValue)
+		}
+		pb.multiFieldKVCache[cc.field] = kvs
+		return kvs
+	}
+	return extractMultiFieldKeyed(cc, r, pb)
+}
+
 // extractMultiField returns all values for an aggregate field.
 // Used by matchCondition when cc.isMulti is true.
 func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []string {
@@ -1608,7 +1675,7 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 	case "all_args":
 		// All query + POST params: names AND values (matches CRS ARGS|ARGS_NAMES)
 		var vals []string
-		for k, vs := range r.URL.Query() {
+		for k, vs := range pb.getQuery(r) {
 			vals = append(vals, k)
 			vals = append(vals, vs...)
 		}
@@ -1623,7 +1690,7 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 	case "all_args_values":
 		// All query + POST param values only (matches CRS ARGS)
 		var vals []string
-		for _, vs := range r.URL.Query() {
+		for _, vs := range pb.getQuery(r) {
 			vals = append(vals, vs...)
 		}
 		if pb != nil {
@@ -1636,7 +1703,7 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 	case "all_args_names":
 		// All query + POST param names (matches CRS ARGS_NAMES)
 		var vals []string
-		for k := range r.URL.Query() {
+		for k := range pb.getQuery(r) {
 			vals = append(vals, k)
 		}
 		if pb != nil {
@@ -1692,7 +1759,7 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 		var vals []string
 
 		// Query param names and values (ARGS + ARGS_NAMES)
-		for k, vs := range r.URL.Query() {
+		for k, vs := range pb.getQuery(r) {
 			vals = append(vals, k)
 			vals = append(vals, vs...)
 		}
@@ -1805,7 +1872,7 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 	switch cc.field {
 	case "all_args":
 		var kvs []keyedValue
-		for k, vs := range r.URL.Query() {
+		for k, vs := range pb.getQuery(r) {
 			kvs = append(kvs, keyedValue{key: "ARGS_NAMES:" + k, val: k})
 			for _, v := range vs {
 				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
@@ -1823,7 +1890,7 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 
 	case "all_args_values":
 		var kvs []keyedValue
-		for k, vs := range r.URL.Query() {
+		for k, vs := range pb.getQuery(r) {
 			for _, v := range vs {
 				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
 			}
@@ -1839,7 +1906,7 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 
 	case "all_args_names":
 		var kvs []keyedValue
-		for k := range r.URL.Query() {
+		for k := range pb.getQuery(r) {
 			kvs = append(kvs, keyedValue{key: "ARGS_NAMES", val: k})
 		}
 		if pb != nil {
@@ -1884,7 +1951,7 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 		var kvs []keyedValue
 
 		// Query param names and values
-		for k, vs := range r.URL.Query() {
+		for k, vs := range pb.getQuery(r) {
 			kvs = append(kvs, keyedValue{key: "ARGS_NAMES:" + k, val: k})
 			for _, v := range vs {
 				kvs = append(kvs, keyedValue{key: "ARGS:" + k, val: v})
@@ -2518,7 +2585,7 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 
 	// Multi-value fields — iterate all, report first match.
 	if cc.isMulti {
-		kvs := extractMultiFieldKeyed(cc, r, pb)
+		kvs := cachedExtractMultiFieldKeyed(cc, r, pb)
 		for _, kv := range kvs {
 			matched, matchedData := evalMultiMatchOrPlainDetailed(cc, kv.val)
 			if matched {
@@ -2785,6 +2852,18 @@ func clientIP(r *http.Request) string {
 
 // ─── Rule Compilation ───────────────────────────────────────────────
 
+// buildRuleTagMap creates an O(1) lookup from rule ID to tags.
+// Used to replace the O(N) linear scan in the detect scoring path.
+func buildRuleTagMap(rules []compiledRule) map[string][]string {
+	m := make(map[string][]string, len(rules))
+	for _, cr := range rules {
+		if len(cr.rule.Tags) > 0 {
+			m[cr.rule.ID] = cr.rule.Tags
+		}
+	}
+	return m
+}
+
 func compileRules(rules []PolicyRule) ([]compiledRule, error) {
 	return compileRulesWithLogger(rules, nil)
 }
@@ -2845,6 +2924,19 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 	// conditions but take no action in ServeHTTP.
 	if !validRuleTypes[rule.Type] {
 		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, skip, rate_limit, or detect)", rule.Type)
+	}
+
+	// Reject user-created rules with zero conditions — they would match all
+	// Zero-condition guard: allow/block/honeypot/skip rules with no conditions match all
+	// requests, which is almost certainly a misconfiguration. Rate-limit and detect rules
+	// are exempt — rate_limit rules are bounded by their key (not conditions), and detect
+	// rules (CRS) may intentionally apply unconditionally for anomaly scoring.
+	// Response_header rules are also exempt (apply to all responses).
+	if len(rule.Conditions) == 0 {
+		switch rule.Type {
+		case "allow", "block", "honeypot", "skip":
+			return cr, fmt.Errorf("rule %q (%s) has no conditions and would match all requests", rule.Name, rule.ID)
+		}
 	}
 
 	for _, cond := range rule.Conditions {
@@ -3504,8 +3596,11 @@ func (pe *PolicyEngine) loadFromFile() error {
 	// Check if sweep interval changed (need to restart sweep goroutine).
 	oldSweepInterval := pe.sweepInterval()
 
+	tagMap := buildRuleTagMap(compiled)
+
 	pe.mu.Lock()
 	pe.rules = compiled
+	pe.ruleTagMap = tagMap
 	pe.rlGlobalConfig = globalCfg
 	pe.respHeaders = respHeaders
 	pe.wafConfig = wafCfg

@@ -1025,7 +1025,7 @@ or the documentation should prominently recommend enabling it in production.
 
 ### 26. `r.URL.Query()` Parsed Repeatedly
 
-**Status: OPEN** — Performance optimization. Deferred.
+**Status: FIXED** — `parsedBody.query`/`queryDone` fields with lazy `getQuery(r)` method; all hot-path callers use `pb.getQuery(r)`.
 
 **File:** `policyengine.go` — multiple locations
 
@@ -1041,7 +1041,7 @@ type requestCache struct {
 
 ### 27. `request_combined` Rebuilds Value Slice Per Rule
 
-**Status: OPEN** — Performance optimization. Deferred.
+**Status: FIXED** — `parsedBody.multiFieldCache`/`multiFieldKVCache` maps with lazy `cachedExtractMultiField`/`cachedExtractMultiFieldKeyed` wrappers.
 
 **File:** `policyengine.go:1678-1734`
 
@@ -1102,7 +1102,7 @@ func (crh *compiledResponseHeaders) resolveCORS(host string) *compiledCORSSettin
 
 ### 32. CSP Fallback Mode Hardcoded to `"set"`
 
-**Status: OPEN** — Feature request. Deferred.
+**Status: FIXED** — CSPConfig has `Mode` and `ReportOnly` fields; fallback compilation reads from config with "set" default; unknown modes validated at compile time.
 
 **File:** `responseheaders.go:276-279`
 
@@ -1111,7 +1111,7 @@ The global CSP fallback is always `mode: "set"`. Allow configuring `mode` and
 
 ### 33. No Default Security Headers
 
-**Status: OPEN** — Feature request. Deferred.
+**Status: FIXED** — `SecurityHeaderConfig.Preset` field with `strictPreset`/`moderatePreset` maps; preset headers applied first then explicit `Headers` override; unknown presets rejected at compile time.
 
 **File:** `responseheaders.go:300-338`
 

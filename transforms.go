@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -53,6 +54,8 @@ var transformRegistry = map[string]transformFunc{
 	"cmdLine":            transformCmdLine,
 	"escapeSeqDecode":    transformEscapeSeqDecode,
 	"removeCommentsChar": transformRemoveCommentsChar,
+	// Extended
+	"normalizeUnicodeWhitespace": transformNormalizeUnicodeWhitespace,
 }
 
 // validTransformNames returns a sorted list of all valid transform names.
@@ -481,6 +484,22 @@ func transformJSDecode(s string) string {
 			b.WriteByte('\\')
 			i++
 		case 'u':
+			// ES6 \u{H...} (1-6 hex digits, code points up to U+10FFFF)
+			if i+3 < len(s) && s[i+2] == '{' {
+				j := i + 3
+				start := j
+				for j < len(s) && j-start < 6 && unhex(s[j]) >= 0 {
+					j++
+				}
+				if j > start && j < len(s) && s[j] == '}' {
+					cp, err := strconv.ParseInt(s[start:j], 16, 32)
+					if err == nil && cp >= 0 && cp <= 0x10FFFF {
+						b.WriteRune(rune(cp))
+						i = j + 1
+						continue
+					}
+				}
+			}
 			// \uHHHH
 			if i+5 < len(s) {
 				h3 := unhex(s[i+2])
@@ -737,6 +756,29 @@ func transformEscapeSeqDecode(s string) string {
 			// Unknown escape — pass through.
 			b.WriteByte('\\')
 			i++
+		}
+	}
+	return b.String()
+}
+
+// transformNormalizeUnicodeWhitespace converts Unicode whitespace characters
+// (including zero-width spaces and BOM) to ASCII space, then compresses
+// consecutive whitespace into a single space. Unlike compressWhitespace
+// (which handles only ASCII whitespace for CRS compatibility), this
+// normalizes the full Unicode whitespace category.
+func transformNormalizeUnicodeWhitespace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) || r == '\u200B' || r == '\uFEFF' {
+			if !inSpace {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+		} else {
+			b.WriteRune(r)
+			inSpace = false
 		}
 	}
 	return b.String()

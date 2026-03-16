@@ -979,8 +979,11 @@ func TestRule_OR_NoneMatch(t *testing.T) {
 }
 
 func TestRule_NoConditions_MatchesAll(t *testing.T) {
+	// detect rules are exempt from the zero-condition guard — they may
+	// intentionally have no conditions (e.g., response_header rules).
 	rule := PolicyRule{
-		ID: "test", Type: "block", Enabled: true, GroupOp: "and",
+		ID: "test", Type: "detect", Enabled: true, GroupOp: "and",
+		Severity: "NOTICE",
 	}
 	cr, err := compileRule(rule)
 	if err != nil {
@@ -989,6 +992,29 @@ func TestRule_NoConditions_MatchesAll(t *testing.T) {
 	r := makeRequest("GET", "/anything", "10.0.0.1:1234")
 	if !matchRule(cr, r, nil) {
 		t.Error("rule with no conditions should match all requests")
+	}
+}
+
+func TestRule_NoConditions_Rejected(t *testing.T) {
+	// Block, allow, skip, and honeypot rules with zero conditions must be
+	// rejected during compilation to prevent match-all mistakes. Rate-limit
+	// and detect rules are exempt (bounded by key, not conditions).
+	for _, rtype := range []string{"allow", "block", "honeypot", "skip"} {
+		t.Run(rtype, func(t *testing.T) {
+			rule := PolicyRule{
+				ID: "test", Name: "test", Type: rtype, Enabled: true, GroupOp: "and",
+			}
+			if rtype == "skip" {
+				rule.SkipTargets = &SkipTargets{AllRemaining: true}
+			}
+			_, err := compileRule(rule)
+			if err == nil {
+				t.Fatalf("expected error for %s rule with no conditions", rtype)
+			}
+			if !strings.Contains(err.Error(), "no conditions") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
@@ -1386,10 +1412,9 @@ func TestPriority_SkipDoesNotOverrideBlock(t *testing.T) {
 	}
 }
 
-func TestPriority_AllowTerminatesBeforeRateLimit(t *testing.T) {
-	// In the 5-pass model, allow terminates immediately. Rate limit
-	// counters do NOT tick for allowed traffic. Use skip to selectively
-	// bypass detect while still respecting rate limits.
+func TestPriority_AllowStillRateLimits(t *testing.T) {
+	// Allow rules bypass block/detect phases but NOT rate limits.
+	// This prevents unlimited throughput through broad allow rules.
 	pe := newTestPolicyEngine(t, []PolicyRule{
 		{
 			ID: "a1", Name: "Allow Trusted", Type: "allow", Enabled: true,
@@ -1410,21 +1435,26 @@ func TestPriority_AllowTerminatesBeforeRateLimit(t *testing.T) {
 		},
 	})
 
-	// Both requests — allow terminates, RL never evaluated, both pass.
-	for i := 0; i < 3; i++ {
-		r := makeRequest("GET", "/api/data", "10.0.0.1:1234")
-		next := &nextHandler{}
-		err := pe.ServeHTTP(httptest.NewRecorder(), r, next)
-		if err != nil {
-			t.Fatalf("request %d: unexpected error: %v", i+1, err)
-		}
-		if !next.called {
-			t.Errorf("request %d: next should be called (allow terminates)", i+1)
-		}
-		action, _ := caddyhttp.GetVar(r.Context(), "policy_engine.action").(string)
-		if action != "allow" {
-			t.Errorf("request %d: action = %q, want allow", i+1, action)
-		}
+	// First request: allow + within rate limit → passes
+	r1 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	next1 := &nextHandler{}
+	if err := pe.ServeHTTP(httptest.NewRecorder(), r1, next1); err != nil {
+		t.Fatalf("request 1: unexpected error: %v", err)
+	}
+	if !next1.called {
+		t.Error("request 1: next should be called")
+	}
+
+	// Second request: allow matched, but rate limit exceeded → error returned
+	r2 := makeRequest("GET", "/api/data", "10.0.0.1:1234")
+	next2 := &nextHandler{}
+	err := pe.ServeHTTP(httptest.NewRecorder(), r2, next2)
+	if err == nil {
+		t.Error("request 2: expected rate limit error (allow should not bypass rate limits)")
+	}
+	action2, _ := caddyhttp.GetVar(r2.Context(), "policy_engine.action").(string)
+	if action2 != "rate_limit" {
+		t.Errorf("request 2: action = %q, want rate_limit", action2)
 	}
 }
 

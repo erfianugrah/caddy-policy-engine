@@ -18,7 +18,7 @@ import (
 // ─── Sliding Window Counter Tests ───────────────────────────────────
 
 func TestZone_AllowUnderLimit(t *testing.T) {
-	z := newZone(10, time.Minute)
+	z := newZone(10, time.Minute, 0)
 	now := time.Now()
 	for i := 0; i < 10; i++ {
 		allowed, _, _ := z.allow("key1", now)
@@ -29,7 +29,7 @@ func TestZone_AllowUnderLimit(t *testing.T) {
 }
 
 func TestZone_DenyAtLimit(t *testing.T) {
-	z := newZone(5, time.Minute)
+	z := newZone(5, time.Minute, 0)
 	now := time.Now()
 	for i := 0; i < 5; i++ {
 		allowed, _, _ := z.allow("key1", now)
@@ -51,7 +51,7 @@ func TestZone_DenyAtLimit(t *testing.T) {
 }
 
 func TestZone_SeparateKeys(t *testing.T) {
-	z := newZone(2, time.Minute)
+	z := newZone(2, time.Minute, 0)
 	now := time.Now()
 
 	// key1: 2 requests (at limit)
@@ -70,7 +70,7 @@ func TestZone_SeparateKeys(t *testing.T) {
 }
 
 func TestZone_WindowRotation(t *testing.T) {
-	z := newZone(5, time.Second)
+	z := newZone(5, time.Second, 0)
 
 	t0 := time.Now()
 	for i := 0; i < 5; i++ {
@@ -101,7 +101,7 @@ func TestZone_WindowRotation(t *testing.T) {
 }
 
 func TestZone_SlidingWindowInterpolation(t *testing.T) {
-	z := newZone(10, time.Second)
+	z := newZone(10, time.Second, 0)
 
 	t0 := time.Now()
 	// Fill up the window.
@@ -119,7 +119,7 @@ func TestZone_SlidingWindowInterpolation(t *testing.T) {
 }
 
 func TestZone_LongGapResets(t *testing.T) {
-	z := newZone(5, time.Minute)
+	z := newZone(5, time.Minute, 0)
 
 	t0 := time.Now()
 	for i := 0; i < 5; i++ {
@@ -135,7 +135,7 @@ func TestZone_LongGapResets(t *testing.T) {
 }
 
 func TestZone_Sweep(t *testing.T) {
-	z := newZone(100, time.Second)
+	z := newZone(100, time.Second, 0)
 
 	t0 := time.Now()
 	// Create some counters.
@@ -158,7 +158,7 @@ func TestZone_Sweep(t *testing.T) {
 }
 
 func TestZone_ConcurrentAccess(t *testing.T) {
-	z := newZone(1000, time.Minute)
+	z := newZone(1000, time.Minute, 0)
 	now := time.Now()
 
 	var wg sync.WaitGroup
