@@ -287,28 +287,29 @@ type compiledSkipTargets struct {
 }
 
 type compiledCondition struct {
-	field        string
-	operator     string
-	name         string // for named fields (header, cookie, args, body_json, body_form, etc.)
-	exactVal     string
-	prefix       string
-	suffix       string
-	contains     string
-	regex        *regexp.Regexp
-	ipNets       []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
-	ipSet        map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
-	stringSet    map[string]bool
-	negate       bool
-	multiMatch   bool            // true: run operator at each transform stage (CRS multiMatch)
-	isExists     bool            // true for "exists" operator (field presence check)
-	transforms   []transformFunc // ordered transform chain applied before operator evaluation
-	acMatcher    *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
-	isMulti      bool            // true for aggregate fields (all_args, all_headers, etc.)
-	isCount      bool            // true for count: pseudo-field
-	countField   string          // the underlying field for count: (e.g., "all_args")
-	numericVal   float64         // pre-parsed numeric value for gt/ge/lt/le operators
-	byteRangeSet *[256]bool      // allowed byte values for validate_byte_range
-	excludes     map[string]bool // patterns to exclude from multi-field extraction (e.g., "cookie:__utm")
+	field         string
+	operator      string
+	name          string // for named fields (header, cookie, args, body_json, body_form, etc.)
+	exactVal      string
+	prefix        string
+	suffix        string
+	contains      string
+	regex         *regexp.Regexp
+	ipNets        []net.IPNet       // CIDR ranges for ip_match/not_ip_match and in_list(ip kind with CIDRs)
+	ipSet         map[[16]byte]bool // O(1) lookup for single IPs in large ip-kind lists
+	stringSet     map[string]bool
+	negate        bool
+	multiMatch    bool            // true: run operator at each transform stage (CRS multiMatch)
+	isExists      bool            // true for "exists" operator (field presence check)
+	transforms    []transformFunc // ordered transform chain applied before operator evaluation
+	acMatcher     *ACMatcher      // compiled Aho-Corasick automaton for phrase_match
+	isMulti       bool            // true for aggregate fields (all_args, all_headers, etc.)
+	isCount       bool            // true for count: pseudo-field
+	isCountScalar bool            // true when count: is on a scalar field (returns 0 or 1)
+	countField    string          // the underlying field for count: (e.g., "all_args")
+	numericVal    float64         // pre-parsed numeric value for gt/ge/lt/le operators
+	byteRangeSet  *[256]bool      // allowed byte values for validate_byte_range
+	excludes      map[string]bool // patterns to exclude from multi-field extraction (e.g., "cookie:__utm")
 	// Nested group support
 	isGroup       bool                // true when this is a group, not a simple condition
 	subConditions []compiledCondition // compiled sub-conditions (when isGroup)
@@ -1330,9 +1331,20 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 		return result
 	}
 
-	// count: pseudo-field — count values in a collection, compare numerically.
+	// count: pseudo-field — count values in a collection (aggregate) or check
+	// presence (scalar), then compare numerically.
 	if cc.isCount {
-		count := countMultiField(cc.countField, r, pb)
+		var count int
+		if cc.isCountScalar {
+			// Scalar field: 1 if non-empty, 0 if empty/missing.
+			val := extractField(cc, r, pb)
+			if val != "" {
+				count = 1
+			}
+		} else {
+			// Aggregate field: count all values.
+			count = countMultiField(cc.countField, r, pb)
+		}
 		target := strconv.Itoa(count)
 		result := evalOperator(cc, target)
 		if cc.negate {
@@ -2611,7 +2623,21 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 
 	// count: pseudo-field.
 	if cc.isCount {
-		count := countMultiField(cc.countField, r, pb)
+		var count int
+		var fieldLabel string
+		if cc.isCountScalar {
+			val := extractField(cc, r, pb)
+			if val != "" {
+				count = 1
+			}
+			fieldLabel = "count:" + cc.field
+			if cc.name != "" {
+				fieldLabel = "count:" + cc.field + ":" + cc.name
+			}
+		} else {
+			count = countMultiField(cc.countField, r, pb)
+			fieldLabel = "count:" + cc.countField
+		}
 		target := strconv.Itoa(count)
 		matched, matchedData := evalOperatorDetailed(cc, target)
 		if cc.negate {
@@ -2619,8 +2645,8 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 		}
 		if matched {
 			return true, &matchDetail{
-				Field:       "count:" + cc.countField,
-				VarName:     "&" + strings.ToUpper(cc.countField),
+				Field:       fieldLabel,
+				VarName:     "&" + strings.ToUpper(fieldLabel),
 				Value:       truncateForLog(target),
 				MatchedData: truncateForLog(matchedData),
 				Operator:    cc.operator,
@@ -3384,15 +3410,26 @@ func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, 
 		cc.isMulti = true
 	}
 
-	// Detect count: pseudo-field — "count:all_args", "count:all_headers", etc.
+	// Detect count: pseudo-field — "count:all_args", "count:host", "count:header:X-Foo", etc.
+	// Aggregate fields (all_args, all_headers, etc.) count all values in the collection.
+	// Scalar fields (host, user_agent, header:X-Foo, etc.) return 1 if non-empty, 0 if empty/missing.
+	// This supports CRS header-presence checks like &REQUEST_HEADERS:Host @eq 0.
 	if strings.HasPrefix(cond.Field, countPrefix) {
 		underlying := cond.Field[len(countPrefix):]
-		if !multiFields[underlying] {
-			return cc, fmt.Errorf("count: requires an aggregate field, got %q (valid: all_args, all_args_values, all_args_names, all_headers, all_headers_names, all_cookies, all_cookies_names, request_combined)", underlying)
-		}
 		cc.isCount = true
-		cc.countField = underlying
 		cc.isMulti = false // count produces a single value, not multi-iteration
+		if multiFields[underlying] {
+			cc.countField = underlying
+		} else {
+			// Scalar field — set up for extractField (handles "header:Name", "cookie:Name", etc.)
+			cc.isCountScalar = true
+			cc.field = underlying
+			// Parse named field syntax (e.g., "header:X-Custom" → field="header", name="X-Custom")
+			if idx := strings.Index(underlying, ":"); idx > 0 {
+				cc.field = underlying[:idx]
+				cc.name = underlying[idx+1:]
+			}
+		}
 	}
 
 	// Resolve transform chain.

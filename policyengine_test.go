@@ -4794,14 +4794,114 @@ func TestCompileCondition_Count(t *testing.T) {
 	}
 }
 
-func TestCompileCondition_Count_InvalidField(t *testing.T) {
-	_, err := compileCondition(PolicyCondition{
-		Field:    "count:path",
-		Operator: "gt",
-		Value:    "10",
+func TestCompileCondition_Count_ScalarField(t *testing.T) {
+	// count: on a scalar field should compile successfully (returns 0 or 1).
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:host",
+		Operator: "eq",
+		Value:    "0",
 	})
-	if err == nil {
-		t.Fatal("count:path should fail (path is not an aggregate field)")
+	if err != nil {
+		t.Fatalf("count:host should compile: %v", err)
+	}
+	if !cc.isCount {
+		t.Error("should be isCount")
+	}
+	if !cc.isCountScalar {
+		t.Error("should be isCountScalar")
+	}
+	if cc.field != "host" {
+		t.Errorf("field = %q, want host", cc.field)
+	}
+}
+
+func TestCompileCondition_Count_NamedHeader(t *testing.T) {
+	// count:header:X-Custom should compile with field="header", name="X-Custom"
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:header:X-Custom",
+		Operator: "eq",
+		Value:    "0",
+	})
+	if err != nil {
+		t.Fatalf("count:header:X-Custom should compile: %v", err)
+	}
+	if !cc.isCountScalar {
+		t.Error("should be isCountScalar")
+	}
+	if cc.field != "header" {
+		t.Errorf("field = %q, want header", cc.field)
+	}
+	if cc.name != "X-Custom" {
+		t.Errorf("name = %q, want X-Custom", cc.name)
+	}
+}
+
+func TestMatchCondition_Count_ScalarPresent(t *testing.T) {
+	// count:user_agent eq 0 → false when User-Agent is present
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:user_agent",
+		Operator: "eq",
+		Value:    "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"User-Agent": "TestBrowser/1.0",
+	})
+	if matchCondition(cc, r, nil) {
+		t.Error("count:user_agent eq 0 should be false when UA is present")
+	}
+}
+
+func TestMatchCondition_Count_ScalarMissing(t *testing.T) {
+	// count:user_agent eq 0 → true when User-Agent is empty/missing
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:user_agent",
+		Operator: "eq",
+		Value:    "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/", "10.0.0.1:1234")
+	r.Header.Del("User-Agent") // Remove default Go UA
+	if !matchCondition(cc, r, nil) {
+		t.Error("count:user_agent eq 0 should be true when UA is missing")
+	}
+}
+
+func TestMatchCondition_Count_NamedHeaderMissing(t *testing.T) {
+	// count:header:X-Custom eq 0 → true when header is missing
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:header:X-Custom",
+		Operator: "eq",
+		Value:    "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequest("GET", "/", "10.0.0.1:1234")
+	if !matchCondition(cc, r, nil) {
+		t.Error("count:header:X-Custom eq 0 should be true when header is missing")
+	}
+}
+
+func TestMatchCondition_Count_NamedHeaderPresent(t *testing.T) {
+	// count:header:X-Custom gt 0 → true when header is present
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "count:header:X-Custom",
+		Operator: "gt",
+		Value:    "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
+		"X-Custom": "value",
+	})
+	if !matchCondition(cc, r, nil) {
+		t.Error("count:header:X-Custom gt 0 should be true when header is present")
 	}
 }
 
