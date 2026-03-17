@@ -2220,9 +2220,6 @@ func parseByteRangeSet(spec string) (*[256]bool, error) {
 	return &set, nil
 }
 
-// evalValidateByteRange returns true if ALL bytes in target are within the
-// allowed set. CRS semantics: @validateByteRange succeeds when the input
-// contains only allowed bytes.
 // evalValidateByteRange returns true if any byte in target is OUTSIDE the
 // allowed set (i.e., a violation was found). This matches CRS/ModSecurity
 // semantics where @validateByteRange fires when invalid bytes are present.

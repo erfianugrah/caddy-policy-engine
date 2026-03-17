@@ -39,7 +39,7 @@ type RateLimitConfig struct {
 
 // RateLimitGlobalConfig holds global settings for the rate limit subsystem.
 type RateLimitGlobalConfig struct {
-	SweepInterval string  `json:"sweep_interval,omitempty"` // How often to evict expired counters (default "1m")
+	SweepInterval string  `json:"sweep_interval,omitempty"` // How often to evict expired counters (default "30s")
 	Jitter        float64 `json:"jitter,omitempty"`         // 0.0-1.0, randomize Retry-After header
 }
 
