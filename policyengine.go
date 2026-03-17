@@ -3129,16 +3129,13 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 			c.defaultDisabledCategories[cat] = true
 		}
 	}
-	// Sensible defaults.
+	// Default paranoia level 1 if not set.
 	if c.defaultPL == 0 {
 		c.defaultPL = 1
 	}
-	if c.defaultInThreshold == 0 {
-		c.defaultInThreshold = 10
-	}
-	if c.defaultOutThreshold == 0 {
-		c.defaultOutThreshold = 10
-	}
+	// Threshold 0 = blocking disabled (detect rules evaluate and log but
+	// never block). The operator must explicitly set a threshold > 0 to
+	// enable anomaly-based blocking.
 	if len(cfg.PerService) > 0 {
 		c.services = make(map[string]compiledWafServiceConfig, len(cfg.PerService))
 		for host, svc := range cfg.PerService {

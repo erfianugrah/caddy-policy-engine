@@ -3647,15 +3647,17 @@ func TestCompileWafConfig_Defaults(t *testing.T) {
 	if c.defaultPL != 1 {
 		t.Errorf("expected defaultPL=1, got %d", c.defaultPL)
 	}
-	if c.defaultInThreshold != 10 {
-		t.Errorf("expected defaultInThreshold=10, got %d", c.defaultInThreshold)
+	// Threshold 0 = blocking disabled (detect rules log but don't block).
+	if c.defaultInThreshold != 0 {
+		t.Errorf("expected defaultInThreshold=0 (disabled), got %d", c.defaultInThreshold)
 	}
 }
 
 func TestCompileWafConfig_PerService(t *testing.T) {
 	c := compileWafConfig(&WafConfig{
-		ParanoiaLevel:    2,
-		InboundThreshold: 10,
+		ParanoiaLevel:     2,
+		InboundThreshold:  10,
+		OutboundThreshold: 10,
 		PerService: map[string]WafServiceConfig{
 			"strict.example.com":  {ParanoiaLevel: 1, InboundThreshold: 5},
 			"relaxed.example.com": {InboundThreshold: 20}, // PL inherits from default.
