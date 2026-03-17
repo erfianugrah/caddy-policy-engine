@@ -769,6 +769,17 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 					setRateLimitHeaders(w, limit, remaining, cr.rlConfig.parsedWindow, cr.rule.Name)
 					w.Header().Set("X-RateLimit-Monitor", cr.rule.Name)
 				}
+				if !allowed {
+					pe.logger.Info("rate limit monitor (log_only)",
+						zap.String("rule_id", cr.rule.ID),
+						zap.String("rule_name", cr.rule.Name),
+						zap.String("key", key),
+						zap.Int64("count", count),
+						zap.Int("limit", limit),
+						zap.Strings("tags", cr.rule.Tags),
+						zap.String("client_ip", clientIP(r)),
+						zap.String("uri", r.RequestURI))
+				}
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit_monitor")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
@@ -1101,6 +1112,17 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 				severity: cr.rule.Severity,
 				score:    cr.score,
 			})
+			if pe.logger != nil {
+				pe.logger.Debug("outbound detect rule matched",
+					zap.String("rule_id", cr.rule.ID),
+					zap.String("rule_name", cr.rule.Name),
+					zap.String("severity", cr.rule.Severity),
+					zap.Int("score", cr.score),
+					zap.Int("cumulative", scorer.outbound),
+					zap.Int("status_code", resp.statusCode),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+			}
 		case "block", "honeypot":
 			return &outboundAction{action: "block", rule: cr.rule}
 		case "response_header":
@@ -1113,12 +1135,21 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 				if zone != nil {
 					key := resolveRateLimitKey(cr.rlConfig.Key, r, nil)
 					now := time.Now()
-					allowed, _, _ := zone.allow(key, now)
+					allowed, count, limit := zone.allow(key, now)
 					if !allowed {
 						if cr.rlConfig.Action != "log_only" {
 							return &outboundAction{action: "rate_limit_block", rule: cr.rule}
 						}
-						// log_only: continue evaluation, just record
+						if pe.logger != nil {
+							pe.logger.Info("outbound rate limit monitor (log_only)",
+								zap.String("rule_id", cr.rule.ID),
+								zap.String("rule_name", cr.rule.Name),
+								zap.String("key", key),
+								zap.Int64("count", count),
+								zap.Int("limit", limit),
+								zap.String("client_ip", clientIP(r)),
+								zap.String("uri", r.RequestURI))
+						}
 					}
 				}
 			}
@@ -3503,6 +3534,9 @@ func (pe *PolicyEngine) checkReload() {
 			if pe.rlState != nil {
 				pe.rlState.updateZones(nil)
 			}
+		} else {
+			pe.logger.Warn("rules file stat error, skipping reload check",
+				zap.String("file", pe.RulesFile), zap.Error(err))
 		}
 		return
 	}
@@ -3521,6 +3555,9 @@ func (pe *PolicyEngine) checkReload() {
 		} else if os.IsNotExist(dErr) && !pe.lastDefaultMod.IsZero() {
 			// Default file removed — trigger reload to clear defaults.
 			rulesChanged = true
+		} else if dErr != nil && !os.IsNotExist(dErr) {
+			pe.logger.Warn("default rules file stat error, skipping reload check",
+				zap.String("file", pe.DefaultRulesFile), zap.Error(dErr))
 		}
 	}
 
@@ -3579,7 +3616,10 @@ func (pe *PolicyEngine) loadFromFile() error {
 	}
 
 	// Parse global rate limit config.
-	globalCfg := compileRLGlobalConfig(file.RateLimitConfig)
+	globalCfg, err := compileRLGlobalConfig(file.RateLimitConfig)
+	if err != nil {
+		return fmt.Errorf("compiling rate limit config: %w", err)
+	}
 
 	// Compile response headers (CSP + security) for O(1) per-request lookup.
 	respHeaders, err := compileResponseHeaders(file.ResponseHeaders)

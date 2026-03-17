@@ -493,15 +493,19 @@ func isValidRLKey(key string) bool {
 }
 
 // compileRLGlobalConfig parses the global rate limit config.
-func compileRLGlobalConfig(cfg *RateLimitGlobalConfig) *parsedRLGlobalConfig {
+func compileRLGlobalConfig(cfg *RateLimitGlobalConfig) (*parsedRLGlobalConfig, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 	parsed := &parsedRLGlobalConfig{
 		jitter: cfg.Jitter,
 	}
 	if cfg.SweepInterval != "" {
-		if d, err := parseWindow(cfg.SweepInterval); err == nil && d > 0 {
+		d, err := parseWindow(cfg.SweepInterval)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sweep_interval %q: %w", cfg.SweepInterval, err)
+		}
+		if d > 0 {
 			parsed.parsedSweep = d
 		}
 	}
@@ -511,7 +515,7 @@ func compileRLGlobalConfig(cfg *RateLimitGlobalConfig) *parsedRLGlobalConfig {
 	if parsed.jitter > 1 {
 		parsed.jitter = 1
 	}
-	return parsed
+	return parsed, nil
 }
 
 // ─── Response Helpers ───────────────────────────────────────────────

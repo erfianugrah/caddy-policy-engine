@@ -624,7 +624,10 @@ func TestCompileRLGlobalConfig(t *testing.T) {
 		SweepInterval: "30s",
 		Jitter:        0.5,
 	}
-	parsed := compileRLGlobalConfig(cfg)
+	parsed, err := compileRLGlobalConfig(cfg)
+	if err != nil {
+		t.Fatalf("compileRLGlobalConfig: %v", err)
+	}
 	if parsed.parsedSweep != 30*time.Second {
 		t.Errorf("sweep: want 30s, got %s", parsed.parsedSweep)
 	}
@@ -634,21 +637,38 @@ func TestCompileRLGlobalConfig(t *testing.T) {
 }
 
 func TestCompileRLGlobalConfig_Nil(t *testing.T) {
-	parsed := compileRLGlobalConfig(nil)
+	parsed, err := compileRLGlobalConfig(nil)
+	if err != nil {
+		t.Fatalf("compileRLGlobalConfig: %v", err)
+	}
 	if parsed != nil {
 		t.Error("nil config should return nil")
 	}
 }
 
+func TestCompileRLGlobalConfig_InvalidSweepInterval(t *testing.T) {
+	cfg := &RateLimitGlobalConfig{SweepInterval: "not-a-duration"}
+	_, err := compileRLGlobalConfig(cfg)
+	if err == nil {
+		t.Error("expected error for invalid sweep_interval")
+	}
+}
+
 func TestCompileRLGlobalConfig_ClampJitter(t *testing.T) {
 	cfg := &RateLimitGlobalConfig{Jitter: 2.0}
-	parsed := compileRLGlobalConfig(cfg)
+	parsed, err := compileRLGlobalConfig(cfg)
+	if err != nil {
+		t.Fatalf("compileRLGlobalConfig: %v", err)
+	}
 	if parsed.jitter != 1.0 {
 		t.Errorf("jitter > 1 should be clamped to 1.0, got %f", parsed.jitter)
 	}
 
 	cfg2 := &RateLimitGlobalConfig{Jitter: -1.0}
-	parsed2 := compileRLGlobalConfig(cfg2)
+	parsed2, err := compileRLGlobalConfig(cfg2)
+	if err != nil {
+		t.Fatalf("compileRLGlobalConfig: %v", err)
+	}
 	if parsed2.jitter != 0.0 {
 		t.Errorf("jitter < 0 should be clamped to 0.0, got %f", parsed2.jitter)
 	}
