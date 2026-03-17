@@ -3503,6 +3503,135 @@ func TestDetect_InvalidParanoiaLevel_Rejected(t *testing.T) {
 	}
 }
 
+func TestDetect_LogOnly_DoesNotScore(t *testing.T) {
+	// A log_only rule should match but NOT contribute to the anomaly score.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "log only rule", Type: "detect", Enabled: true,
+			Priority: 400, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Action: "log_only",
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 4, InboundThreshold: 5})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Fatal("next handler should be called — log_only rule should not block")
+	}
+	// Anomaly score should be 0 (log_only rule's score is not accumulated).
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "" && score != "0" {
+		t.Errorf("expected anomaly_score empty or 0 for log_only, got %q", score)
+	}
+}
+
+func TestDetect_LogOnly_MixedWithScoring(t *testing.T) {
+	// Mix of log_only and scoring rules. Only the scoring rule should
+	// contribute to the threshold.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "scoring rule", Type: "detect", Enabled: true,
+			Priority: 400, Severity: "WARNING", ParanoiaLevel: 1,
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+		{
+			ID: "d2", Name: "log only rule", Type: "detect", Enabled: true,
+			Priority: 401, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Action: "log_only",
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/test"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 4, InboundThreshold: 5})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/test", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Scoring rule adds 3 (WARNING), log_only adds 0. 3 < 5 → passes.
+	if !next.called {
+		t.Fatal("next handler should be called — score 3 < threshold 5")
+	}
+	score, _ := caddyhttp.GetVar(r.Context(), "policy_engine.anomaly_score").(string)
+	if score != "3" {
+		t.Errorf("expected anomaly_score=3 (WARNING only, log_only excluded), got %q", score)
+	}
+	// detect_rules should include BOTH rules (log_only annotated).
+	detectRules, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_rules").(string)
+	if detectRules == "" {
+		t.Fatal("expected detect_rules to be set")
+	}
+	if !strings.Contains(detectRules, "d2:CRITICAL:5:log_only") {
+		t.Errorf("expected log_only annotation in detect_rules, got %q", detectRules)
+	}
+}
+
+func TestDetect_LogOnly_WouldHaveBlocked(t *testing.T) {
+	// CRITICAL log_only rule WOULD push score over threshold if scoring.
+	// Verify it doesn't block.
+	path := writeTempRulesFileWithConfig(t, []PolicyRule{
+		{
+			ID: "d1", Name: "critical log only", Type: "detect", Enabled: true,
+			Priority: 400, Severity: "CRITICAL", ParanoiaLevel: 1,
+			Action: "log_only",
+			Conditions: []PolicyCondition{
+				{Field: "path", Operator: "contains", Value: "/attack"},
+			},
+		},
+	}, &WafConfig{ParanoiaLevel: 4, InboundThreshold: 5})
+
+	pe := &PolicyEngine{RulesFile: path}
+	mustProvision(t, pe)
+
+	r := makeRequest("GET", "/attack", "10.0.0.1:1234")
+	w := httptest.NewRecorder()
+	next := &nextHandler{}
+	err := pe.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !next.called {
+		t.Fatal("next handler should be called — log_only should not trigger blocking")
+	}
+}
+
+func TestDetect_InvalidAction_Rejected(t *testing.T) {
+	rule := PolicyRule{
+		ID: "d1", Name: "test", Type: "detect", Enabled: true,
+		Priority: 150, Severity: "CRITICAL", ParanoiaLevel: 1,
+		Action: "block",
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "eq", Value: "/"},
+		},
+	}
+	_, err := compileRule(rule)
+	if err == nil {
+		t.Fatal("expected error for invalid action")
+	}
+	if !strings.Contains(err.Error(), "unknown action") {
+		t.Errorf("expected 'unknown action' error, got: %v", err)
+	}
+}
+
 func TestCompileWafConfig_Nil(t *testing.T) {
 	c := compileWafConfig(nil)
 	if c != nil {

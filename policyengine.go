@@ -182,6 +182,7 @@ type matchedRule struct {
 	ruleName string
 	severity string
 	score    int
+	logOnly  bool          // true if rule is log_only (score not counted toward threshold)
 	matches  []matchDetail // per-condition match details (nil for non-detect)
 }
 
@@ -219,6 +220,7 @@ type PolicyRule struct {
 	Severity      string `json:"severity,omitempty"`       // CRITICAL(5), ERROR(4), WARNING(3), NOTICE(2)
 	ParanoiaLevel int    `json:"paranoia_level,omitempty"` // 1-4; rule only evaluates if configured PL >= this
 	Phase         string `json:"phase,omitempty"`          // "inbound" (default) or "outbound" — outbound rules evaluate after upstream response
+	Action        string `json:"action,omitempty"`         // "" (default=score) or "log_only" — evaluate & log but don't add to anomaly score
 
 	// Skip rule fields (selective bypass)
 	SkipTargets *SkipTargets `json:"skip_targets,omitempty"`
@@ -269,6 +271,7 @@ type compiledRule struct {
 	needsBody   bool                 // true if any condition or RL key uses body/body_json/body_form
 	rlConfig    *compiledRLConfig    // non-nil for rate_limit rules
 	score       int                  // severity-derived score for detect rules (0 for non-detect)
+	logOnly     bool                 // true if detect rule should evaluate & log but not contribute to anomaly score
 	skipTargets *compiledSkipTargets // non-nil for skip rules
 	outbound    bool                 // true if this rule evaluates in the response phase (post-upstream)
 }
@@ -727,12 +730,18 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		case "detect":
 			// Pass 3: anomaly scoring — accumulate score, don't terminate.
-			scorer.inbound += cr.score
+			// Log-only rules are recorded for observability but don't count toward
+			// the anomaly threshold. This enables WAF tuning: promote rules from
+			// disabled → log_only → scoring as confidence grows.
+			if !cr.logOnly {
+				scorer.inbound += cr.score
+			}
 			scorer.matched = append(scorer.matched, matchedRule{
 				ruleID:   cr.rule.ID,
 				ruleName: cr.rule.Name,
 				severity: cr.rule.Severity,
 				score:    cr.score,
+				logOnly:  cr.logOnly,
 				matches:  detectDetails,
 			})
 			pe.logger.Debug("detect rule matched",
@@ -740,6 +749,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("rule_name", cr.rule.Name),
 				zap.String("severity", cr.rule.Severity),
 				zap.Int("score", cr.score),
+				zap.Bool("log_only", cr.logOnly),
 				zap.Int("cumulative", scorer.inbound),
 				zap.Int("match_details", len(detectDetails)),
 				zap.String("client_ip", clientIP(r)),
@@ -854,8 +864,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		tagSeen := map[string]bool{}
 		for _, m := range scorer.matched {
 			ruleNames = append(ruleNames, m.ruleID)
-			// Format: "920350:WARNING:3" (id:severity:score)
-			ruleDetails = append(ruleDetails, m.ruleID+":"+m.severity+":"+strconv.Itoa(m.score))
+			// Format: "920350:WARNING:3" (id:severity:score) or "920350:WARNING:3:log_only"
+			detail := m.ruleID + ":" + m.severity + ":" + strconv.Itoa(m.score)
+			if m.logOnly {
+				detail += ":log_only"
+			}
+			ruleDetails = append(ruleDetails, detail)
 		}
 		// Look up tags via O(1) map instead of scanning all rules.
 		for _, m := range scorer.matched {
@@ -1105,12 +1119,15 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 
 		switch cr.rule.Type {
 		case "detect":
-			scorer.outbound += cr.score
+			if !cr.logOnly {
+				scorer.outbound += cr.score
+			}
 			scorer.matched = append(scorer.matched, matchedRule{
 				ruleID:   cr.rule.ID,
 				ruleName: cr.rule.Name,
 				severity: cr.rule.Severity,
 				score:    cr.score,
+				logOnly:  cr.logOnly,
 			})
 			if pe.logger != nil {
 				pe.logger.Debug("outbound detect rule matched",
@@ -1118,6 +1135,7 @@ func (pe *PolicyEngine) evaluateOutbound(rules []compiledRule, resp *responseCon
 					zap.String("rule_name", cr.rule.Name),
 					zap.String("severity", cr.rule.Severity),
 					zap.Int("score", cr.score),
+					zap.Bool("log_only", cr.logOnly),
 					zap.Int("cumulative", scorer.outbound),
 					zap.Int("status_code", resp.statusCode),
 					zap.String("client_ip", clientIP(r)),
@@ -3002,6 +3020,12 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		cr.score = score
 		if rule.ParanoiaLevel < 0 || rule.ParanoiaLevel > 4 {
 			return cr, fmt.Errorf("paranoia_level must be 0-4, got %d", rule.ParanoiaLevel)
+		}
+		// Log-only detect rules evaluate and log but don't contribute to anomaly score.
+		if rule.Action == "log_only" {
+			cr.logOnly = true
+		} else if rule.Action != "" {
+			return cr, fmt.Errorf("unknown action %q (must be empty or \"log_only\")", rule.Action)
 		}
 	}
 
