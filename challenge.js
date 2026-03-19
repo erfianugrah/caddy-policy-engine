@@ -9,7 +9,7 @@
   if (!data) return;
 
   const config = JSON.parse(data.textContent);
-  const { random_data, difficulty, hmac, original_url, timestamp } = config;
+  const { random_data, difficulty, hmac, original_url, timestamp, algorithm } = config;
 
   const likelihood = Math.pow(16, -difficulty);
   const t0 = Date.now();
@@ -51,7 +51,8 @@
   const threads = Math.max(Math.floor(cores / 2), 1);
 
   if (canUseWorkers) {
-    if (statusEl) statusEl.textContent = "Computing proof-of-work (" + threads + " threads, difficulty " + difficulty + ")...";
+    const algoLabel = (algorithm === "slow") ? "slow mode, " : "";
+    if (statusEl) statusEl.textContent = "Computing proof-of-work (" + algoLabel + threads + " threads, difficulty " + difficulty + ")...";
     if (progressEl) progressEl.style.display = "inline-block";
 
     const workerURL = "/.well-known/policy-challenge/worker.js";
@@ -92,6 +93,7 @@
             difficulty: difficulty,
             nonce: i,
             threads: threads,
+            algorithm: algorithm || "fast",
           });
 
           workers.push(w);

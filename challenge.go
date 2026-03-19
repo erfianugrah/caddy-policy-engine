@@ -57,6 +57,7 @@ type compiledChallengeConfig struct {
 type challengePayload struct {
 	RandomData  string `json:"random_data"`
 	Difficulty  int    `json:"difficulty"`
+	Algorithm   string `json:"algorithm"`
 	HMAC        string `json:"hmac"`
 	OriginalURL string `json:"original_url"`
 	Timestamp   string `json:"timestamp"`
@@ -204,6 +205,7 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 	challengeData := challengePayload{
 		RandomData:  randomData,
 		Difficulty:  cfg.difficulty,
+		Algorithm:   cfg.algorithm,
 		HMAC:        payloadHMAC,
 		OriginalURL: originalURL,
 		Timestamp:   strconv.FormatInt(now.Unix(), 10),

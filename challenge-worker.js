@@ -11,10 +11,11 @@ const toHex = (arr) => {
 };
 
 addEventListener("message", async ({ data: msg }) => {
-  const { data, difficulty, nonce: startNonce, threads } = msg;
+  const { data, difficulty, nonce: startNonce, threads, algorithm } = msg;
   let nonce = startNonce;
   const isMainThread = startNonce === 0;
   let iterations = 0;
+  const isSlow = algorithm === "slow";
 
   const requiredZeroBytes = Math.floor(difficulty / 2);
   const isDifficultyOdd = difficulty % 2 !== 0;
@@ -23,6 +24,10 @@ addEventListener("message", async ({ data: msg }) => {
   const hasWebCrypto = typeof crypto !== "undefined" && crypto.subtle;
 
   for (;;) {
+    // "slow" algorithm: deliberate 10ms delay per iteration.
+    // Intentionally wastes CPU time — used as punishment for suspected bots.
+    if (isSlow) await new Promise(r => setTimeout(r, 10));
+
     const input = data + nonce;
     let hashArray;
 
