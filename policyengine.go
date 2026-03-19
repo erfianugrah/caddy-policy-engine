@@ -111,6 +111,10 @@ type PolicyEngine struct {
 	respHeaders    *compiledResponseHeaders // CSP + security headers
 	wafConfig      *compiledWafConfig       // anomaly scoring thresholds
 	stopSweep      chan struct{}
+
+	// Challenge state
+	challengeHMACKey []byte // 32-byte HMAC-SHA256 key for cookie signing
+	challengeEnabled bool   // true if any challenge rules exist in the loaded config
 }
 
 // PolicyRulesFile is the top-level JSON structure of the user rules file.
@@ -120,6 +124,7 @@ type PolicyRulesFile struct {
 	RateLimitConfig      *RateLimitGlobalConfig `json:"rate_limit_config,omitempty"`
 	ResponseHeaders      *ResponseHeaderConfig  `json:"response_headers,omitempty"`
 	WafConfig            *WafConfig             `json:"waf_config,omitempty"`
+	ChallengeConfig      *ChallengeGlobalConfig `json:"challenge_config,omitempty"`
 	Generated            string                 `json:"generated"`
 	Version              int                    `json:"version"`
 }
@@ -207,11 +212,12 @@ type keyedValue struct {
 type PolicyRule struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
-	Type       string            `json:"type"`              // "allow", "block", "honeypot", "skip", "rate_limit", "detect"
-	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit, detect, and skip rules)
+	Type       string            `json:"type"`              // "allow", "block", "honeypot", "challenge", "skip", "rate_limit", "detect"
+	Service    string            `json:"service,omitempty"` // hostname or "*" (rate_limit, detect, skip, and challenge rules)
 	Conditions []PolicyCondition `json:"conditions"`
 	GroupOp    string            `json:"group_op"` // "and" or "or"
 	RateLimit  *RateLimitConfig  `json:"rate_limit,omitempty"`
+	Challenge  *ChallengeConfig  `json:"challenge,omitempty"` // PoW challenge settings
 	Tags       []string          `json:"tags,omitempty"`
 	Enabled    bool              `json:"enabled"`
 	Priority   int               `json:"priority"`
@@ -266,24 +272,26 @@ type PolicyCondition struct {
 // ─── Compiled State ─────────────────────────────────────────────────
 
 type compiledRule struct {
-	rule        PolicyRule
-	conditions  []compiledCondition
-	needsBody   bool                 // true if any condition or RL key uses body/body_json/body_form
-	rlConfig    *compiledRLConfig    // non-nil for rate_limit rules
-	score       int                  // severity-derived score for detect rules (0 for non-detect)
-	logOnly     bool                 // true if detect rule should evaluate & log but not contribute to anomaly score
-	skipTargets *compiledSkipTargets // non-nil for skip rules
-	outbound    bool                 // true if this rule evaluates in the response phase (post-upstream)
+	rule            PolicyRule
+	conditions      []compiledCondition
+	needsBody       bool                     // true if any condition or RL key uses body/body_json/body_form
+	rlConfig        *compiledRLConfig        // non-nil for rate_limit rules
+	challengeConfig *compiledChallengeConfig // non-nil for challenge rules
+	score           int                      // severity-derived score for detect rules (0 for non-detect)
+	logOnly         bool                     // true if detect rule should evaluate & log but not contribute to anomaly score
+	skipTargets     *compiledSkipTargets     // non-nil for skip rules
+	outbound        bool                     // true if this rule evaluates in the response phase (post-upstream)
 }
 
 // compiledSkipTargets is the pre-compiled form of SkipTargets.
 // Rule IDs are stored in a hash set for O(1) lookup during evaluation.
 type compiledSkipTargets struct {
-	ruleIDs      map[string]bool // specific rule IDs to skip
-	skipDetect   bool            // true if "detect" phase should be skipped
-	skipRL       bool            // true if "rate_limit" phase should be skipped
-	skipBlock    bool            // true if "block" phase should be skipped
-	allRemaining bool            // skip everything below this rule
+	ruleIDs       map[string]bool // specific rule IDs to skip
+	skipDetect    bool            // true if "detect" phase should be skipped
+	skipRL        bool            // true if "rate_limit" phase should be skipped
+	skipBlock     bool            // true if "block" phase should be skipped
+	skipChallenge bool            // true if "challenge" phase should be skipped
+	allRemaining  bool            // skip everything below this rule
 }
 
 type compiledCondition struct {
@@ -535,19 +543,37 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 
-	// ── 6-pass evaluation ──────────────────────────────────────────
+	// ── Challenge verification endpoint ─────────────────────────────
+	// Handle POST to /.well-known/policy-challenge/verify before any
+	// rule evaluation. This path is implicitly allowed — it must never
+	// be challenged, blocked, or rate-limited.
+	if pe.challengeEnabled && r.URL.Path == "/.well-known/policy-challenge/verify" && r.Method == "POST" {
+		return pe.handleChallengeVerify(w, r)
+	}
+
+	// ── Challenge cookie check ──────────────────────────────────────
+	// If any challenge rules exist, check for a valid challenge cookie.
+	// Valid cookie → set flag, skip challenge rules in main loop.
+	var challengePassed bool
+	if pe.challengeEnabled {
+		challengePassed = pe.validateChallengeCookie(r)
+	}
+
+	// ── 7-pass evaluation ──────────────────────────────────────────
 	//
-	// Pass 1 — Allow (50-99):   full bypass, terminates immediately.
-	// Pass 2 — Block (100-199): deny list, terminates with 403. Skippable.
-	// Pass 3 — Skip (200-299):  selective bypass, accumulates skip flags.
+	// Pass 1 — Allow (50-99):       full bypass, terminates immediately.
+	// Pass 2 — Block (100-149):     deny list, terminates with 403. Skippable.
+	// Pass 3 — Challenge (150-199): PoW interstitial. Skippable. Cookie bypass.
+	// Pass 4 — Skip (200-299):      selective bypass, accumulates skip flags.
 	//          Non-terminating (evaluation continues for non-skipped types).
-	// Pass 4 — Rate limit (300-399): sliding window counters. Skippable.
-	// Pass 5 — Detect (400-499): CRS anomaly scoring. Skippable.
+	// Pass 5 — Rate limit (300-399): sliding window counters. Skippable.
+	// Pass 6 — Detect (400-499):     CRS anomaly scoring. Skippable.
+	// Pass 7 — Response Header (500-599): set/add/remove/default response headers.
 	//
 	// Rules are sorted by priority so a single loop handles all passes.
 	// Skip rules accumulate flags that suppress downstream evaluation:
 	//   - skip_targets.all_remaining: skip everything below
-	//   - skip_targets.phases: skip entire phases (detect, rate_limit, block)
+	//   - skip_targets.phases: skip entire phases (detect, rate_limit, block, challenge)
 	//   - skip_targets.rules: skip specific rule IDs
 	//
 	// After the loop: if accumulated score > threshold → 403 (detect_block).
@@ -557,11 +583,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	var allowMatched bool
 	var scorer scoreAccumulator
 
-	// Skip state — accumulated from skip rules (pass 3).
+	// Skip state — accumulated from skip rules (pass 4).
 	var skipAllRemaining bool
 	var skipDetect bool
 	var skipRL bool
 	var skipBlock bool
+	var skipChallenge bool
 	skipRuleIDs := map[string]bool{}
 
 	// Resolve per-service WAF config for this request.
@@ -575,7 +602,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		// Service matching for service-scoped rule types.
-		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect" || cr.rule.Type == "skip") && !matchService(cr.rule.Service, r) {
+		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect" || cr.rule.Type == "skip" || cr.rule.Type == "challenge") && !matchService(cr.rule.Service, r) {
 			continue
 		}
 
@@ -590,6 +617,11 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// suppressed by upstream skip rules.
 		if cr.rule.Type == "block" || cr.rule.Type == "honeypot" {
 			if skipAllRemaining || skipBlock || skipRuleIDs[cr.rule.ID] {
+				continue
+			}
+		}
+		if cr.rule.Type == "challenge" {
+			if skipAllRemaining || skipChallenge || skipRuleIDs[cr.rule.ID] {
 				continue
 			}
 		}
@@ -694,8 +726,40 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.String("uri", r.RequestURI))
 			return caddyhttp.Error(http.StatusForbidden, nil)
 
+		case "challenge":
+			// Pass 3: proof-of-work challenge — serve interstitial or validate cookie.
+			if challengePassed {
+				// Valid cookie — log bypass, continue evaluation.
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_bypassed")
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+				pe.logger.Debug("challenge bypassed (valid cookie)",
+					zap.String("rule_id", cr.rule.ID),
+					zap.String("rule_name", cr.rule.Name),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				// Continue — do not terminate. Let downstream rules (skip, RL, detect) evaluate.
+
+			} else {
+				// No valid cookie — serve challenge interstitial (terminates handler chain).
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_issued")
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+				if len(cr.rule.Tags) > 0 {
+					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+				}
+				pe.logger.Info("challenge issued",
+					zap.String("rule_id", cr.rule.ID),
+					zap.String("rule_name", cr.rule.Name),
+					zap.Int("difficulty", cr.challengeConfig.difficulty),
+					zap.String("algorithm", cr.challengeConfig.algorithm),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				return pe.serveChallengeInterstitial(w, r, cr.challengeConfig)
+			}
+
 		case "skip":
-			// Pass 3: selective bypass — accumulate skip flags, non-terminating.
+			// Pass 4: selective bypass — accumulate skip flags, non-terminating.
 			// Merge this rule's skip_targets into the running skip state.
 			if cr.skipTargets != nil {
 				if cr.skipTargets.allRemaining {
@@ -709,6 +773,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				}
 				if cr.skipTargets.skipBlock {
 					skipBlock = true
+				}
+				if cr.skipTargets.skipChallenge {
+					skipChallenge = true
 				}
 				for id := range cr.skipTargets.ruleIDs {
 					skipRuleIDs[id] = true
@@ -2967,6 +3034,7 @@ var validRuleTypes = map[string]bool{
 	"allow":           true,
 	"block":           true,
 	"honeypot":        true,
+	"challenge":       true,
 	"skip":            true,
 	"rate_limit":      true,
 	"detect":          true,
@@ -2978,6 +3046,7 @@ var validSkipPhases = map[string]bool{
 	"detect":     true,
 	"rate_limit": true,
 	"block":      true,
+	"challenge":  true,
 }
 
 // severityScores maps severity strings to anomaly score points.
@@ -2995,18 +3064,18 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 	// Validate rule type early — unknown types would silently match
 	// conditions but take no action in ServeHTTP.
 	if !validRuleTypes[rule.Type] {
-		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, skip, rate_limit, or detect)", rule.Type)
+		return cr, fmt.Errorf("unsupported rule type %q (must be allow, block, honeypot, challenge, skip, rate_limit, or detect)", rule.Type)
 	}
 
 	// Reject user-created rules with zero conditions — they would match all
-	// Zero-condition guard: allow/block/honeypot/skip rules with no conditions match all
-	// requests, which is almost certainly a misconfiguration. Rate-limit and detect rules
-	// are exempt — rate_limit rules are bounded by their key (not conditions), and detect
-	// rules (CRS) may intentionally apply unconditionally for anomaly scoring.
+	// Zero-condition guard: allow/block/honeypot/skip/challenge rules with no conditions
+	// match all requests, which is almost certainly a misconfiguration. Rate-limit and
+	// detect rules are exempt — rate_limit rules are bounded by their key (not conditions),
+	// and detect rules (CRS) may intentionally apply unconditionally for anomaly scoring.
 	// Response_header rules are also exempt (apply to all responses).
 	if len(rule.Conditions) == 0 {
 		switch rule.Type {
-		case "allow", "block", "honeypot", "skip":
+		case "allow", "block", "honeypot", "skip", "challenge":
 			return cr, fmt.Errorf("rule %q (%s) has no conditions and would match all requests", rule.Name, rule.ID)
 		}
 	}
@@ -3031,6 +3100,39 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		cr.rlConfig = rlCfg
 		if rlCfg.needsBody {
 			cr.needsBody = true
+		}
+	}
+
+	// Compile challenge config.
+	if rule.Type == "challenge" {
+		if rule.Challenge == nil {
+			return cr, fmt.Errorf("challenge rules must have a challenge config")
+		}
+		diff := rule.Challenge.Difficulty
+		if diff <= 0 {
+			diff = 4
+		}
+		if diff > 16 {
+			diff = 16
+		}
+		algo := rule.Challenge.Algorithm
+		if algo == "" {
+			algo = "fast"
+		}
+		ttl := time.Duration(rule.Challenge.TTLSeconds) * time.Second
+		if ttl <= 0 {
+			ttl = 7 * 24 * time.Hour
+		}
+		svc := rule.Service
+		if svc == "" {
+			svc = "_global"
+		}
+		cr.challengeConfig = &compiledChallengeConfig{
+			difficulty: diff,
+			algorithm:  algo,
+			ttl:        ttl,
+			bindIP:     rule.Challenge.BindIP,
+			cookieName: challengeCookieName(svc),
 		}
 	}
 
@@ -3104,6 +3206,8 @@ func compileSkipTargets(st *SkipTargets) (*compiledSkipTargets, error) {
 			cst.skipRL = true
 		case "block":
 			cst.skipBlock = true
+		case "challenge":
+			cst.skipChallenge = true
 		}
 	}
 	return cst, nil
@@ -3687,6 +3791,19 @@ func (pe *PolicyEngine) loadFromFile() error {
 
 	// Compile WAF config (anomaly scoring thresholds + paranoia levels).
 	wafCfg := compileWafConfig(file.WafConfig)
+
+	// Provision challenge HMAC key and detect if any challenge rules exist.
+	hasChallengeRules := false
+	for _, cr := range compiled {
+		if cr.rule.Type == "challenge" && cr.rule.Enabled {
+			hasChallengeRules = true
+			break
+		}
+	}
+	if hasChallengeRules && len(pe.challengeHMACKey) == 0 {
+		pe.provisionChallengeKey(file.ChallengeConfig)
+	}
+	pe.challengeEnabled = hasChallengeRules
 
 	// Check if sweep interval changed (need to restart sweep goroutine).
 	oldSweepInterval := pe.sweepInterval()
