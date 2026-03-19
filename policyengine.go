@@ -547,13 +547,15 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// Handle challenge endpoints before any rule evaluation. These paths
 	// are implicitly allowed — they must never be challenged, blocked,
 	// or rate-limited.
-	if pe.challengeEnabled && strings.HasPrefix(r.URL.Path, "/.well-known/policy-challenge/") {
+	if strings.HasPrefix(r.URL.Path, "/.well-known/policy-challenge/") {
 		switch r.URL.Path {
 		case "/.well-known/policy-challenge/verify":
-			if r.Method == "POST" {
+			if pe.challengeEnabled && r.Method == "POST" {
 				return pe.handleChallengeVerify(w, r)
 			}
 		case "/.well-known/policy-challenge/worker.js":
+			// Worker JS is always served — the interstitial page references it,
+			// and it must be available before challenge rules are hot-reloaded.
 			return pe.serveChallengeWorkerJS(w, r)
 		}
 	}
