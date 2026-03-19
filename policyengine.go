@@ -543,12 +543,19 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 
-	// ── Challenge verification endpoint ─────────────────────────────
-	// Handle POST to /.well-known/policy-challenge/verify before any
-	// rule evaluation. This path is implicitly allowed — it must never
-	// be challenged, blocked, or rate-limited.
-	if pe.challengeEnabled && r.URL.Path == "/.well-known/policy-challenge/verify" && r.Method == "POST" {
-		return pe.handleChallengeVerify(w, r)
+	// ── Challenge reserved paths ────────────────────────────────────
+	// Handle challenge endpoints before any rule evaluation. These paths
+	// are implicitly allowed — they must never be challenged, blocked,
+	// or rate-limited.
+	if pe.challengeEnabled && strings.HasPrefix(r.URL.Path, "/.well-known/policy-challenge/") {
+		switch r.URL.Path {
+		case "/.well-known/policy-challenge/verify":
+			if r.Method == "POST" {
+				return pe.handleChallengeVerify(w, r)
+			}
+		case "/.well-known/policy-challenge/worker.js":
+			return pe.serveChallengeWorkerJS(w, r)
+		}
 	}
 
 	// ── Challenge cookie check ──────────────────────────────────────

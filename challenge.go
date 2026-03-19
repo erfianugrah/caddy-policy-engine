@@ -25,6 +25,9 @@ var challengeHTMLTemplate string
 //go:embed challenge.js
 var challengeJS string
 
+//go:embed challenge-worker.js
+var challengeWorkerJS string
+
 // ─── Types ──────────────────────────────────────────────────────────
 
 // ChallengeConfig is the per-rule challenge configuration in policy-rules.json.
@@ -65,6 +68,20 @@ type challengeCookiePayload struct {
 	Aud string `json:"aud"` // Service hostname
 	Exp int64  `json:"exp"` // Unix timestamp
 	Dif int    `json:"dif"` // Difficulty solved at
+}
+
+// ─── Worker JS Serving ──────────────────────────────────────────────
+
+// serveChallengeWorkerJS serves the Web Worker JS file at
+// /.well-known/policy-challenge/worker.js. Served with aggressive caching
+// since the content is deterministic (changes only on plugin binary update).
+func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Request) error {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(challengeWorkerJS))
+	return nil
 }
 
 // ─── Cookie Name ────────────────────────────────────────────────────

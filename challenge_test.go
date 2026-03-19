@@ -263,8 +263,8 @@ func TestServeChallengeInterstitial(t *testing.T) {
 	if !strings.Contains(body, "random_data") {
 		t.Error("body should contain challenge data with random_data")
 	}
-	if !strings.Contains(body, "crypto.subtle.digest") {
-		t.Error("body should contain the JS PoW solver")
+	if !strings.Contains(body, "/.well-known/policy-challenge/worker.js") {
+		t.Error("body should contain worker.js URL for Web Workers")
 	}
 }
 
@@ -383,6 +383,47 @@ func TestCompileChallengeRuleNoConditions(t *testing.T) {
 	_, err := compileRule(rule)
 	if err == nil {
 		t.Error("expected error for challenge rule without conditions")
+	}
+}
+
+// ─── Worker JS Serving ──────────────────────────────────────────────
+
+func TestServeChallengeWorkerJS(t *testing.T) {
+	pe := &PolicyEngine{
+		challengeEnabled: true,
+		logger:           zap.NewNop(),
+	}
+
+	r := makeRequest("GET", "/.well-known/policy-challenge/worker.js", "1.2.3.4:5678")
+	w := httptest.NewRecorder()
+
+	err := pe.serveChallengeWorkerJS(w, r)
+	if err != nil {
+		t.Fatalf("serveChallengeWorkerJS returned error: %v", err)
+	}
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/javascript") {
+		t.Errorf("Content-Type = %q, want application/javascript", ct)
+	}
+	cc := resp.Header.Get("Cache-Control")
+	if !strings.Contains(cc, "public") || !strings.Contains(cc, "max-age=86400") {
+		t.Errorf("Cache-Control = %q, want public, max-age=86400", cc)
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "addEventListener") {
+		t.Error("worker JS missing addEventListener")
+	}
+	if !strings.Contains(body, "crypto.subtle.digest") {
+		t.Error("worker JS missing WebCrypto digest call")
+	}
+	if !strings.Contains(body, "sha256Fallback") {
+		t.Error("worker JS missing pure-JS fallback")
 	}
 }
 
