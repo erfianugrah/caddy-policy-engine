@@ -342,8 +342,8 @@ func TestCompileChallengeRuleDefaults(t *testing.T) {
 	if cr.challengeConfig.algorithm != "fast" {
 		t.Errorf("default algorithm = %q, want fast", cr.challengeConfig.algorithm)
 	}
-	if cr.challengeConfig.ttl != 7*24*time.Hour {
-		t.Errorf("default ttl = %v, want 168h", cr.challengeConfig.ttl)
+	if cr.challengeConfig.ttl != time.Hour {
+		t.Errorf("default ttl = %v, want 1h", cr.challengeConfig.ttl)
 	}
 }
 

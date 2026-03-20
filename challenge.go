@@ -466,8 +466,8 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	cookieName := challengeCookieName(host)
 
 	// Find the matching challenge rule's TTL and bind_ip setting.
-	// Default to 7 days if no matching rule found (shouldn't happen in practice).
-	ttl := 7 * 24 * time.Hour
+	// Default to 1 hour if no matching rule found (shouldn't happen in practice).
+	ttl := time.Hour
 	bindIP := true
 	pe.mu.RLock()
 	for _, cr := range pe.rules {

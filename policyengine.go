@@ -3130,7 +3130,7 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		}
 		ttl := time.Duration(rule.Challenge.TTLSeconds) * time.Second
 		if ttl <= 0 {
-			ttl = 7 * 24 * time.Hour
+			ttl = time.Hour // default 1h
 		}
 		svc := rule.Service
 		if svc == "" {
