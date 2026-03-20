@@ -92,24 +92,30 @@ func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Re
 
 // botSignals is the parsed client-side environment probe data.
 type botSignals struct {
-	Webdriver      int     `json:"wd"`   // 1 = navigator.webdriver true
-	CDCPresent     int     `json:"cdc"`  // 1 = ChromeDriver markers found
-	ChromeRuntime  int     `json:"cr"`   // 1 = window.chrome.runtime present
-	PluginCount    int     `json:"plg"`  // navigator.plugins.length
-	LanguageCount  int     `json:"lang"` // navigator.languages.length
-	SpeechVoices   int     `json:"sv"`   // speechSynthesis voices count
-	WebGLRenderer  string  `json:"wglr"` // UNMASKED_RENDERER_WEBGL
-	WebGLVendor    string  `json:"wglv"` // UNMASKED_VENDOR_WEBGL
-	Cores          int     `json:"cores"`
-	Memory         float64 `json:"mem"`
-	TouchPoints    int     `json:"touch"`
-	Platform       string  `json:"plt"`
-	ScreenWidth    int     `json:"sw"`
-	ScreenHeight   int     `json:"sh"`
-	ColorDepth     int     `json:"cd"`
-	PixelRatio     float64 `json:"dpr"`
-	CanvasHash     string  `json:"cvs"`
-	PermissionTime float64 `json:"pt"` // ms for permissions.query
+	Webdriver       int        `json:"wd"`                      // 1 = navigator.webdriver true
+	CDCPresent      int        `json:"cdc"`                     // 1 = ChromeDriver markers found
+	ChromeRuntime   int        `json:"cr"`                      // 1 = window.chrome.runtime present
+	PluginCount     int        `json:"plg"`                     // navigator.plugins.length
+	LanguageCount   int        `json:"lang"`                    // navigator.languages.length
+	SpeechVoices    int        `json:"sv"`                      // speechSynthesis voices count
+	WebGLRenderer   string     `json:"wglr"`                    // UNMASKED_RENDERER_WEBGL
+	WebGLVendor     string     `json:"wglv"`                    // UNMASKED_VENDOR_WEBGL
+	WebGLMaxTex     int        `json:"wglMaxTex,omitempty"`     // MAX_TEXTURE_SIZE
+	WebGLMaxVP      [2]int     `json:"wglMaxVP,omitempty"`      // MAX_VIEWPORT_DIMS
+	WebGLMaxRB      int        `json:"wglMaxRB,omitempty"`      // MAX_RENDERBUFFER_SIZE
+	WebGLAliasedLW  [2]float64 `json:"wglAliasedLW,omitempty"`  // ALIASED_LINE_WIDTH_RANGE
+	WebGLShaderHigh int        `json:"wglShaderHigh,omitempty"` // FRAGMENT_SHADER HIGH_FLOAT precision
+	AudioHash       int        `json:"audioHash,omitempty"`     // OfflineAudioContext fingerprint
+	Cores           int        `json:"cores"`
+	Memory          float64    `json:"mem"`
+	TouchPoints     int        `json:"touch"`
+	Platform        string     `json:"plt"`
+	ScreenWidth     int        `json:"sw"`
+	ScreenHeight    int        `json:"sh"`
+	ColorDepth      int        `json:"cd"`
+	PixelRatio      float64    `json:"dpr"`
+	CanvasHash      string     `json:"cvs"`
+	PermissionTime  float64    `json:"pt"` // ms for permissions.query
 }
 
 // botBehavior is the parsed behavioral data collected during PoW.
@@ -199,6 +205,25 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 	}
 	if strings.Contains(sig.WebGLRenderer, "SwiftShader") {
 		score += 85
+	}
+	// Deep WebGL probe: SwiftShader has distinctive MAX_TEXTURE_SIZE and
+	// shader precision values that differ from real GPUs. Even if the
+	// renderer string is spoofed, the actual GPU capabilities aren't.
+	// SwiftShader: MAX_TEXTURE_SIZE=8192, shader precision=23.
+	// Real GPUs: MAX_TEXTURE_SIZE=16384+, shader precision=23-127.
+	if sig.WebGLMaxTex > 0 && sig.WebGLMaxTex <= 8192 && !strings.Contains(sig.WebGLRenderer, "SwiftShader") {
+		// Renderer says it's a real GPU but MAX_TEXTURE_SIZE is SwiftShader-level.
+		// This catches stealth scripts that patch the renderer string but not
+		// the actual GPU parameter values.
+		score += 60
+	}
+	// Audio fingerprint: headless Chrome produces a deterministic hash.
+	// A hash of 0 means the API isn't available or failed — don't score.
+	// Known headless audio hashes can be checked against a list.
+	// For now, just flag absence of audio context (0 = no audio support).
+	if sig.AudioHash == 0 && sig.PluginCount > 0 {
+		// Claims to have plugins (patched) but no audio context = suspicious.
+		score += 15
 	}
 	if sig.PluginCount == 0 {
 		score += 30

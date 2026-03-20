@@ -430,10 +430,18 @@ func TestServeChallengeWorkerJS(t *testing.T) {
 // ─── Bot Signal Scoring ─────────────────────────────────────────────
 
 func TestScoreBotSignals_RealBrowser(t *testing.T) {
-	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","wglv":"Google Inc. (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"a1b2c3d4","pt":12.5}`
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","wglv":"Google Inc. (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"a1b2c3d4","pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
 	behavior := `{"me":15,"ke":0,"fc":1,"se":2,"fi":850,"wtv":8.3,"dur":3000}`
 
-	score := scoreBotSignals(signals, behavior, makeRequest("POST", "/.well-known/policy-challenge/verify", "1.2.3.4:5678"), zap.NewNop())
+	// Real browser request with proper headers.
+	r := makeRequestWithHeaders("POST", "/.well-known/policy-challenge/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US,en;q=0.9",
+		"Sec-CH-UA":       `"Chromium";v="120", "Google Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, behavior, r, zap.NewNop())
 	if score > 30 {
 		t.Errorf("real browser score = %d, want <= 30", score)
 	}

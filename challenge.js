@@ -60,8 +60,47 @@
         signals.wglr = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "";
         signals.wglv = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || "";
       }
+      // Deep WebGL probes — these can't be faked by patching getParameter
+      // for just the renderer string. SwiftShader returns distinctive values.
+      signals.wglMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+      signals.wglMaxVP = (() => { try { const v = gl.getParameter(gl.MAX_VIEWPORT_DIMS); return v ? [v[0], v[1]] : [0,0]; } catch { return [0,0]; } })();
+      signals.wglMaxRB = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
+      signals.wglAliasedLW = (() => { try { const v = gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE); return v ? [v[0], v[1]] : [0,0]; } catch { return [0,0]; } })();
+      signals.wglShaderHigh = (() => {
+        try {
+          const p = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+          return p ? p.precision : 0;
+        } catch { return 0; }
+      })();
     }
   } catch {}
+
+  // 3c-extra. Audio fingerprint — OfflineAudioContext produces different
+  // output per audio driver/OS. Headless Chrome returns deterministic output.
+  signals.audioHash = await (async () => {
+    try {
+      const ctx = new OfflineAudioContext(1, 44100, 44100);
+      const osc = ctx.createOscillator();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(10000, ctx.currentTime);
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.setValueAtTime(-50, ctx.currentTime);
+      comp.knee.setValueAtTime(40, ctx.currentTime);
+      comp.ratio.setValueAtTime(12, ctx.currentTime);
+      comp.attack.setValueAtTime(0, ctx.currentTime);
+      comp.release.setValueAtTime(0.25, ctx.currentTime);
+      osc.connect(comp);
+      comp.connect(ctx.destination);
+      osc.start(0);
+      const rendered = await ctx.startRendering();
+      const data = rendered.getChannelData(0).slice(4500, 5000);
+      let hash = 0;
+      for (let i = 0; i < data.length; i++) {
+        hash = ((hash << 5) - hash + Math.round(data[i] * 1000000)) | 0;
+      }
+      return hash;
+    } catch { return 0; }
+  })();
 
   // 3d. Hardware consistency
   signals.cores = navigator.hardwareConcurrency || 0;
