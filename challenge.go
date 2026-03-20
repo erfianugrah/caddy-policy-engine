@@ -124,8 +124,17 @@ type botBehavior struct {
 }
 
 // scoreBotSignals parses the signals and behavior JSON from the challenge
-// submission and returns a bot score (0-100).
-func scoreBotSignals(signalsJSON, behaviorJSON string, logger *zap.Logger) int {
+// submission, combines with JA4 TLS fingerprint and HTTP header analysis,
+// and returns a bot score (0-100).
+//
+// Layers:
+//
+//	L1 — TLS fingerprint (JA4) — non-browser TLS stacks
+//	L2 — HTTP headers — missing Sec-Fetch-*, inconsistent Client Hints
+//	L3 — JS environment probes — webdriver, plugins, WebGL, canvas, permissions
+//	L4 — Behavioral signals — mouse, keyboard, scroll, worker timing
+//	L5 — Spatial inconsistency — cross-referencing UA, JA4, and JS signals
+func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *zap.Logger) int {
 	var sig botSignals
 	var beh botBehavior
 	score := 0
@@ -143,54 +152,98 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, logger *zap.Logger) int {
 		json.Unmarshal([]byte(behaviorJSON), &beh) // best-effort
 	}
 
-	// ── Automation markers (deterministic, high confidence) ────────
+	// ── Layer 1: TLS fingerprint (JA4) ────────────────────────────
+	ja4 := ja4Registry.Get(r.RemoteAddr)
+	if ja4 != "" {
+		// Non-browser TLS clients: Python requests, Go http, curl have
+		// distinctive JA4 patterns (low extension count, no ALPN h2, etc.).
+		parts := strings.SplitN(ja4, "_", 2)
+		if len(parts) >= 1 && len(parts[0]) >= 10 {
+			a := parts[0]
+			alpn := a[8:10]
+			// No ALPN or HTTP/1.1 only — most browsers negotiate h2.
+			if alpn == "00" {
+				score += 25 // no ALPN = likely non-browser
+			}
+			// TLS 1.2 without supported_versions — very old or non-browser.
+			if a[1:3] == "12" {
+				score += 10
+			}
+		}
+	}
+
+	// ── Layer 2: HTTP header analysis ─────────────────────────────
+	// Real browsers send Sec-Fetch-* headers (Fetch Metadata).
+	// Automation tools and HTTP libraries typically don't.
+	if r.Header.Get("Sec-Fetch-Site") == "" && r.Header.Get("Sec-Fetch-Mode") == "" {
+		score += 20 // missing Fetch Metadata headers
+	}
+	// Real browsers send Accept-Language. Most bots don't.
+	if r.Header.Get("Accept-Language") == "" {
+		score += 10
+	}
+	// Client Hints (Sec-CH-UA-*) — present in Chrome 89+. Absence with
+	// Chrome UA is suspicious but not definitive (could be Firefox).
+	ua := r.Header.Get("User-Agent")
+	isChromeLikeUA := strings.Contains(ua, "Chrome/") || strings.Contains(ua, "Chromium/")
+	if isChromeLikeUA && r.Header.Get("Sec-CH-UA") == "" {
+		score += 15 // Chrome UA but no Client Hints
+	}
+
+	// ── Layer 3: JS environment probes ────────────────────────────
 	if sig.Webdriver == 1 {
 		score += 90 // navigator.webdriver = true
 	}
 	if sig.CDCPresent == 1 {
 		score += 95 // ChromeDriver/Puppeteer markers in DOM
 	}
-
-	// ── WebGL renderer (SwiftShader = headless Chrome) ─────────────
 	if strings.Contains(sig.WebGLRenderer, "SwiftShader") {
 		score += 85
 	}
-
-	// ── Plugin count (headless has 0, real Chrome has 2-5) ─────────
 	if sig.PluginCount == 0 {
-		// Only flag if UA suggests Chrome (which should have plugins).
-		// Firefox genuinely has 0 plugins in some configs.
 		score += 30
 	}
-
-	// ── Speech voices (headless has 0) ────────────────────────────
 	if sig.SpeechVoices == 0 {
 		score += 20
 	}
-
-	// ── Permissions API timing (headless < 0.5ms) ─────────────────
 	if sig.PermissionTime >= 0 && sig.PermissionTime < 0.5 {
 		score += 30
 	}
-
-	// ── Language count (headless often has 0 or 1) ─────────────────
 	if sig.LanguageCount <= 1 {
 		score += 10
 	}
-
-	// ── Chrome runtime missing (absent in headless Chrome) ─────────
 	if sig.ChromeRuntime == 0 {
 		score += 15
 	}
 
-	// ── Behavioral: no interaction during PoW ──────────────────────
+	// ── Layer 4: Behavioral signals ───────────────────────────────
 	if beh.Duration > 2000 && beh.MouseEvents == 0 && beh.KeyEvents == 0 && beh.ScrollEvents == 0 {
 		score += 15
 	}
-
-	// ── Worker timing variance (containers are unnaturally uniform) ─
 	if beh.WorkerVariance >= 0 && beh.WorkerVariance < 1.0 && beh.Duration > 1000 {
 		score += 20
+	}
+
+	// ── Layer 5: Spatial inconsistency (cross-reference) ──────────
+	// UA claims mobile but JS reports desktop hardware.
+	isMobileUA := strings.Contains(strings.ToLower(ua), "mobile") ||
+		strings.Contains(strings.ToLower(ua), "android") ||
+		strings.Contains(strings.ToLower(ua), "iphone")
+	if isMobileUA && sig.TouchPoints == 0 {
+		score += 40 // mobile UA but no touch support
+	}
+	if isMobileUA && sig.ScreenWidth > 2000 {
+		score += 30 // mobile UA but desktop screen resolution
+	}
+	// UA claims Chrome but JA4 is non-browser TLS stack.
+	if isChromeLikeUA && ja4 != "" {
+		parts := strings.SplitN(ja4, "_", 2)
+		if len(parts) >= 1 && len(parts[0]) >= 10 {
+			alpn := parts[0][8:10]
+			if alpn == "00" || alpn == "h1" {
+				score += 35 // Chrome UA but non-browser TLS (no h2 ALPN)
+			}
+		}
 	}
 
 	// Cap at 100.
@@ -200,12 +253,16 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, logger *zap.Logger) int {
 
 	logger.Debug("challenge bot score",
 		zap.Int("score", score),
+		zap.String("ja4", ja4),
 		zap.Int("webdriver", sig.Webdriver),
 		zap.Int("plugins", sig.PluginCount),
 		zap.String("webgl", sig.WebGLRenderer),
 		zap.Float64("perm_timing", sig.PermissionTime),
 		zap.Int("mouse_events", beh.MouseEvents),
-		zap.Float64("worker_variance", beh.WorkerVariance))
+		zap.Float64("worker_variance", beh.WorkerVariance),
+		zap.Bool("has_sec_fetch", r.Header.Get("Sec-Fetch-Site") != ""),
+		zap.Bool("mobile_ua", isMobileUA),
+		zap.Int("touch_points", sig.TouchPoints))
 
 	return score
 }
@@ -451,7 +508,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	// ── Bot signal scoring ──────────────────────────────────────────
 	// Parse client-side environment probes and behavioral signals.
 	// Compute a weighted bot score (0-100). High score = likely bot.
-	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), pe.logger)
+	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), r, pe.logger)
 
 	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
 
