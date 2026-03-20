@@ -743,6 +743,8 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		case "challenge":
 			// Pass 3: proof-of-work challenge — serve interstitial or validate cookie.
+			// Capture request context for all challenge events (investigation).
+			captureRequestContext(r, pb)
 			if challengePassed {
 				// Valid cookie — log bypass, continue evaluation.
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_bypassed")
@@ -775,6 +777,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 		case "skip":
 			// Pass 4: selective bypass — accumulate skip flags, non-terminating.
+			captureRequestContext(r, pb)
 			// Merge this rule's skip_targets into the running skip state.
 			if cr.skipTargets != nil {
 				if cr.skipTargets.allRemaining {
