@@ -65,10 +65,13 @@ type challengePayload struct {
 
 // challengeCookiePayload is the signed cookie content.
 type challengeCookiePayload struct {
-	Sub string `json:"sub"` // Client IP (if bind_ip)
-	Aud string `json:"aud"` // Service hostname
-	Exp int64  `json:"exp"` // Unix timestamp
-	Dif int    `json:"dif"` // Difficulty solved at
+	Jti   string `json:"jti"`           // Unique token ID (16 hex chars)
+	Sub   string `json:"sub,omitempty"` // Client IP (if bind_ip)
+	Aud   string `json:"aud"`           // Service hostname
+	Iat   int64  `json:"iat"`           // Issued at (unix timestamp)
+	Exp   int64  `json:"exp"`           // Expires at (unix timestamp)
+	Dif   int    `json:"dif"`           // Difficulty solved at
+	Score int    `json:"scr"`           // Bot score at time of issuance (0-100)
 }
 
 // ─── Worker JS Serving ──────────────────────────────────────────────
@@ -481,11 +484,21 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	}
 	pe.mu.RUnlock()
 
+	// Generate unique token ID (8 random bytes → 16 hex chars).
+	jtiBytes := make([]byte, 8)
+	rand.Read(jtiBytes)
+	jti := hex.EncodeToString(jtiBytes)
+
+	now := time.Now()
+
 	// Build cookie payload.
 	cp := challengeCookiePayload{
-		Aud: host,
-		Exp: time.Now().Add(ttl).Unix(),
-		Dif: difficulty,
+		Jti:   jti,
+		Aud:   host,
+		Iat:   now.Unix(),
+		Exp:   now.Add(ttl).Unix(),
+		Dif:   difficulty,
+		Score: botScore,
 	}
 	if bindIP {
 		cp.Sub = clientIP(r)
@@ -516,9 +529,12 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		zap.String("host", host),
 		zap.Int("difficulty", difficulty),
 		zap.Int("bot_score", botScore),
+		zap.String("jti", jti),
 		zap.String("cookie", cookieName))
 
 	caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_passed")
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_jti", jti)
 
 	// Redirect to original URL.
 	redirectURL := originalURL

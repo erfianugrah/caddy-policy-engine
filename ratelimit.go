@@ -12,6 +12,8 @@
 package policyengine
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -333,6 +335,29 @@ func resolveRateLimitKey(keySpec string, r *http.Request, pb *parsedBody) string
 		return clientIP(r) + "_" + r.URL.Path
 	case "client_ip+method":
 		return clientIP(r) + "_" + r.Method
+	case "challenge_cookie":
+		// Rate limit by challenge cookie token ID (jti).
+		// Automatically resolves the per-service cookie name and extracts the jti.
+		host := stripPort(r.Host)
+		cookieName := challengeCookieName(host)
+		if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
+			// Extract jti from the cookie payload (base64url(json).signature).
+			if parts := strings.SplitN(c.Value, ".", 2); len(parts) == 2 {
+				if payload, err := base64.RawURLEncoding.DecodeString(parts[0]); err == nil {
+					var cp struct {
+						Jti string `json:"jti"`
+					}
+					if json.Unmarshal(payload, &cp) == nil && cp.Jti != "" {
+						return cp.Jti
+					}
+				}
+			}
+			// Fallback: use the full cookie value as key.
+			return c.Value
+		}
+		// No challenge cookie — fall back to client IP so the request
+		// still gets rate-limited (just by IP instead of cookie).
+		return clientIP(r)
 	}
 
 	// Parameterized keys.
