@@ -617,7 +617,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		// Service matching for service-scoped rule types.
-		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect" || cr.rule.Type == "skip" || cr.rule.Type == "challenge") && !matchService(cr.rule.Service, r) {
+		if (cr.rule.Type == "rate_limit" || cr.rule.Type == "detect" || cr.rule.Type == "skip") && !matchService(cr.rule.Service, r) {
 			continue
 		}
 
