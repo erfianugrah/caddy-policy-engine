@@ -85,6 +85,128 @@ func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Re
 	return nil
 }
 
+// ─── Bot Signal Scoring ─────────────────────────────────────────────
+
+// botSignals is the parsed client-side environment probe data.
+type botSignals struct {
+	Webdriver      int     `json:"wd"`   // 1 = navigator.webdriver true
+	CDCPresent     int     `json:"cdc"`  // 1 = ChromeDriver markers found
+	ChromeRuntime  int     `json:"cr"`   // 1 = window.chrome.runtime present
+	PluginCount    int     `json:"plg"`  // navigator.plugins.length
+	LanguageCount  int     `json:"lang"` // navigator.languages.length
+	SpeechVoices   int     `json:"sv"`   // speechSynthesis voices count
+	WebGLRenderer  string  `json:"wglr"` // UNMASKED_RENDERER_WEBGL
+	WebGLVendor    string  `json:"wglv"` // UNMASKED_VENDOR_WEBGL
+	Cores          int     `json:"cores"`
+	Memory         float64 `json:"mem"`
+	TouchPoints    int     `json:"touch"`
+	Platform       string  `json:"plt"`
+	ScreenWidth    int     `json:"sw"`
+	ScreenHeight   int     `json:"sh"`
+	ColorDepth     int     `json:"cd"`
+	PixelRatio     float64 `json:"dpr"`
+	CanvasHash     string  `json:"cvs"`
+	PermissionTime float64 `json:"pt"` // ms for permissions.query
+}
+
+// botBehavior is the parsed behavioral data collected during PoW.
+type botBehavior struct {
+	MouseEvents      int     `json:"me"`
+	KeyEvents        int     `json:"ke"`
+	FocusChanges     int     `json:"fc"`
+	ScrollEvents     int     `json:"se"`
+	FirstInteraction int     `json:"fi"`  // ms from page load, -1 = none
+	WorkerVariance   float64 `json:"wtv"` // stddev of worker progress intervals
+	Duration         int     `json:"dur"` // total challenge duration ms
+}
+
+// scoreBotSignals parses the signals and behavior JSON from the challenge
+// submission and returns a bot score (0-100).
+func scoreBotSignals(signalsJSON, behaviorJSON string, logger *zap.Logger) int {
+	var sig botSignals
+	var beh botBehavior
+	score := 0
+
+	if signalsJSON != "" {
+		if err := json.Unmarshal([]byte(signalsJSON), &sig); err != nil {
+			logger.Debug("challenge: failed to parse signals", zap.Error(err))
+			return 0 // fail open — can't score without signals
+		}
+	} else {
+		return 0 // no signals submitted — fail open
+	}
+
+	if behaviorJSON != "" {
+		json.Unmarshal([]byte(behaviorJSON), &beh) // best-effort
+	}
+
+	// ── Automation markers (deterministic, high confidence) ────────
+	if sig.Webdriver == 1 {
+		score += 90 // navigator.webdriver = true
+	}
+	if sig.CDCPresent == 1 {
+		score += 95 // ChromeDriver/Puppeteer markers in DOM
+	}
+
+	// ── WebGL renderer (SwiftShader = headless Chrome) ─────────────
+	if strings.Contains(sig.WebGLRenderer, "SwiftShader") {
+		score += 85
+	}
+
+	// ── Plugin count (headless has 0, real Chrome has 2-5) ─────────
+	if sig.PluginCount == 0 {
+		// Only flag if UA suggests Chrome (which should have plugins).
+		// Firefox genuinely has 0 plugins in some configs.
+		score += 30
+	}
+
+	// ── Speech voices (headless has 0) ────────────────────────────
+	if sig.SpeechVoices == 0 {
+		score += 20
+	}
+
+	// ── Permissions API timing (headless < 0.5ms) ─────────────────
+	if sig.PermissionTime >= 0 && sig.PermissionTime < 0.5 {
+		score += 30
+	}
+
+	// ── Language count (headless often has 0 or 1) ─────────────────
+	if sig.LanguageCount <= 1 {
+		score += 10
+	}
+
+	// ── Chrome runtime missing (absent in headless Chrome) ─────────
+	if sig.ChromeRuntime == 0 {
+		score += 15
+	}
+
+	// ── Behavioral: no interaction during PoW ──────────────────────
+	if beh.Duration > 2000 && beh.MouseEvents == 0 && beh.KeyEvents == 0 && beh.ScrollEvents == 0 {
+		score += 15
+	}
+
+	// ── Worker timing variance (containers are unnaturally uniform) ─
+	if beh.WorkerVariance >= 0 && beh.WorkerVariance < 1.0 && beh.Duration > 1000 {
+		score += 20
+	}
+
+	// Cap at 100.
+	if score > 100 {
+		score = 100
+	}
+
+	logger.Debug("challenge bot score",
+		zap.Int("score", score),
+		zap.Int("webdriver", sig.Webdriver),
+		zap.Int("plugins", sig.PluginCount),
+		zap.String("webgl", sig.WebGLRenderer),
+		zap.Float64("perm_timing", sig.PermissionTime),
+		zap.Int("mouse_events", beh.MouseEvents),
+		zap.Float64("worker_variance", beh.WorkerVariance))
+
+	return score
+}
+
 // ─── Cookie Name ────────────────────────────────────────────────────
 
 // challengeCookieName computes a per-service cookie name from the service hostname.
@@ -323,7 +445,23 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
-	// PoW is valid — issue a signed cookie.
+	// ── Bot signal scoring ──────────────────────────────────────────
+	// Parse client-side environment probes and behavioral signals.
+	// Compute a weighted bot score (0-100). High score = likely bot.
+	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), pe.logger)
+
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
+
+	// Reject if bot score exceeds threshold (likely headless Chrome).
+	if botScore >= 70 {
+		pe.logger.Info("challenge rejected: high bot score",
+			zap.String("client_ip", clientIP(r)),
+			zap.Int("bot_score", botScore))
+		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		return caddyhttp.Error(http.StatusForbidden, nil)
+	}
+
+	// PoW is valid + bot score acceptable — issue a signed cookie.
 	host := stripPort(r.Host)
 	cookieName := challengeCookieName(host)
 
@@ -377,6 +515,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		zap.String("client_ip", clientIP(r)),
 		zap.String("host", host),
 		zap.Int("difficulty", difficulty),
+		zap.Int("bot_score", botScore),
 		zap.String("cookie", cookieName))
 
 	caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_passed")

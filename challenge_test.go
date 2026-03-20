@@ -427,6 +427,52 @@ func TestServeChallengeWorkerJS(t *testing.T) {
 	}
 }
 
+// ─── Bot Signal Scoring ─────────────────────────────────────────────
+
+func TestScoreBotSignals_RealBrowser(t *testing.T) {
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","wglv":"Google Inc. (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"a1b2c3d4","pt":12.5}`
+	behavior := `{"me":15,"ke":0,"fc":1,"se":2,"fi":850,"wtv":8.3,"dur":3000}`
+
+	score := scoreBotSignals(signals, behavior, zap.NewNop())
+	if score > 30 {
+		t.Errorf("real browser score = %d, want <= 30", score)
+	}
+}
+
+func TestScoreBotSignals_HeadlessChrome(t *testing.T) {
+	signals := `{"wd":1,"cdc":0,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","wglv":"Google Inc.","cores":2,"mem":0,"touch":0,"plt":"Linux x86_64","sw":800,"sh":600,"cd":24,"dpr":1,"cvs":"deadbeef","pt":0.1}`
+	behavior := `{"me":0,"ke":0,"fc":0,"se":0,"fi":-1,"wtv":0.3,"dur":5000}`
+
+	score := scoreBotSignals(signals, behavior, zap.NewNop())
+	if score < 70 {
+		t.Errorf("headless Chrome score = %d, want >= 70", score)
+	}
+}
+
+func TestScoreBotSignals_Puppeteer(t *testing.T) {
+	signals := `{"wd":0,"cdc":1,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","wglv":"Google Inc.","cores":4,"mem":0,"touch":0,"plt":"Linux x86_64","sw":1280,"sh":720,"cd":24,"dpr":1,"cvs":"cafebabe","pt":0.05}`
+	behavior := `{"me":0,"ke":0,"fc":0,"se":0,"fi":-1,"wtv":0.5,"dur":2000}`
+
+	score := scoreBotSignals(signals, behavior, zap.NewNop())
+	if score < 70 {
+		t.Errorf("Puppeteer score = %d, want >= 70 (cdc + SwiftShader + 0 plugins)", score)
+	}
+}
+
+func TestScoreBotSignals_EmptySignals(t *testing.T) {
+	score := scoreBotSignals("", "", zap.NewNop())
+	if score != 0 {
+		t.Errorf("empty signals score = %d, want 0 (fail open)", score)
+	}
+}
+
+func TestScoreBotSignals_MalformedJSON(t *testing.T) {
+	score := scoreBotSignals("{invalid", "", zap.NewNop())
+	if score != 0 {
+		t.Errorf("malformed JSON score = %d, want 0 (fail open)", score)
+	}
+}
+
 // ─── Verify Endpoint ────────────────────────────────────────────────
 
 func TestHandleChallengeVerifyValid(t *testing.T) {

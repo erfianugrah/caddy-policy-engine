@@ -1,6 +1,5 @@
-// PoW challenge solver — multi-threaded Web Worker orchestrator.
-// Spawns floor(hardwareConcurrency/2) workers with interleaved nonce search.
-// Falls back to single-threaded inline computation if Workers are unavailable.
+// PoW challenge solver with browser fingerprint signal collection.
+// Multi-threaded Web Worker orchestrator + environment probes + behavioral signals.
 // Embedded in the plugin via go:embed, injected into challenge.html.
 (async () => {
   const statusEl = document.getElementById("challenge-status");
@@ -14,10 +13,125 @@
   const likelihood = Math.pow(16, -difficulty);
   const t0 = Date.now();
 
+  // ── FNV-1a 32-bit hash (for canvas fingerprint) ─────────────────
+  function fnv1a32(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  // ── Layer 3: JS Environment Probes ──────────────────────────────
+  // Collected at page load, before PoW starts.
+  const signals = {};
+
+  // 3a. Automation markers
+  signals.wd = navigator.webdriver ? 1 : 0;
+  signals.cdc = (() => {
+    try {
+      for (const key of Object.keys(document)) {
+        if (/^cdc_|^__puppeteer/.test(key)) return 1;
+      }
+    } catch {}
+    return 0;
+  })();
+  signals.cr = (window.chrome && window.chrome.runtime) ? 1 : 0;
+
+  // 3b. Plugin & feature presence
+  signals.plg = navigator.plugins ? navigator.plugins.length : -1;
+  signals.lang = navigator.languages ? navigator.languages.length : 0;
+  signals.sv = (() => {
+    try {
+      return window.speechSynthesis ? speechSynthesis.getVoices().length : -1;
+    } catch { return -1; }
+  })();
+
+  // 3c. WebGL renderer (SwiftShader = headless)
+  signals.wglr = "";
+  signals.wglv = "";
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+    if (gl) {
+      const ext = gl.getExtension("WEBGL_debug_renderer_info");
+      if (ext) {
+        signals.wglr = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "";
+        signals.wglv = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || "";
+      }
+    }
+  } catch {}
+
+  // 3d. Hardware consistency
+  signals.cores = navigator.hardwareConcurrency || 0;
+  signals.mem = navigator.deviceMemory || 0;
+  signals.touch = navigator.maxTouchPoints || 0;
+  signals.plt = navigator.platform || "";
+  signals.sw = screen.width;
+  signals.sh = screen.height;
+  signals.cd = screen.colorDepth;
+  signals.dpr = window.devicePixelRatio || 1;
+
+  // 3e. Canvas fingerprint
+  signals.cvs = (() => {
+    try {
+      const c = document.createElement("canvas");
+      c.width = 280; c.height = 60;
+      const ctx = c.getContext("2d");
+      ctx.font = "14px Arial";
+      ctx.fillStyle = "#f60";
+      ctx.fillRect(125, 1, 62, 20);
+      ctx.fillStyle = "#069";
+      ctx.fillText("policy-challenge-fp", 2, 15);
+      ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
+      ctx.fillText("policy-challenge-fp", 4, 45);
+      return fnv1a32(c.toDataURL());
+    } catch { return "err"; }
+  })();
+
+  // 3f. Permissions API timing (async — done before PoW starts)
+  signals.pt = -1;
+  try {
+    const pt0 = performance.now();
+    await navigator.permissions.query({ name: "notifications" });
+    signals.pt = Math.round((performance.now() - pt0) * 100) / 100;
+  } catch {}
+
+  // ── Layer 4: Behavioral Signals ─────────────────────────────────
+  // Collected during PoW computation.
+  const behavior = { me: 0, ke: 0, fc: 0, se: 0, fi: -1 };
+  const progressTimings = [];
+  let lastProgressTs = Date.now();
+
+  const onMouse = () => { behavior.me++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
+  const onKey = () => { behavior.ke++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
+  const onFocus = () => behavior.fc++;
+  const onScroll = () => { behavior.se++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
+
+  document.addEventListener("mousemove", onMouse);
+  document.addEventListener("keydown", onKey);
+  document.addEventListener("visibilitychange", onFocus);
+  document.addEventListener("scroll", onScroll);
+
   // ── Submit solution to verify endpoint ──────────────────────────
   const submitSolution = async (hash, nonce) => {
+    // Remove listeners
+    document.removeEventListener("mousemove", onMouse);
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("visibilitychange", onFocus);
+    document.removeEventListener("scroll", onScroll);
+
     if (statusEl) statusEl.textContent = "Verified! Redirecting...";
     if (progressEl) progressEl.style.width = "100%";
+
+    // Compute worker timing variance
+    let wtv = 0;
+    if (progressTimings.length >= 3) {
+      const mean = progressTimings.reduce((a, b) => a + b, 0) / progressTimings.length;
+      const variance = progressTimings.reduce((a, b) => a + (b - mean) ** 2, 0) / progressTimings.length;
+      wtv = Math.round(Math.sqrt(variance) * 100) / 100;
+    }
 
     const form = new URLSearchParams();
     form.set("random_data", random_data);
@@ -28,6 +142,14 @@
     form.set("timestamp", timestamp);
     form.set("original_url", original_url);
     form.set("elapsed_ms", String(Date.now() - t0));
+
+    // Signals (compact JSON to minimize form size)
+    form.set("signals", JSON.stringify(signals));
+    form.set("behavior", JSON.stringify({
+      ...behavior,
+      wtv: wtv,
+      dur: Date.now() - t0,
+    }));
 
     const resp = await fetch("/.well-known/policy-challenge/verify", {
       method: "POST",
@@ -72,12 +194,14 @@
 
           w.onmessage = (event) => {
             if (typeof event.data === "number") {
-              // Progress update from main thread worker.
+              // Progress + behavioral timing
+              const now = Date.now();
+              progressTimings.push(now - lastProgressTs);
+              lastProgressTs = now;
               const probability = Math.pow(1 - likelihood, event.data);
               const distance = (1 - probability * probability) * 100;
               if (progressEl) progressEl.style.width = distance + "%";
             } else {
-              // Solution found.
               cleanup();
               resolve(event.data);
             }
@@ -100,7 +224,6 @@
         }
       }).then(result => submitSolution(result.hash, result.nonce));
     } catch (e) {
-      // Workers failed — fall through to single-threaded.
       if (!settled) {
         cleanup();
         console.warn("Web Workers failed, falling back to single-threaded:", e);
@@ -108,11 +231,10 @@
       }
     }
   } else {
-    // No Worker support — single-threaded fallback.
     await solveSingleThreaded();
   }
 
-  // ── Single-threaded fallback (no Workers) ───────────────────────
+  // ── Single-threaded fallback ────────────────────────────────────
   async function solveSingleThreaded() {
     if (statusEl) statusEl.textContent = "Computing proof-of-work (difficulty " + difficulty + ")...";
     if (progressEl) progressEl.style.display = "inline-block";
@@ -143,6 +265,9 @@
 
       nonce++;
       if ((nonce & 1023) === 0) {
+        const now = Date.now();
+        progressTimings.push(now - lastProgressTs);
+        lastProgressTs = now;
         const probability = Math.pow(1 - likelihood, nonce);
         const distance = (1 - probability * probability) * 100;
         if (progressEl) progressEl.style.width = distance + "%";
