@@ -536,6 +536,12 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	wafCfg := pe.wafConfig
 	pe.mu.RUnlock()
 
+	// ── JA4 TLS Fingerprint ─────────────────────────────────────────
+	// Read JA4 from the listener wrapper registry (computed at Accept time).
+	if ja4 := ja4Registry.Get(r.RemoteAddr); ja4 != "" {
+		caddyhttp.SetVar(r.Context(), "policy_engine.ja4", ja4)
+	}
+
 	// ── CORS Preflight ─────────────────────────────────────────────
 	// Handle OPTIONS preflight before any rule evaluation.
 	// Preflight requests get 204 + CORS headers without reaching upstream.
@@ -1582,6 +1588,8 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 		return r.Header.Get("Referer")
 	case "http_version":
 		return r.Proto
+	case "ja4":
+		return ja4Registry.Get(r.RemoteAddr)
 	case "request_line":
 		// CRS REQUEST_LINE: "METHOD /path HTTP/version"
 		return r.Method + " " + r.URL.RequestURI() + " " + r.Proto
