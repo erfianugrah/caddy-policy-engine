@@ -509,6 +509,10 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 	// Select difficulty adaptively based on pre-signal scoring.
 	difficulty := selectDifficulty(r, cfg.minDifficulty, cfg.maxDifficulty)
 
+	// Log the selected difficulty and pre-signal score for analytics.
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_difficulty", strconv.Itoa(difficulty))
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_pre_score", strconv.Itoa(preSignalScore(r)))
+
 	// Generate random data (64 bytes → 128 hex chars, matching Anubis).
 	randomBytes := make([]byte, 64)
 	if _, err := rand.Read(randomBytes); err != nil {
@@ -695,6 +699,13 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			elapsedMs = v
 		}
 	}
+
+	// Log elapsed_ms and difficulty for analytics.
+	if elapsedMs >= 0 {
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_elapsed_ms", strconv.Itoa(elapsedMs))
+	}
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_difficulty", strconv.Itoa(difficulty))
+	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_pre_score", strconv.Itoa(preSignalScore(r)))
 
 	// Parse core count from signals JSON for timing validation.
 	// We read it here (before scoreBotSignals) so we can do the
