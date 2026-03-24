@@ -1105,3 +1105,42 @@ func TestCompileChallengeRuleAdaptiveDifficulty(t *testing.T) {
 		})
 	}
 }
+
+// ─── Challenge History Condition Field ──────────────────────────────
+
+func TestChallengeHistoryField(t *testing.T) {
+	host := "httpbun.erfi.io"
+	cookieName := challengeCookieName(host)
+
+	t.Run("no_cookie_returns_none", func(t *testing.T) {
+		r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+		r.Host = host
+		cc := compiledCondition{field: "challenge_history"}
+		val := extractField(cc, r, nil)
+		if val != "none" {
+			t.Errorf("got %q, want 'none'", val)
+		}
+	})
+
+	t.Run("valid_cookie_returns_passed", func(t *testing.T) {
+		r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+		r.Host = host
+		r.AddCookie(&http.Cookie{Name: cookieName, Value: "payload.signature"})
+		cc := compiledCondition{field: "challenge_history"}
+		val := extractField(cc, r, nil)
+		if val != "passed" {
+			t.Errorf("got %q, want 'passed'", val)
+		}
+	})
+
+	t.Run("malformed_cookie_returns_expired", func(t *testing.T) {
+		r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+		r.Host = host
+		r.AddCookie(&http.Cookie{Name: cookieName, Value: "garbage_no_dot"})
+		cc := compiledCondition{field: "challenge_history"}
+		val := extractField(cc, r, nil)
+		if val != "expired" {
+			t.Errorf("got %q, want 'expired'", val)
+		}
+	})
+}

@@ -1593,6 +1593,22 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 		return r.Proto
 	case "ja4":
 		return ja4Registry.Get(r.RemoteAddr)
+	case "challenge_history":
+		// Returns the client's challenge cookie state for the current host:
+		// "passed" = valid cookie present, "expired" = cookie present but invalid,
+		// "none" = no challenge cookie found.
+		// We check for the cookie directly — no pe needed.
+		host := stripPort(r.Host)
+		cookieName := challengeCookieName(host)
+		cookie, err := r.Cookie(cookieName)
+		if err != nil || cookie.Value == "" {
+			return "none"
+		}
+		// Cookie exists — check if it's structurally valid (has dot separator).
+		if strings.Contains(cookie.Value, ".") {
+			return "passed"
+		}
+		return "expired"
 	case "request_line":
 		// CRS REQUEST_LINE: "METHOD /path HTTP/version"
 		return r.Method + " " + r.URL.RequestURI() + " " + r.Proto
