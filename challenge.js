@@ -10,7 +10,7 @@
   const config = JSON.parse(data.textContent);
   const { random_data, difficulty, hmac, original_url, timestamp, algorithm } = config;
 
-  const likelihood = Math.pow(16, -difficulty);
+  const expectedIters = Math.pow(16, difficulty); // expected iterations to find a solution
   const t0 = Date.now();
 
   // ── FNV-1a 32-bit hash (for canvas fingerprint) ─────────────────
@@ -212,8 +212,7 @@
   const threads = Math.max(Math.floor(cores / 2), 1);
 
   if (canUseWorkers) {
-    const algoLabel = (algorithm === "slow") ? "slow mode, " : "";
-    if (statusEl) statusEl.textContent = "Computing proof-of-work (" + algoLabel + threads + " threads, difficulty " + difficulty + ")...";
+    if (statusEl) statusEl.textContent = "Verifying your browser...";
     if (progressEl) progressEl.style.display = "inline-block";
 
     const workerURL = "/.well-known/policy-challenge/worker.js";
@@ -237,9 +236,11 @@
               const now = Date.now();
               progressTimings.push(now - lastProgressTs);
               lastProgressTs = now;
-              const probability = Math.pow(1 - likelihood, event.data);
-              const distance = (1 - probability * probability) * 100;
-              if (progressEl) progressEl.style.width = distance + "%";
+              // Progress based on fraction of expected iterations searched.
+              // Nonce is the total iterations across all threads so far.
+              // Cap at 95% — the last 5% is reserved for the "Verified!" state.
+              const pct = Math.min(event.data / expectedIters * 100, 95);
+              if (progressEl) progressEl.style.width = pct + "%";
             } else {
               cleanup();
               resolve(event.data);
@@ -275,7 +276,7 @@
 
   // ── Single-threaded fallback ────────────────────────────────────
   async function solveSingleThreaded() {
-    if (statusEl) statusEl.textContent = "Computing proof-of-work (difficulty " + difficulty + ")...";
+    if (statusEl) statusEl.textContent = "Verifying your browser...";
     if (progressEl) progressEl.style.display = "inline-block";
 
     const encoder = new TextEncoder();
@@ -307,9 +308,8 @@
         const now = Date.now();
         progressTimings.push(now - lastProgressTs);
         lastProgressTs = now;
-        const probability = Math.pow(1 - likelihood, nonce);
-        const distance = (1 - probability * probability) * 100;
-        if (progressEl) progressEl.style.width = distance + "%";
+        const pct = Math.min(nonce / expectedIters * 100, 95);
+        if (progressEl) progressEl.style.width = pct + "%";
       }
     }
   }

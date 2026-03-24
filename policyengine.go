@@ -3135,6 +3135,35 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 		if diff > 16 {
 			diff = 16
 		}
+
+		// Adaptive difficulty: min/max range. If unset, both default to diff.
+		minDiff := rule.Challenge.MinDifficulty
+		maxDiff := rule.Challenge.MaxDifficulty
+		if minDiff <= 0 && maxDiff <= 0 {
+			// Neither set — use static difficulty for both.
+			minDiff = diff
+			maxDiff = diff
+		} else {
+			// At least one is set. Fill in missing values.
+			if minDiff <= 0 {
+				minDiff = diff
+			}
+			if maxDiff <= 0 {
+				maxDiff = diff
+			}
+			// Clamp to [1, 16].
+			if minDiff < 1 {
+				minDiff = 1
+			}
+			if maxDiff > 16 {
+				maxDiff = 16
+			}
+			// Ensure min <= max.
+			if minDiff > maxDiff {
+				minDiff = maxDiff
+			}
+		}
+
 		algo := rule.Challenge.Algorithm
 		if algo == "" {
 			algo = "fast"
@@ -3148,11 +3177,14 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 			svc = "_global"
 		}
 		cr.challengeConfig = &compiledChallengeConfig{
-			difficulty: diff,
-			algorithm:  algo,
-			ttl:        ttl,
-			bindIP:     rule.Challenge.BindIP,
-			cookieName: challengeCookieName(svc),
+			difficulty:    diff,
+			minDifficulty: minDiff,
+			maxDifficulty: maxDiff,
+			algorithm:     algo,
+			ttl:           ttl,
+			bindIP:        rule.Challenge.BindIP,
+			bindJA4:       rule.Challenge.BindJA4,
+			cookieName:    challengeCookieName(svc),
 		}
 	}
 

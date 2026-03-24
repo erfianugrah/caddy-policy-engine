@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,10 +33,13 @@ var challengeWorkerJS string
 
 // ChallengeConfig is the per-rule challenge configuration in policy-rules.json.
 type ChallengeConfig struct {
-	Difficulty int    `json:"difficulty"`  // Leading hex zeros in SHA-256 (1-16)
-	Algorithm  string `json:"algorithm"`   // "fast" or "slow"
-	TTLSeconds int    `json:"ttl_seconds"` // Cookie lifetime in seconds
-	BindIP     bool   `json:"bind_ip"`     // Bind cookie to client IP
+	Difficulty    int    `json:"difficulty"`               // Leading hex zeros in SHA-256 (1-16)
+	MinDifficulty int    `json:"min_difficulty,omitempty"` // Adaptive: minimum difficulty (1-16)
+	MaxDifficulty int    `json:"max_difficulty,omitempty"` // Adaptive: maximum difficulty (1-16)
+	Algorithm     string `json:"algorithm"`                // "fast" or "slow"
+	TTLSeconds    int    `json:"ttl_seconds"`              // Cookie lifetime in seconds
+	BindIP        bool   `json:"bind_ip"`                  // Bind cookie to client IP
+	BindJA4       bool   `json:"bind_ja4,omitempty"`       // Bind cookie to JA4 TLS fingerprint
 }
 
 // ChallengeGlobalConfig holds global challenge settings in policy-rules.json.
@@ -45,11 +49,14 @@ type ChallengeGlobalConfig struct {
 
 // compiledChallengeConfig is the pre-compiled form of ChallengeConfig.
 type compiledChallengeConfig struct {
-	difficulty int
-	algorithm  string
-	ttl        time.Duration
-	bindIP     bool
-	cookieName string
+	difficulty    int // static difficulty (used when min == max)
+	minDifficulty int // adaptive: minimum difficulty
+	maxDifficulty int // adaptive: maximum difficulty
+	algorithm     string
+	ttl           time.Duration
+	bindIP        bool
+	bindJA4       bool
+	cookieName    string
 }
 
 // challengePayload is the JSON payload embedded in the interstitial page
@@ -72,6 +79,7 @@ type challengeCookiePayload struct {
 	Exp   int64  `json:"exp"`           // Expires at (unix timestamp)
 	Dif   int    `json:"dif"`           // Difficulty solved at
 	Score int    `json:"scr"`           // Bot score at time of issuance (0-100)
+	Ja4   string `json:"ja4,omitempty"` // JA4 TLS fingerprint (if bind_ja4)
 }
 
 // ─── Worker JS Serving ──────────────────────────────────────────────
@@ -86,6 +94,58 @@ func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(challengeWorkerJS))
 	return nil
+}
+
+// ─── Timing Validation ──────────────────────────────────────────────
+
+const (
+	// hashesPerCoreMs is a generous upper bound for WebCrypto SHA-256
+	// hashes per core per millisecond. Real browsers typically achieve
+	// 20-40; we use 50 to avoid false positives on fast hardware.
+	hashesPerCoreMs = 50
+
+	// timingSafetyFactor allows 3.3x faster than the expected average,
+	// accounting for variance in hash distribution and system load.
+	timingSafetyFactor = 0.3
+
+	// timingScorePenalty is the bot score added when elapsed time is
+	// below the expected minimum but above the hard-reject threshold.
+	timingScorePenalty = 40
+)
+
+// minSolveMs computes the minimum expected solve time in milliseconds
+// for a given difficulty and core count. This is the floor below which
+// a solution is suspiciously fast.
+//
+// Formula: (2^(difficulty*4)) / (cores * hashesPerCoreMs) * safetyFactor
+//
+// Cores are clamped to [1, 256] to prevent division tricks.
+func minSolveMs(difficulty, cores int) int {
+	if cores < 1 {
+		cores = 1
+	}
+	if cores > 256 {
+		cores = 256
+	}
+	if difficulty < 1 {
+		difficulty = 1
+	}
+	if difficulty > 16 {
+		difficulty = 16
+	}
+
+	// Expected iterations = 16^difficulty = 2^(difficulty*4).
+	expectedIters := math.Pow(2, float64(difficulty*4))
+
+	// Minimum time = expected iters / (cores * hashes/core/ms) * safety factor.
+	minMs := (expectedIters / float64(cores*hashesPerCoreMs)) * timingSafetyFactor
+
+	// Floor at 0 — difficulty 1 with many cores can produce sub-millisecond.
+	if minMs < 0 {
+		minMs = 0
+	}
+
+	return int(minMs)
 }
 
 // ─── Bot Signal Scoring ─────────────────────────────────────────────
@@ -129,9 +189,89 @@ type botBehavior struct {
 	Duration         int     `json:"dur"` // total challenge duration ms
 }
 
+// preSignalScore computes a bot score from signals available before the
+// interstitial is served — Layers 1 (JA4/TLS), 2 (HTTP headers), and
+// 5 (spatial inconsistency, UA-only subset). This runs at challenge-serve
+// time to drive adaptive difficulty selection.
+//
+// Layer 5 here only uses UA-based checks that don't require JS probes
+// (touch points and screen width come from JS, so they're excluded).
+// The full L5 check runs later in scoreBotSignals when JS data is available.
+func preSignalScore(r *http.Request) int {
+	score := 0
+
+	// ── Layer 1: TLS fingerprint (JA4) ────────────────────────────
+	ja4 := ja4Registry.Get(r.RemoteAddr)
+	if ja4 != "" {
+		parts := strings.SplitN(ja4, "_", 2)
+		if len(parts) >= 1 && len(parts[0]) >= 10 {
+			a := parts[0]
+			alpn := a[8:10]
+			if alpn == "00" {
+				score += 25
+			}
+			if a[1:3] == "12" {
+				score += 10
+			}
+		}
+	}
+
+	// ── Layer 2: HTTP header analysis ─────────────────────────────
+	if r.Header.Get("Sec-Fetch-Site") == "" && r.Header.Get("Sec-Fetch-Mode") == "" {
+		score += 20
+	}
+	if r.Header.Get("Accept-Language") == "" {
+		score += 10
+	}
+	ua := r.Header.Get("User-Agent")
+	isChromeLikeUA := strings.Contains(ua, "Chrome/") || strings.Contains(ua, "Chromium/")
+	if isChromeLikeUA && r.Header.Get("Sec-CH-UA") == "" {
+		score += 15
+	}
+
+	// ── Layer 5 (partial): UA-only spatial checks ─────────────────
+	// Chrome UA but JA4 is non-browser TLS stack — no JS needed.
+	if isChromeLikeUA && ja4 != "" {
+		parts := strings.SplitN(ja4, "_", 2)
+		if len(parts) >= 1 && len(parts[0]) >= 10 {
+			alpn := parts[0][8:10]
+			if alpn == "00" || alpn == "h1" {
+				score += 35
+			}
+		}
+	}
+
+	if score > 100 {
+		score = 100
+	}
+	return score
+}
+
+// selectDifficulty picks a PoW difficulty from [min, max] based on the
+// pre-signal score of the incoming request. Score 0 → min, score >= 70 → max.
+func selectDifficulty(r *http.Request, min, max int) int {
+	if min >= max {
+		return min
+	}
+	score := preSignalScore(r)
+	if score >= 70 {
+		return max
+	}
+	if score <= 0 {
+		return min
+	}
+	// Linear interpolation: score/70 * (max-min) + min.
+	return min + (score*(max-min)+69)/70 // integer ceil division
+}
+
 // scoreBotSignals parses the signals and behavior JSON from the challenge
 // submission, combines with JA4 TLS fingerprint and HTTP header analysis,
 // and returns a bot score (0-100).
+//
+// elapsedMs is the client-reported solve time; difficulty is the PoW difficulty.
+// These are used for timing-based scoring: if the solve was suspiciously fast
+// relative to the expected minimum (based on difficulty and reported core count),
+// a penalty is applied. Pass elapsedMs < 0 to skip timing scoring.
 //
 // Layers:
 //
@@ -140,10 +280,10 @@ type botBehavior struct {
 //	L3 — JS environment probes — webdriver, plugins, WebGL, canvas, permissions
 //	L4 — Behavioral signals — mouse, keyboard, scroll, worker timing
 //	L5 — Spatial inconsistency — cross-referencing UA, JA4, and JS signals
-func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *zap.Logger) int {
+//	L6 — Timing validation — suspiciously fast PoW solutions
+func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *zap.Logger, elapsedMs, difficulty int) int {
 	var sig botSignals
 	var beh botBehavior
-	score := 0
 
 	if signalsJSON != "" {
 		if err := json.Unmarshal([]byte(signalsJSON), &sig); err != nil {
@@ -158,43 +298,10 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		json.Unmarshal([]byte(behaviorJSON), &beh) // best-effort
 	}
 
-	// ── Layer 1: TLS fingerprint (JA4) ────────────────────────────
-	ja4 := ja4Registry.Get(r.RemoteAddr)
-	if ja4 != "" {
-		// Non-browser TLS clients: Python requests, Go http, curl have
-		// distinctive JA4 patterns (low extension count, no ALPN h2, etc.).
-		parts := strings.SplitN(ja4, "_", 2)
-		if len(parts) >= 1 && len(parts[0]) >= 10 {
-			a := parts[0]
-			alpn := a[8:10]
-			// No ALPN or HTTP/1.1 only — most browsers negotiate h2.
-			if alpn == "00" {
-				score += 25 // no ALPN = likely non-browser
-			}
-			// TLS 1.2 without supported_versions — very old or non-browser.
-			if a[1:3] == "12" {
-				score += 10
-			}
-		}
-	}
+	// Start with L1/L2/partial-L5 from preSignalScore.
+	score := preSignalScore(r)
 
-	// ── Layer 2: HTTP header analysis ─────────────────────────────
-	// Real browsers send Sec-Fetch-* headers (Fetch Metadata).
-	// Automation tools and HTTP libraries typically don't.
-	if r.Header.Get("Sec-Fetch-Site") == "" && r.Header.Get("Sec-Fetch-Mode") == "" {
-		score += 20 // missing Fetch Metadata headers
-	}
-	// Real browsers send Accept-Language. Most bots don't.
-	if r.Header.Get("Accept-Language") == "" {
-		score += 10
-	}
-	// Client Hints (Sec-CH-UA-*) — present in Chrome 89+. Absence with
-	// Chrome UA is suspicious but not definitive (could be Firefox).
 	ua := r.Header.Get("User-Agent")
-	isChromeLikeUA := strings.Contains(ua, "Chrome/") || strings.Contains(ua, "Chromium/")
-	if isChromeLikeUA && r.Header.Get("Sec-CH-UA") == "" {
-		score += 15 // Chrome UA but no Client Hints
-	}
 
 	// ── Layer 3: JS environment probes ────────────────────────────
 	if sig.Webdriver == 1 {
@@ -206,23 +313,10 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 	if strings.Contains(sig.WebGLRenderer, "SwiftShader") {
 		score += 85
 	}
-	// Deep WebGL probe: SwiftShader has distinctive MAX_TEXTURE_SIZE and
-	// shader precision values that differ from real GPUs. Even if the
-	// renderer string is spoofed, the actual GPU capabilities aren't.
-	// SwiftShader: MAX_TEXTURE_SIZE=8192, shader precision=23.
-	// Real GPUs: MAX_TEXTURE_SIZE=16384+, shader precision=23-127.
 	if sig.WebGLMaxTex > 0 && sig.WebGLMaxTex <= 8192 && !strings.Contains(sig.WebGLRenderer, "SwiftShader") {
-		// Renderer says it's a real GPU but MAX_TEXTURE_SIZE is SwiftShader-level.
-		// This catches stealth scripts that patch the renderer string but not
-		// the actual GPU parameter values.
 		score += 60
 	}
-	// Audio fingerprint: headless Chrome produces a deterministic hash.
-	// A hash of 0 means the API isn't available or failed — don't score.
-	// Known headless audio hashes can be checked against a list.
-	// For now, just flag absence of audio context (0 = no audio support).
 	if sig.AudioHash == 0 && sig.PluginCount > 0 {
-		// Claims to have plugins (patched) but no audio context = suspicious.
 		score += 15
 	}
 	if sig.PluginCount == 0 {
@@ -249,8 +343,9 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		score += 20
 	}
 
-	// ── Layer 5: Spatial inconsistency (cross-reference) ──────────
-	// UA claims mobile but JS reports desktop hardware.
+	// ── Layer 5 (full): Spatial inconsistency with JS signals ─────
+	// The partial L5 check (Chrome UA + JA4) already ran in preSignalScore.
+	// Here we add the JS-dependent checks: touch points and screen width.
 	isMobileUA := strings.Contains(strings.ToLower(ua), "mobile") ||
 		strings.Contains(strings.ToLower(ua), "android") ||
 		strings.Contains(strings.ToLower(ua), "iphone")
@@ -260,14 +355,21 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 	if isMobileUA && sig.ScreenWidth > 2000 {
 		score += 30 // mobile UA but desktop screen resolution
 	}
-	// UA claims Chrome but JA4 is non-browser TLS stack.
-	if isChromeLikeUA && ja4 != "" {
-		parts := strings.SplitN(ja4, "_", 2)
-		if len(parts) >= 1 && len(parts[0]) >= 10 {
-			alpn := parts[0][8:10]
-			if alpn == "00" || alpn == "h1" {
-				score += 35 // Chrome UA but non-browser TLS (no h2 ALPN)
-			}
+
+	// ── Layer 6: Timing validation ───────────────────────────────
+	if elapsedMs >= 0 && difficulty >= 1 {
+		cores := sig.Cores
+		if cores < 1 {
+			cores = 1
+		}
+		floor := minSolveMs(difficulty, cores)
+		if floor > 0 && elapsedMs < floor {
+			score += timingScorePenalty
+			logger.Debug("challenge: suspicious solve timing",
+				zap.Int("elapsed_ms", elapsedMs),
+				zap.Int("floor_ms", floor),
+				zap.Int("cores", cores),
+				zap.Int("difficulty", difficulty))
 		}
 	}
 
@@ -276,6 +378,7 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		score = 100
 	}
 
+	ja4 := ja4Registry.Get(r.RemoteAddr)
 	logger.Debug("challenge bot score",
 		zap.Int("score", score),
 		zap.String("ja4", ja4),
@@ -287,7 +390,8 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		zap.Float64("worker_variance", beh.WorkerVariance),
 		zap.Bool("has_sec_fetch", r.Header.Get("Sec-Fetch-Site") != ""),
 		zap.Bool("mobile_ua", isMobileUA),
-		zap.Int("touch_points", sig.TouchPoints))
+		zap.Int("touch_points", sig.TouchPoints),
+		zap.Int("elapsed_ms", elapsedMs))
 
 	return score
 }
@@ -385,6 +489,16 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 		return false
 	}
 
+	// Check JA4 binding (if enabled at issuance time, Ja4 will be non-empty).
+	// If the client's current TLS fingerprint doesn't match the one stored in
+	// the cookie, the cookie was likely replayed from a different TLS stack.
+	if payload.Ja4 != "" {
+		currentJA4 := ja4Registry.Get(r.RemoteAddr)
+		if currentJA4 != payload.Ja4 {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -392,6 +506,9 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 
 // serveChallengeInterstitial generates and serves the PoW interstitial page.
 func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *http.Request, cfg *compiledChallengeConfig) error {
+	// Select difficulty adaptively based on pre-signal scoring.
+	difficulty := selectDifficulty(r, cfg.minDifficulty, cfg.maxDifficulty)
+
 	// Generate random data (64 bytes → 128 hex chars, matching Anubis).
 	randomBytes := make([]byte, 64)
 	if _, err := rand.Read(randomBytes); err != nil {
@@ -402,7 +519,14 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 	now := time.Now().UTC()
 
 	// Build the challenge payload that will be HMAC'd and embedded.
-	payloadStr := fmt.Sprintf("%s|%d|%d", randomData, cfg.difficulty, now.Unix())
+	// When JA4 binding is enabled, include the TLS fingerprint in the
+	// HMAC so the challenge can only be verified from the same TLS stack.
+	payloadStr := fmt.Sprintf("%s|%d|%d", randomData, difficulty, now.Unix())
+	if cfg.bindJA4 {
+		if ja4 := ja4Registry.Get(r.RemoteAddr); ja4 != "" {
+			payloadStr += "|" + ja4
+		}
+	}
 	mac := hmac.New(sha256.New, pe.challengeHMACKey)
 	mac.Write([]byte(payloadStr))
 	payloadHMAC := hex.EncodeToString(mac.Sum(nil))
@@ -411,7 +535,7 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 
 	challengeData := challengePayload{
 		RandomData:  randomData,
-		Difficulty:  cfg.difficulty,
+		Difficulty:  difficulty,
 		Algorithm:   cfg.algorithm,
 		HMAC:        payloadHMAC,
 		OriginalURL: originalURL,
@@ -493,14 +617,46 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
+	// Look up the matching challenge rule to get config (JA4 binding,
+	// TTL, bind_ip). We need bindJA4 before HMAC verification because
+	// the JA4 fingerprint is part of the HMAC input when enabled.
+	host := stripPort(r.Host)
+	cookieName := challengeCookieName(host)
+	bindJA4 := true  // default
+	ttl := time.Hour // default
+	bindIP := true   // default
+	pe.mu.RLock()
+	for _, cr := range pe.rules {
+		if cr.rule.Type == "challenge" && cr.challengeConfig != nil {
+			if cr.challengeConfig.cookieName == cookieName {
+				bindJA4 = cr.challengeConfig.bindJA4
+				ttl = cr.challengeConfig.ttl
+				bindIP = cr.challengeConfig.bindIP
+				break
+			}
+		}
+	}
+	pe.mu.RUnlock()
+
 	// Verify HMAC of the challenge payload (prevents tampering).
+	// When JA4 binding is enabled, the JA4 fingerprint was included in
+	// the HMAC at interstitial-serve time, so we must include it here too.
 	payloadStr := fmt.Sprintf("%s|%d|%d", randomData, difficulty, timestamp)
+	ja4 := ""
+	if bindJA4 {
+		ja4 = ja4Registry.Get(r.RemoteAddr)
+		if ja4 != "" {
+			payloadStr += "|" + ja4
+		}
+	}
 	mac := hmac.New(sha256.New, pe.challengeHMACKey)
 	mac.Write([]byte(payloadStr))
 	expectedHMAC := hex.EncodeToString(mac.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(submittedHMAC), []byte(expectedHMAC)) != 1 {
 		pe.logger.Info("challenge verify: HMAC mismatch",
-			zap.String("client_ip", clientIP(r)))
+			zap.String("client_ip", clientIP(r)),
+			zap.Bool("bind_ja4", bindJA4),
+			zap.String("ja4", ja4))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
@@ -530,12 +686,57 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
+	// ── Timing validation ───────────────────────────────────────────
+	// Parse elapsed_ms (client-reported solve time) and validate against
+	// the expected minimum for this difficulty and core count.
+	elapsedMs := -1 // negative = not submitted, skip timing checks
+	if ems := r.FormValue("elapsed_ms"); ems != "" {
+		if v, err := strconv.Atoi(ems); err == nil {
+			elapsedMs = v
+		}
+	}
+
+	// Parse core count from signals JSON for timing validation.
+	// We read it here (before scoreBotSignals) so we can do the
+	// hard-reject check independently of the soft scoring.
+	signalCores := 1
+	if signalsJSON := r.FormValue("signals"); signalsJSON != "" {
+		var sigPeek struct {
+			Cores int `json:"cores"`
+		}
+		if json.Unmarshal([]byte(signalsJSON), &sigPeek) == nil && sigPeek.Cores > 0 {
+			signalCores = sigPeek.Cores
+		}
+	}
+
+	// Hard reject: elapsed time below 1/3 of the floor is physically
+	// impossible — indicates pre-computation or hash table lookup.
+	if elapsedMs >= 0 {
+		floor := minSolveMs(difficulty, signalCores)
+		hardRejectFloor := floor / 3
+		if hardRejectFloor > 0 && elapsedMs < hardRejectFloor {
+			pe.logger.Info("challenge rejected: impossibly fast solve",
+				zap.String("client_ip", clientIP(r)),
+				zap.Int("elapsed_ms", elapsedMs),
+				zap.Int("floor_ms", floor),
+				zap.Int("hard_reject_floor_ms", hardRejectFloor),
+				zap.Int("cores", signalCores),
+				zap.Int("difficulty", difficulty))
+			caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+			return caddyhttp.Error(http.StatusForbidden, nil)
+		}
+	}
+
 	// ── Bot signal scoring ──────────────────────────────────────────
 	// Parse client-side environment probes and behavioral signals.
 	// Compute a weighted bot score (0-100). High score = likely bot.
-	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), r, pe.logger)
+	// Timing params (elapsedMs, difficulty) feed into L6 soft penalty.
+	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), r, pe.logger, elapsedMs, difficulty)
 
 	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
+
+	// Capture request headers for event detail (same browser session headers).
+	captureRequestContext(r, nil)
 
 	// Reject if bot score exceeds threshold (likely headless Chrome).
 	if botScore >= 70 {
@@ -547,24 +748,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	}
 
 	// PoW is valid + bot score acceptable — issue a signed cookie.
-	host := stripPort(r.Host)
-	cookieName := challengeCookieName(host)
-
-	// Find the matching challenge rule's TTL and bind_ip setting.
-	// Default to 1 hour if no matching rule found (shouldn't happen in practice).
-	ttl := time.Hour
-	bindIP := true
-	pe.mu.RLock()
-	for _, cr := range pe.rules {
-		if cr.rule.Type == "challenge" && cr.challengeConfig != nil {
-			if cr.challengeConfig.cookieName == cookieName {
-				ttl = cr.challengeConfig.ttl
-				bindIP = cr.challengeConfig.bindIP
-				break
-			}
-		}
-	}
-	pe.mu.RUnlock()
+	// host and cookieName were computed earlier for the JA4/HMAC lookup.
 
 	// Generate unique token ID (8 random bytes → 16 hex chars).
 	jtiBytes := make([]byte, 8)
@@ -584,6 +768,9 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	}
 	if bindIP {
 		cp.Sub = clientIP(r)
+	}
+	if bindJA4 && ja4 != "" {
+		cp.Ja4 = ja4
 	}
 
 	cpJSON, _ := json.Marshal(cp)
