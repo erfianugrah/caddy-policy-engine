@@ -632,6 +632,74 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 	return true
 }
 
+// ─── Session Collector Injection ─────────────────────────────────────
+
+// sessionCollectorWriter wraps an http.ResponseWriter to inject the
+// session collector inline script into HTML responses. The script is
+// appended before </body> if present, or at the end of the response.
+// Only active when a valid challenge cookie is present.
+type sessionCollectorWriter struct {
+	http.ResponseWriter
+	inject      []byte // the <script>...</script> to inject
+	isHTML      bool
+	checked     bool
+	wroteHeader bool
+}
+
+func (w *sessionCollectorWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	if !w.checked {
+		w.checked = true
+		ct := w.Header().Get("Content-Type")
+		w.isHTML = strings.Contains(ct, "text/html")
+		if w.isHTML {
+			// Remove Content-Length since we're modifying the body.
+			w.Header().Del("Content-Length")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *sessionCollectorWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if !w.isHTML || len(w.inject) == 0 {
+		return w.ResponseWriter.Write(b)
+	}
+
+	// Look for </body> in the chunk and inject before it.
+	lower := strings.ToLower(string(b))
+	idx := strings.LastIndex(lower, "</body>")
+	if idx >= 0 {
+		// Write everything before </body>, then the script, then </body> onward.
+		n1, err := w.ResponseWriter.Write(b[:idx])
+		if err != nil {
+			return n1, err
+		}
+		n2, err := w.ResponseWriter.Write(w.inject)
+		if err != nil {
+			return n1 + n2, err
+		}
+		n3, err := w.ResponseWriter.Write(b[idx:])
+		return n1 + n3, err // report original byte count to caller
+	}
+
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *sessionCollectorWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// sessionCollectorTag builds the <script> tag for the session collector.
+func sessionCollectorTag() []byte {
+	return []byte("\n<script>" + sessionCollectorJS + "</script>\n")
+}
+
 // ─── JTI Denylist ───────────────────────────────────────────────────
 
 // jtiDenylistFile is the JSON structure written by wafctl.

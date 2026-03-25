@@ -1154,6 +1154,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		w = rhw
 	}
 
+	// Wrap with session collector injection for HTML responses when a
+	// valid challenge cookie is present. This inserts the page-level
+	// behavioral collector script before </body>.
+	if challengePassed {
+		w = &sessionCollectorWriter{
+			ResponseWriter: w,
+			inject:         sessionCollectorTag(),
+		}
+	}
+
 	upstreamErr = next.ServeHTTP(w, r)
 
 	// Build response context from captured status + headers (no body).
