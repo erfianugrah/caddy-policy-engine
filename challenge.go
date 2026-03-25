@@ -605,7 +605,7 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 	// so we check if Sub is non-empty, meaning binding was active when issued).
 	if payload.Sub != "" && payload.Sub != clientIP(r) {
 		if pe.logger != nil {
-			pe.logger.Debug("challenge cookie rejected: IP mismatch",
+			pe.logger.Info("challenge cookie rejected: IP mismatch",
 				zap.String("cookie_ip", payload.Sub),
 				zap.String("current_ip", clientIP(r)),
 				zap.String("remote_addr", r.RemoteAddr),
@@ -621,7 +621,7 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 		currentJA4 := ja4Registry.Get(r.RemoteAddr)
 		if currentJA4 != payload.Ja4 {
 			if pe.logger != nil {
-				pe.logger.Debug("challenge cookie rejected: JA4 mismatch",
+				pe.logger.Info("challenge cookie rejected: JA4 mismatch",
 					zap.String("cookie_ja4", payload.Ja4),
 					zap.String("current_ja4", currentJA4),
 					zap.String("remote_addr", r.RemoteAddr),
