@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,12 @@ var challengeJS string
 
 //go:embed challenge-worker.js
 var challengeWorkerJS string
+
+//go:embed session-sw.js
+var sessionSWJS string
+
+//go:embed session-collector.js
+var sessionCollectorJS string
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -93,6 +101,83 @@ func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Re
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(challengeWorkerJS))
+	return nil
+}
+
+// serveSessionSW serves the session tracking service worker at
+// /.well-known/policy-challenge/session-sw.js. The Service-Worker-Allowed
+// header permits registration with origin-wide scope (the script path is
+// under /.well-known/ which is more restrictive than /).
+func (pe *PolicyEngine) serveSessionSW(w http.ResponseWriter, r *http.Request) error {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("Service-Worker-Allowed", "/")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sessionSWJS))
+	return nil
+}
+
+// handleSessionBeacon accepts POST beacons from the session service worker
+// and page-level collector at /.well-known/policy-challenge/session.
+// The beacon JSON is logged via Caddy variables for downstream processing
+// by wafctl. Returns 204 No Content (per Beacon API spec recommendation).
+func (pe *PolicyEngine) handleSessionBeacon(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return nil
+	}
+
+	// Read beacon body (limited to 64KB to prevent abuse).
+	body := make([]byte, 0, 4096)
+	buf := make([]byte, 4096)
+	total := 0
+	for {
+		n, err := r.Body.Read(buf)
+		if n > 0 {
+			total += n
+			if total > 65536 {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return nil
+			}
+			body = append(body, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if len(body) > 0 {
+		// Extract JTI from the challenge cookie for session correlation.
+		host := stripPort(r.Host)
+		cookieName := challengeCookieName(host)
+		jti := ""
+		if cookie, err := r.Cookie(cookieName); err == nil && cookie.Value != "" {
+			parts := strings.SplitN(cookie.Value, ".", 2)
+			if len(parts) == 2 {
+				if payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0]); err == nil {
+					var cp struct {
+						Jti string `json:"jti"`
+					}
+					if json.Unmarshal(payloadBytes, &cp) == nil {
+						jti = cp.Jti
+					}
+				}
+			}
+		}
+
+		// Log the session beacon data as Caddy variables for access log capture.
+		caddyhttp.SetVar(r.Context(), "policy_engine.session_beacon", string(body))
+		caddyhttp.SetVar(r.Context(), "policy_engine.session_jti", jti)
+		caddyhttp.SetVar(r.Context(), "policy_engine.action", "session_beacon")
+
+		pe.logger.Debug("session beacon received",
+			zap.String("jti", jti),
+			zap.Int("body_bytes", len(body)),
+			zap.String("client_ip", clientIP(r)))
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 
@@ -532,7 +617,144 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 		}
 	}
 
+	// Check JTI denylist — retrospective invalidation from session tracking.
+	// If the session scored as suspicious, the JTI is added to the denylist
+	// by wafctl, and the client must re-solve the challenge.
+	if payload.Jti != "" && pe.jtiDenylist != nil {
+		pe.mu.RLock()
+		denied := pe.jtiDenylist[payload.Jti]
+		pe.mu.RUnlock()
+		if denied {
+			return false
+		}
+	}
+
 	return true
+}
+
+// ─── Session Collector Injection ─────────────────────────────────────
+
+// sessionCollectorWriter wraps an http.ResponseWriter to inject the
+// session collector inline script into HTML responses. The script is
+// appended before </body> if present, or at the end of the response.
+// Only active when a valid challenge cookie is present.
+type sessionCollectorWriter struct {
+	http.ResponseWriter
+	inject      []byte // the <script>...</script> to inject
+	isHTML      bool
+	checked     bool
+	wroteHeader bool
+}
+
+func (w *sessionCollectorWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	if !w.checked {
+		w.checked = true
+		ct := w.Header().Get("Content-Type")
+		w.isHTML = strings.Contains(ct, "text/html")
+		if w.isHTML {
+			// Remove Content-Length since we're modifying the body.
+			w.Header().Del("Content-Length")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *sessionCollectorWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if !w.isHTML || len(w.inject) == 0 {
+		return w.ResponseWriter.Write(b)
+	}
+
+	// Look for </body> in the chunk and inject before it.
+	lower := strings.ToLower(string(b))
+	idx := strings.LastIndex(lower, "</body>")
+	if idx >= 0 {
+		// Write everything before </body>, then the script, then </body> onward.
+		n1, err := w.ResponseWriter.Write(b[:idx])
+		if err != nil {
+			return n1, err
+		}
+		n2, err := w.ResponseWriter.Write(w.inject)
+		if err != nil {
+			return n1 + n2, err
+		}
+		n3, err := w.ResponseWriter.Write(b[idx:])
+		return n1 + n3, err // report original byte count to caller
+	}
+
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *sessionCollectorWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// sessionCollectorTag builds the <script> tag for the session collector.
+func sessionCollectorTag() []byte {
+	return []byte("\n<script>" + sessionCollectorJS + "</script>\n")
+}
+
+// ─── JTI Denylist ───────────────────────────────────────────────────
+
+// jtiDenylistFile is the JSON structure written by wafctl.
+type jtiDenylistFile struct {
+	JTIs      []string `json:"jtis"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+// loadDenylist reads the JTI denylist file and updates the in-memory map.
+func (pe *PolicyEngine) loadDenylist() {
+	f, err := os.Open(pe.denylistFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			pe.mu.Lock()
+			pe.jtiDenylist = nil
+			pe.lastDenylistMod = time.Time{}
+			pe.mu.Unlock()
+			return
+		}
+		pe.logger.Warn("denylist file open error", zap.Error(err))
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		pe.logger.Warn("denylist file stat error", zap.Error(err))
+		return
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		pe.logger.Warn("denylist file read error", zap.Error(err))
+		return
+	}
+
+	var dl jtiDenylistFile
+	if err := json.Unmarshal(data, &dl); err != nil {
+		pe.logger.Warn("denylist file parse error", zap.Error(err))
+		return
+	}
+
+	denyMap := make(map[string]bool, len(dl.JTIs))
+	for _, jti := range dl.JTIs {
+		denyMap[jti] = true
+	}
+
+	pe.mu.Lock()
+	pe.jtiDenylist = denyMap
+	pe.lastDenylistMod = info.ModTime()
+	pe.mu.Unlock()
+
+	pe.logger.Info("loaded JTI denylist",
+		zap.Int("count", len(denyMap)),
+		zap.String("file", pe.denylistFile))
 }
 
 // ─── Interstitial Serving ───────────────────────────────────────────
@@ -624,24 +846,28 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		pe.logger.Info("challenge verify: missing fields",
 			zap.String("client_ip", clientIP(r)))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "missing_fields")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	difficulty, err := strconv.Atoi(difficultyStr)
 	if err != nil || difficulty < 1 || difficulty > 16 {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	nonce, err := strconv.Atoi(nonceStr)
 	if err != nil {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -651,6 +877,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("client_ip", clientIP(r)),
 			zap.Int64("timestamp", timestamp))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "payload_expired")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -695,6 +922,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.Bool("bind_ja4", bindJA4),
 			zap.String("ja4", ja4))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "hmac_invalid")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -710,6 +938,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("expected", calculated),
 			zap.String("got", response))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_pow")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -720,6 +949,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.Int("difficulty", difficulty),
 			zap.String("hash", calculated))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_pow")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -767,6 +997,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 				zap.Int("cores", signalCores),
 				zap.Int("difficulty", difficulty))
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+			caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "timing_hard")
 			return caddyhttp.Error(http.StatusForbidden, nil)
 		}
 	}
@@ -788,6 +1019,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("client_ip", clientIP(r)),
 			zap.Int("bot_score", botScore))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bot_score")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -115,6 +116,13 @@ type PolicyEngine struct {
 	// Challenge state
 	challengeHMACKey []byte // 32-byte HMAC-SHA256 key for cookie signing
 	challengeEnabled bool   // true if any challenge rules exist in the loaded config
+
+	// Session tracking: JTI denylist for retrospective cookie invalidation.
+	// Written by wafctl when sessions score above the suspicious threshold.
+	// Read by the plugin on mtime change (same poll loop as policy-rules.json).
+	jtiDenylist     map[string]bool // suspended JTIs
+	denylistFile    string          // path to jti-denylist.json
+	lastDenylistMod time.Time       // mtime of last read
 }
 
 // PolicyRulesFile is the top-level JSON structure of the user rules file.
@@ -461,6 +469,11 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 				zap.String("file", pe.RulesFile), zap.Error(err))
 			pe.rules = nil
 		}
+
+		// Set up JTI denylist file path (same directory as rules file).
+		pe.denylistFile = filepath.Join(filepath.Dir(pe.RulesFile), "jti-denylist.json")
+		pe.loadDenylist() // initial load (may not exist yet)
+
 		// Start hot-reload polling.
 		pe.stopPoll = make(chan struct{})
 		go pe.pollForChanges()
@@ -563,6 +576,14 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			// Worker JS is always served — the interstitial page references it,
 			// and it must be available before challenge rules are hot-reloaded.
 			return pe.serveChallengeWorkerJS(w, r)
+		case "/.well-known/policy-challenge/session-sw.js":
+			// Session tracking service worker — served with Service-Worker-Allowed: /
+			// header so it can be registered with origin-wide scope.
+			return pe.serveSessionSW(w, r)
+		case "/.well-known/policy-challenge/session":
+			// Session beacon receiver — always active (the SW may persist
+			// after challenge rules are removed). Returns 204 No Content.
+			return pe.handleSessionBeacon(w, r)
 		}
 	}
 
@@ -1131,6 +1152,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	if !isWrapped {
 		rhw = &responseHeaderWriter{ResponseWriter: w}
 		w = rhw
+	}
+
+	// Wrap with session collector injection for HTML responses when a
+	// valid challenge cookie is present. This inserts the page-level
+	// behavioral collector script before </body>.
+	if challengePassed {
+		w = &sessionCollectorWriter{
+			ResponseWriter: w,
+			inject:         sessionCollectorTag(),
+		}
 	}
 
 	upstreamErr = next.ServeHTTP(w, r)
@@ -3788,6 +3819,14 @@ func (pe *PolicyEngine) checkReload() {
 		} else if dErr != nil && !os.IsNotExist(dErr) {
 			pe.logger.Warn("default rules file stat error, skipping reload check",
 				zap.String("file", pe.DefaultRulesFile), zap.Error(dErr))
+		}
+	}
+
+	// Check JTI denylist file for changes (independent of rules reload).
+	if pe.denylistFile != "" {
+		dInfo, dErr := os.Stat(pe.denylistFile)
+		if dErr == nil && dInfo.ModTime().After(pe.lastDenylistMod) {
+			pe.loadDenylist()
 		}
 	}
 

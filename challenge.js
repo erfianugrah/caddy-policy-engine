@@ -182,6 +182,17 @@
       redirect: "manual",
     });
 
+    // Register session tracking service worker before redirecting.
+    // The SW will call clients.claim() on activate, so it will control
+    // the next page load immediately. Registration is fire-and-forget —
+    // we don't wait for it to complete before redirecting.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register(
+        "/.well-known/policy-challenge/session-sw.js",
+        { scope: "/" }
+      ).catch(() => {}); // best-effort — don't block redirect on failure
+    }
+
     if (resp.status === 302 || resp.status === 303 || resp.type === "opaqueredirect") {
       window.location.replace(original_url || "/");
     } else if (resp.ok) {
