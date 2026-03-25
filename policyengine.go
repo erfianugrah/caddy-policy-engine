@@ -581,11 +581,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			// header so it can be registered with origin-wide scope.
 			return pe.serveSessionSW(w, r)
 		case "/.well-known/policy-challenge/session":
-			// Session beacon receiver — accepts POST data from the session SW
-			// and page-level collector. Returns 204 No Content.
-			if pe.challengeEnabled {
-				return pe.handleSessionBeacon(w, r)
-			}
+			// Session beacon receiver — always active (the SW may persist
+			// after challenge rules are removed). Returns 204 No Content.
+			return pe.handleSessionBeacon(w, r)
 		}
 	}
 
