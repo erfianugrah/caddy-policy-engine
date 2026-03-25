@@ -47,7 +47,7 @@ All source lives in the repository root as a single flat Go package:
 | File | Lines | Purpose |
 |---|---|---|
 | `policyengine.go` | ~4164 | Core engine: types, compilation, 7-pass evaluation, ServeHTTP, hot-reload, field extraction, operators |
-| `challenge.go` | ~1091 | PoW challenge system: interstitial, verification, 6-layer bot scoring, adaptive difficulty, HMAC cookies, session tracking, JTI denylist |
+| `challenge.go` | ~1120 | PoW challenge system: interstitial, verification, 6-layer bot scoring, adaptive difficulty, HMAC cookies, session tracking, JTI denylist |
 | `ratelimit.go` | ~606 | Sliding window rate limiting with 16-shard concurrent counters |
 | `transforms.go` | ~820 | CRS-compatible transform functions (21 transforms matching ModSecurity `t:xxx`) |
 | `responseheaders.go` | ~804 | CSP, security headers, CORS, ResponseWriter wrapper |
@@ -56,7 +56,7 @@ All source lives in the repository root as a single flat Go package:
 | `ja4_registry.go` | ~28 | Thread-safe JA4 fingerprint store (`sync.Map`) keyed by remote address |
 | `ahocorasick.go` | ~172 | Aho-Corasick multi-pattern substring matcher for `phrase_match` operator |
 | `policyengine_test.go` | ~7498 | Core engine tests |
-| `challenge_test.go` | ~1265 | Challenge system tests |
+| `challenge_test.go` | ~1278 | Challenge system tests |
 | `ratelimit_test.go` | ~1217 | Rate limiter tests |
 | `transforms_test.go` | ~951 | Transform function tests |
 | `responseheaders_test.go` | ~2054 | Response header tests |
