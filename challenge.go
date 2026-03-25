@@ -29,6 +29,12 @@ var challengeJS string
 //go:embed challenge-worker.js
 var challengeWorkerJS string
 
+//go:embed session-sw.js
+var sessionSWJS string
+
+//go:embed session-collector.js
+var sessionCollectorJS string
+
 // ─── Types ──────────────────────────────────────────────────────────
 
 // ChallengeConfig is the per-rule challenge configuration in policy-rules.json.
@@ -93,6 +99,83 @@ func (pe *PolicyEngine) serveChallengeWorkerJS(w http.ResponseWriter, r *http.Re
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(challengeWorkerJS))
+	return nil
+}
+
+// serveSessionSW serves the session tracking service worker at
+// /.well-known/policy-challenge/session-sw.js. The Service-Worker-Allowed
+// header permits registration with origin-wide scope (the script path is
+// under /.well-known/ which is more restrictive than /).
+func (pe *PolicyEngine) serveSessionSW(w http.ResponseWriter, r *http.Request) error {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	w.Header().Set("Service-Worker-Allowed", "/")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sessionSWJS))
+	return nil
+}
+
+// handleSessionBeacon accepts POST beacons from the session service worker
+// and page-level collector at /.well-known/policy-challenge/session.
+// The beacon JSON is logged via Caddy variables for downstream processing
+// by wafctl. Returns 204 No Content (per Beacon API spec recommendation).
+func (pe *PolicyEngine) handleSessionBeacon(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return nil
+	}
+
+	// Read beacon body (limited to 64KB to prevent abuse).
+	body := make([]byte, 0, 4096)
+	buf := make([]byte, 4096)
+	total := 0
+	for {
+		n, err := r.Body.Read(buf)
+		if n > 0 {
+			total += n
+			if total > 65536 {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return nil
+			}
+			body = append(body, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if len(body) > 0 {
+		// Extract JTI from the challenge cookie for session correlation.
+		host := stripPort(r.Host)
+		cookieName := challengeCookieName(host)
+		jti := ""
+		if cookie, err := r.Cookie(cookieName); err == nil && cookie.Value != "" {
+			parts := strings.SplitN(cookie.Value, ".", 2)
+			if len(parts) == 2 {
+				if payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0]); err == nil {
+					var cp struct {
+						Jti string `json:"jti"`
+					}
+					if json.Unmarshal(payloadBytes, &cp) == nil {
+						jti = cp.Jti
+					}
+				}
+			}
+		}
+
+		// Log the session beacon data as Caddy variables for access log capture.
+		caddyhttp.SetVar(r.Context(), "policy_engine.session_beacon", string(body))
+		caddyhttp.SetVar(r.Context(), "policy_engine.session_jti", jti)
+		caddyhttp.SetVar(r.Context(), "policy_engine.action", "session_beacon")
+
+		pe.logger.Debug("session beacon received",
+			zap.String("jti", jti),
+			zap.Int("body_bytes", len(body)),
+			zap.String("client_ip", clientIP(r)))
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 
@@ -624,24 +707,28 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		pe.logger.Info("challenge verify: missing fields",
 			zap.String("client_ip", clientIP(r)))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "missing_fields")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	difficulty, err := strconv.Atoi(difficultyStr)
 	if err != nil || difficulty < 1 || difficulty > 16 {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	nonce, err := strconv.Atoi(nonceStr)
 	if err != nil {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_input")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -651,6 +738,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("client_ip", clientIP(r)),
 			zap.Int64("timestamp", timestamp))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "payload_expired")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -695,6 +783,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.Bool("bind_ja4", bindJA4),
 			zap.String("ja4", ja4))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "hmac_invalid")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -710,6 +799,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("expected", calculated),
 			zap.String("got", response))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_pow")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -720,6 +810,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.Int("difficulty", difficulty),
 			zap.String("hash", calculated))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bad_pow")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
@@ -767,6 +858,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 				zap.Int("cores", signalCores),
 				zap.Int("difficulty", difficulty))
 			caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+			caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "timing_hard")
 			return caddyhttp.Error(http.StatusForbidden, nil)
 		}
 	}
@@ -788,6 +880,7 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 			zap.String("client_ip", clientIP(r)),
 			zap.Int("bot_score", botScore))
 		caddyhttp.SetVar(r.Context(), "policy_engine.action", "challenge_failed")
+		caddyhttp.SetVar(r.Context(), "policy_engine.challenge_fail_reason", "bot_score")
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 

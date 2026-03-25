@@ -563,6 +563,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			// Worker JS is always served — the interstitial page references it,
 			// and it must be available before challenge rules are hot-reloaded.
 			return pe.serveChallengeWorkerJS(w, r)
+		case "/.well-known/policy-challenge/session-sw.js":
+			// Session tracking service worker — served with Service-Worker-Allowed: /
+			// header so it can be registered with origin-wide scope.
+			return pe.serveSessionSW(w, r)
+		case "/.well-known/policy-challenge/session":
+			// Session beacon receiver — accepts POST data from the session SW
+			// and page-level collector. Returns 204 No Content.
+			if pe.challengeEnabled {
+				return pe.handleSessionBeacon(w, r)
+			}
 		}
 	}
 
