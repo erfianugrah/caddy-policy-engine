@@ -10,17 +10,33 @@
   const config = JSON.parse(data.textContent);
   const { random_data, difficulty, hmac, original_url, timestamp, algorithm } = config;
 
-  const expectedIters = Math.pow(16, difficulty); // expected iterations to find a solution
   const t0 = Date.now();
 
-  // ── FNV-1a 32-bit hash (for canvas fingerprint) ─────────────────
-  function fnv1a32(str) {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < str.length; i++) {
-      h ^= str.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
-    }
-    return (h >>> 0).toString(16);
+  // Estimate median solve time (ms) for the time-based progress bar.
+  // Formula mirrors server-side minSolveMs: 16^difficulty / (cores * hashesPerCoreMs).
+  // We use the full expected iterations (not the safety-factored minimum) because
+  // this is the median — half of solves finish before this, half after.
+  const cores = navigator.hardwareConcurrency || 1;
+  const threads = Math.max(Math.floor(cores / 2), 1);
+  const hashesPerCoreMs = 50; // generous upper bound, same as server
+  const expectedIters = Math.pow(16, difficulty);
+  const isSlow = (algorithm === "slow");
+  // "slow" algorithm adds 10ms per iteration per thread — completely dominates.
+  const estimatedMs = isSlow
+    ? (expectedIters / threads) * 10 // 10ms delay per iter, divided across threads
+    : expectedIters / (threads * hashesPerCoreMs);
+  // Minimum 500ms so the bar is visible even at difficulty 1.
+  const estimatedSolveMs = Math.max(estimatedMs, 500);
+
+  // Time-based progress: asymptotic curve that approaches 95% smoothly.
+  // Uses 1 - e^(-k*t) where k is tuned so we hit ~80% at the estimated time.
+  // This means: fast early progress (reassuring), gradual slowdown, never stalls.
+  // If the solve takes longer than estimated, the bar keeps creeping toward 95%.
+  const progressK = -Math.log(1 - 0.80) / estimatedSolveMs; // k such that f(estimated) = 0.80
+  function timeProgress() {
+    const elapsed = Date.now() - t0;
+    const pct = (1 - Math.exp(-progressK * elapsed)) * 95;
+    return Math.min(pct, 95);
   }
 
   // ── Layer 3: JS Environment Probes ──────────────────────────────
@@ -48,9 +64,8 @@
     } catch { return -1; }
   })();
 
-  // 3c. WebGL renderer (SwiftShader = headless)
+  // 3c. WebGL renderer (SwiftShader = headless) + MAX_TEXTURE_SIZE
   signals.wglr = "";
-  signals.wglv = "";
   try {
     const c = document.createElement("canvas");
     const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
@@ -58,20 +73,10 @@
       const ext = gl.getExtension("WEBGL_debug_renderer_info");
       if (ext) {
         signals.wglr = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "";
-        signals.wglv = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || "";
       }
-      // Deep WebGL probes — these can't be faked by patching getParameter
-      // for just the renderer string. SwiftShader returns distinctive values.
+      // MAX_TEXTURE_SIZE catches stealth scripts that patch the renderer
+      // string but can't fake GPU limits. SwiftShader caps at 8192.
       signals.wglMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
-      signals.wglMaxVP = (() => { try { const v = gl.getParameter(gl.MAX_VIEWPORT_DIMS); return v ? [v[0], v[1]] : [0,0]; } catch { return [0,0]; } })();
-      signals.wglMaxRB = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
-      signals.wglAliasedLW = (() => { try { const v = gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE); return v ? [v[0], v[1]] : [0,0]; } catch { return [0,0]; } })();
-      signals.wglShaderHigh = (() => {
-        try {
-          const p = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
-          return p ? p.precision : 0;
-        } catch { return 0; }
-      })();
     }
   } catch {}
 
@@ -109,27 +114,8 @@
   signals.plt = navigator.platform || "";
   signals.sw = screen.width;
   signals.sh = screen.height;
-  signals.cd = screen.colorDepth;
-  signals.dpr = window.devicePixelRatio || 1;
 
-  // 3e. Canvas fingerprint
-  signals.cvs = (() => {
-    try {
-      const c = document.createElement("canvas");
-      c.width = 280; c.height = 60;
-      const ctx = c.getContext("2d");
-      ctx.font = "14px Arial";
-      ctx.fillStyle = "#f60";
-      ctx.fillRect(125, 1, 62, 20);
-      ctx.fillStyle = "#069";
-      ctx.fillText("policy-challenge-fp", 2, 15);
-      ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
-      ctx.fillText("policy-challenge-fp", 4, 45);
-      return fnv1a32(c.toDataURL());
-    } catch { return "err"; }
-  })();
-
-  // 3f. Permissions API timing (async — done before PoW starts)
+  // 3e. Permissions API timing (async — done before PoW starts)
   signals.pt = -1;
   try {
     const pt0 = performance.now();
@@ -208,8 +194,6 @@
 
   // ── Try multi-threaded Web Workers ──────────────────────────────
   const canUseWorkers = typeof Worker !== "undefined";
-  const cores = navigator.hardwareConcurrency || 1;
-  const threads = Math.max(Math.floor(cores / 2), 1);
 
   if (canUseWorkers) {
     if (statusEl) statusEl.textContent = "Verifying your browser...";
@@ -236,11 +220,8 @@
               const now = Date.now();
               progressTimings.push(now - lastProgressTs);
               lastProgressTs = now;
-              // Progress based on fraction of expected iterations searched.
-              // Nonce is the total iterations across all threads so far.
-              // Cap at 95% — the last 5% is reserved for the "Verified!" state.
-              const pct = Math.min(event.data / expectedIters * 100, 95);
-              if (progressEl) progressEl.style.width = pct + "%";
+              // Time-based progress — smooth asymptotic curve regardless of difficulty.
+              if (progressEl) progressEl.style.width = timeProgress() + "%";
             } else {
               cleanup();
               resolve(event.data);
@@ -308,8 +289,8 @@
         const now = Date.now();
         progressTimings.push(now - lastProgressTs);
         lastProgressTs = now;
-        const pct = Math.min(nonce / expectedIters * 100, 95);
-        if (progressEl) progressEl.style.width = pct + "%";
+        // Time-based progress — same asymptotic curve as the worker path.
+        if (progressEl) progressEl.style.width = timeProgress() + "%";
       }
     }
   }

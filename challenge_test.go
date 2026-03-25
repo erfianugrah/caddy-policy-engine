@@ -570,7 +570,7 @@ func TestServeChallengeWorkerJS(t *testing.T) {
 // ─── Bot Signal Scoring ─────────────────────────────────────────────
 
 func TestScoreBotSignals_RealBrowser(t *testing.T) {
-	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","wglv":"Google Inc. (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"a1b2c3d4","pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
 	behavior := `{"me":15,"ke":0,"fc":1,"se":2,"fi":850,"wtv":8.3,"dur":3000}`
 
 	// Real browser request with proper headers.
@@ -588,7 +588,7 @@ func TestScoreBotSignals_RealBrowser(t *testing.T) {
 }
 
 func TestScoreBotSignals_HeadlessChrome(t *testing.T) {
-	signals := `{"wd":1,"cdc":0,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","wglv":"Google Inc.","cores":2,"mem":0,"touch":0,"plt":"Linux x86_64","sw":800,"sh":600,"cd":24,"dpr":1,"cvs":"deadbeef","pt":0.1}`
+	signals := `{"wd":1,"cdc":0,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","cores":2,"mem":0,"touch":0,"plt":"Linux x86_64","sw":800,"sh":600,"pt":0.1}`
 	behavior := `{"me":0,"ke":0,"fc":0,"se":0,"fi":-1,"wtv":0.3,"dur":5000}`
 
 	score := scoreBotSignals(signals, behavior, makeRequest("POST", "/.well-known/policy-challenge/verify", "1.2.3.4:5678"), zap.NewNop(), -1, 0)
@@ -598,8 +598,8 @@ func TestScoreBotSignals_HeadlessChrome(t *testing.T) {
 }
 
 func TestScoreBotSignals_Puppeteer(t *testing.T) {
-	signals := `{"wd":0,"cdc":1,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","wglv":"Google Inc.","cores":4,"mem":0,"touch":0,"plt":"Linux x86_64","sw":1280,"sh":720,"cd":24,"dpr":1,"cvs":"cafebabe","pt":0.05}`
-	behavior := `{"me":0,"ke":0,"fc":0,"se":0,"fi":-1,"wtv":0.5,"dur":2000}`
+	signals := `{"wd":0,"cdc":1,"cr":0,"plg":0,"lang":1,"sv":0,"wglr":"Google SwiftShader","cores":4,"mem":0,"touch":0,"plt":"Linux x86_64","sw":1280,"sh":720,"pt":0.05}`
+	behavior := `{"me":0,"ke":0,"fc":0,"se":0,"fi":-1,"wtv":0.3,"dur":2000}`
 
 	score := scoreBotSignals(signals, behavior, makeRequest("POST", "/.well-known/policy-challenge/verify", "1.2.3.4:5678"), zap.NewNop(), -1, 0)
 	if score < 70 {
@@ -771,7 +771,7 @@ func TestMinSolveMs_Monotonic(t *testing.T) {
 
 func TestScoreBotSignals_TimingPenalty(t *testing.T) {
 	// Real browser signals (low base score) but suspiciously fast solve.
-	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","wglv":"Google Inc. (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"a1b2c3d4","pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
 	behavior := `{"me":15,"ke":0,"fc":1,"se":2,"fi":850,"wtv":8.3,"dur":3000}`
 
 	r := makeRequestWithHeaders("POST", "/.well-known/policy-challenge/verify", "1.2.3.4:5678", map[string]string{
@@ -795,7 +795,7 @@ func TestScoreBotSignals_TimingPenalty(t *testing.T) {
 
 func TestScoreBotSignals_TimingSkipped(t *testing.T) {
 	// With elapsedMs = -1, timing scoring is skipped entirely.
-	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","wglv":"Google","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"abc","pt":12.5}`
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5}`
 	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
 		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
 		"Sec-Fetch-Site":  "same-origin",
@@ -888,7 +888,7 @@ func TestHandleChallengeVerifyTimingHardReject(t *testing.T) {
 	payloadHMAC = hex.EncodeToString(mac.Sum(nil))
 
 	// Signals with 8 cores. minSolveMs(4, 8) ≈ 49ms. Hard reject floor ≈ 16ms.
-	signalsJSON := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","wglv":"Google","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"abc","pt":12.5}`
+	signalsJSON := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5}`
 
 	form := url.Values{}
 	form.Set("random_data", randomData)
@@ -1044,7 +1044,7 @@ func TestSelectDifficulty_ScoreBotSignalsConsistency(t *testing.T) {
 	preScore := preSignalScore(r)
 	// scoreBotSignals with no signals returns 0 (fail open).
 	// But with minimal signals it should include at least the preScore.
-	minimalSignals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","wglv":"Google","cores":8,"mem":8,"touch":0,"plt":"Linux","sw":1920,"sh":1080,"cd":24,"dpr":1,"cvs":"abc","pt":12.5,"wglMaxTex":16384,"audioHash":-1}`
+	minimalSignals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Linux","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-1}`
 	fullScore := scoreBotSignals(minimalSignals, "", r, zap.NewNop(), -1, 0)
 
 	if fullScore < preScore {

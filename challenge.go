@@ -152,30 +152,22 @@ func minSolveMs(difficulty, cores int) int {
 
 // botSignals is the parsed client-side environment probe data.
 type botSignals struct {
-	Webdriver       int        `json:"wd"`                      // 1 = navigator.webdriver true
-	CDCPresent      int        `json:"cdc"`                     // 1 = ChromeDriver markers found
-	ChromeRuntime   int        `json:"cr"`                      // 1 = window.chrome.runtime present
-	PluginCount     int        `json:"plg"`                     // navigator.plugins.length
-	LanguageCount   int        `json:"lang"`                    // navigator.languages.length
-	SpeechVoices    int        `json:"sv"`                      // speechSynthesis voices count
-	WebGLRenderer   string     `json:"wglr"`                    // UNMASKED_RENDERER_WEBGL
-	WebGLVendor     string     `json:"wglv"`                    // UNMASKED_VENDOR_WEBGL
-	WebGLMaxTex     int        `json:"wglMaxTex,omitempty"`     // MAX_TEXTURE_SIZE
-	WebGLMaxVP      [2]int     `json:"wglMaxVP,omitempty"`      // MAX_VIEWPORT_DIMS
-	WebGLMaxRB      int        `json:"wglMaxRB,omitempty"`      // MAX_RENDERBUFFER_SIZE
-	WebGLAliasedLW  [2]float64 `json:"wglAliasedLW,omitempty"`  // ALIASED_LINE_WIDTH_RANGE
-	WebGLShaderHigh int        `json:"wglShaderHigh,omitempty"` // FRAGMENT_SHADER HIGH_FLOAT precision
-	AudioHash       int        `json:"audioHash,omitempty"`     // OfflineAudioContext fingerprint
-	Cores           int        `json:"cores"`
-	Memory          float64    `json:"mem"`
-	TouchPoints     int        `json:"touch"`
-	Platform        string     `json:"plt"`
-	ScreenWidth     int        `json:"sw"`
-	ScreenHeight    int        `json:"sh"`
-	ColorDepth      int        `json:"cd"`
-	PixelRatio      float64    `json:"dpr"`
-	CanvasHash      string     `json:"cvs"`
-	PermissionTime  float64    `json:"pt"` // ms for permissions.query
+	Webdriver      int     `json:"wd"`                  // 1 = navigator.webdriver true
+	CDCPresent     int     `json:"cdc"`                 // 1 = ChromeDriver markers found
+	ChromeRuntime  int     `json:"cr"`                  // 1 = window.chrome.runtime present
+	PluginCount    int     `json:"plg"`                 // navigator.plugins.length
+	LanguageCount  int     `json:"lang"`                // navigator.languages.length
+	SpeechVoices   int     `json:"sv"`                  // speechSynthesis voices count
+	WebGLRenderer  string  `json:"wglr"`                // UNMASKED_RENDERER_WEBGL
+	WebGLMaxTex    int     `json:"wglMaxTex,omitempty"` // MAX_TEXTURE_SIZE
+	AudioHash      int     `json:"audioHash,omitempty"` // OfflineAudioContext fingerprint
+	Cores          int     `json:"cores"`
+	Memory         float64 `json:"mem"`
+	TouchPoints    int     `json:"touch"`
+	Platform       string  `json:"plt"`
+	ScreenWidth    int     `json:"sw"`
+	ScreenHeight   int     `json:"sh"`
+	PermissionTime float64 `json:"pt"` // ms for permissions.query
 }
 
 // botBehavior is the parsed behavioral data collected during PoW.
@@ -314,10 +306,10 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		score += 85
 	}
 	if sig.WebGLMaxTex > 0 && sig.WebGLMaxTex <= 8192 && !strings.Contains(sig.WebGLRenderer, "SwiftShader") {
-		score += 60
+		score += 60 // small GPU texture limit without SwiftShader — virtual GPU
 	}
 	if sig.AudioHash == 0 && sig.PluginCount > 0 {
-		score += 15
+		score += 15 // audio API failed but plugins present — inconsistent
 	}
 	if sig.PluginCount == 0 {
 		score += 30
@@ -326,7 +318,7 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		score += 20
 	}
 	if sig.PermissionTime >= 0 && sig.PermissionTime < 0.5 {
-		score += 30
+		score += 30 // permissions.query too fast — no real permission store
 	}
 	if sig.LanguageCount <= 1 {
 		score += 10
@@ -334,26 +326,65 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 	if sig.ChromeRuntime == 0 {
 		score += 15
 	}
+	// Server-class memory: >= 32GB is unusual for a consumer browser.
+	// VPS instances running headless Chrome farms typically report high RAM.
+	if sig.Memory >= 32 {
+		score += 15
+	}
 
 	// ── Layer 4: Behavioral signals ───────────────────────────────
 	if beh.Duration > 2000 && beh.MouseEvents == 0 && beh.KeyEvents == 0 && beh.ScrollEvents == 0 {
-		score += 15
+		score += 15 // no interaction during long challenge — likely automated
 	}
-	if beh.WorkerVariance >= 0 && beh.WorkerVariance < 1.0 && beh.Duration > 1000 {
+	// Worker timing variance: truly deterministic execution (stddev < 0.5ms)
+	// over a meaningful duration indicates a controlled environment. Real
+	// browsers have OS scheduling jitter that produces higher variance.
+	if beh.WorkerVariance >= 0 && beh.WorkerVariance < 0.5 && beh.Duration > 1000 {
 		score += 20
+	}
+	// Positive signal: organic mouse activity with early first interaction
+	// indicates a real human. Subtract a small amount to reduce false positives
+	// for legitimate browsers that happen to trigger minor red flags.
+	if beh.MouseEvents >= 5 && beh.FirstInteraction > 0 && beh.FirstInteraction < 2000 {
+		score -= 10
+		if score < 0 {
+			score = 0
+		}
 	}
 
 	// ── Layer 5 (full): Spatial inconsistency with JS signals ─────
 	// The partial L5 check (Chrome UA + JA4) already ran in preSignalScore.
-	// Here we add the JS-dependent checks: touch points and screen width.
-	isMobileUA := strings.Contains(strings.ToLower(ua), "mobile") ||
-		strings.Contains(strings.ToLower(ua), "android") ||
-		strings.Contains(strings.ToLower(ua), "iphone")
+	// Here we add the JS-dependent checks.
+	uaLower := strings.ToLower(ua)
+	isMobileUA := strings.Contains(uaLower, "mobile") ||
+		strings.Contains(uaLower, "android") ||
+		strings.Contains(uaLower, "iphone")
 	if isMobileUA && sig.TouchPoints == 0 {
 		score += 40 // mobile UA but no touch support
 	}
 	if isMobileUA && sig.ScreenWidth > 2000 {
 		score += 30 // mobile UA but desktop screen resolution
+	}
+	// Platform vs UA cross-check: "Win32" platform with non-Windows UA
+	// or "Linux" platform with Windows UA indicates UA spoofing.
+	if sig.Platform != "" {
+		pltLower := strings.ToLower(sig.Platform)
+		isWinPlatform := strings.Contains(pltLower, "win")
+		isLinuxPlatform := strings.Contains(pltLower, "linux")
+		isMacPlatform := strings.Contains(pltLower, "mac")
+		uaClaimsWindows := strings.Contains(uaLower, "windows")
+		uaClaimsMac := strings.Contains(uaLower, "macintosh") || strings.Contains(uaLower, "mac os")
+		uaClaimsLinux := strings.Contains(uaLower, "linux") || strings.Contains(uaLower, "android")
+		// Platform says Windows but UA says Mac/Linux (or vice versa).
+		if isWinPlatform && !uaClaimsWindows && (uaClaimsMac || uaClaimsLinux) {
+			score += 30
+		}
+		if isMacPlatform && !uaClaimsMac && (uaClaimsWindows || uaClaimsLinux) {
+			score += 30
+		}
+		if isLinuxPlatform && !uaClaimsLinux && (uaClaimsWindows || uaClaimsMac) {
+			score += 30
+		}
 	}
 
 	// ── Layer 6: Timing validation ───────────────────────────────
@@ -391,6 +422,8 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		zap.Bool("has_sec_fetch", r.Header.Get("Sec-Fetch-Site") != ""),
 		zap.Bool("mobile_ua", isMobileUA),
 		zap.Int("touch_points", sig.TouchPoints),
+		zap.String("platform", sig.Platform),
+		zap.Float64("memory_gb", sig.Memory),
 		zap.Int("elapsed_ms", elapsedMs))
 
 	return score
