@@ -248,6 +248,11 @@ The challenge system serves a proof-of-work interstitial to suspicious traffic. 
 | `bind_ip` | bool | true | Invalidate cookie if client IP changes |
 | `bind_ja4` | bool | true | Invalidate cookie if JA4 TLS fingerprint changes |
 
+**Proxy-aware bindings:** When a request arrives via a trusted proxy (detected by comparing
+the trusted-proxy-resolved client IP with `r.RemoteAddr`), JA4 binding is automatically
+skipped because the JA4 fingerprint belongs to the proxy's TLS stack, not the client's.
+IP binding uses the resolved real client IP in all cases.
+
 When both `min_difficulty` and `max_difficulty` are > 0, the server picks difficulty per-request based on `preSignalScore()`. Clean browsers get min, suspicious TLS/headers get max. This overrides `difficulty` entirely.
 
 ### Adaptive Difficulty
@@ -273,7 +278,7 @@ A bot score >= 70 rejects the submission even with a valid PoW solution.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/.well-known/policy-challenge/verify` | POST | PoW solution verification |
+| `/.well-known/policy-challenge/verify` | POST | PoW solution verification (returns 200 JSON `{redirect: url}`) |
 | `/.well-known/policy-challenge/worker.js` | GET | Web Worker for parallel SHA-256 hashing |
 | `/.well-known/policy-challenge/session-sw.js` | GET | Service Worker for session tracking |
 | `/.well-known/policy-challenge/session` | POST | Session beacon receiver |
