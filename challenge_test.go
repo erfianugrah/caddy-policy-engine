@@ -1144,3 +1144,122 @@ func TestChallengeHistoryField(t *testing.T) {
 		}
 	})
 }
+
+// ─── JTI Denylist Tests ─────────────────────────────────────────────
+
+func TestJTIDenylistInvalidatesCookie(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	pe := &PolicyEngine{
+		challengeHMACKey: key,
+		mu:               &sync.RWMutex{},
+		// Denylist with one suspended JTI.
+		jtiDenylist: map[string]bool{"suspended-jti-001": true},
+	}
+
+	host := "httpbun.erfi.io"
+	cookieName := challengeCookieName(host)
+
+	// Build a valid cookie with the suspended JTI.
+	payload := challengeCookiePayload{
+		Jti: "suspended-jti-001",
+		Aud: host,
+		Exp: time.Now().Add(time.Hour).Unix(),
+		Iat: time.Now().Unix(),
+		Dif: 4,
+	}
+	cpJSON, _ := json.Marshal(payload)
+	cpB64 := base64.RawURLEncoding.EncodeToString(cpJSON)
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(cpB64))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+	r.Host = host
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: cpB64 + "." + sig})
+
+	// Cookie is cryptographically valid, but JTI is denylisted.
+	if pe.validateChallengeCookie(r) {
+		t.Error("cookie with denylisted JTI should fail validation")
+	}
+}
+
+func TestJTIDenylistAllowsNonDenied(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	pe := &PolicyEngine{
+		challengeHMACKey: key,
+		mu:               &sync.RWMutex{},
+		jtiDenylist:      map[string]bool{"other-jti": true},
+	}
+
+	host := "httpbun.erfi.io"
+	cookieName := challengeCookieName(host)
+
+	// Build a valid cookie with a non-suspended JTI.
+	payload := challengeCookiePayload{
+		Jti: "good-jti-002",
+		Sub: "1.2.3.4",
+		Aud: host,
+		Exp: time.Now().Add(time.Hour).Unix(),
+		Iat: time.Now().Unix(),
+		Dif: 4,
+	}
+	cpJSON, _ := json.Marshal(payload)
+	cpB64 := base64.RawURLEncoding.EncodeToString(cpJSON)
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(cpB64))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+	r.Host = host
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: cpB64 + "." + sig})
+
+	if !pe.validateChallengeCookie(r) {
+		t.Error("cookie with non-denied JTI should pass validation")
+	}
+}
+
+func TestJTIDenylistNilAllowsAll(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	pe := &PolicyEngine{
+		challengeHMACKey: key,
+		mu:               &sync.RWMutex{},
+		jtiDenylist:      nil, // no denylist file loaded
+	}
+
+	host := "httpbun.erfi.io"
+	cookieName := challengeCookieName(host)
+
+	payload := challengeCookiePayload{
+		Jti: "any-jti",
+		Sub: "1.2.3.4",
+		Aud: host,
+		Exp: time.Now().Add(time.Hour).Unix(),
+		Iat: time.Now().Unix(),
+		Dif: 4,
+	}
+	cpJSON, _ := json.Marshal(payload)
+	cpB64 := base64.RawURLEncoding.EncodeToString(cpJSON)
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(cpB64))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
+	r.Host = host
+	r.AddCookie(&http.Cookie{Name: cookieName, Value: cpB64 + "." + sig})
+
+	if !pe.validateChallengeCookie(r) {
+		t.Error("cookie should pass when denylist is nil")
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -115,6 +116,13 @@ type PolicyEngine struct {
 	// Challenge state
 	challengeHMACKey []byte // 32-byte HMAC-SHA256 key for cookie signing
 	challengeEnabled bool   // true if any challenge rules exist in the loaded config
+
+	// Session tracking: JTI denylist for retrospective cookie invalidation.
+	// Written by wafctl when sessions score above the suspicious threshold.
+	// Read by the plugin on mtime change (same poll loop as policy-rules.json).
+	jtiDenylist     map[string]bool // suspended JTIs
+	denylistFile    string          // path to jti-denylist.json
+	lastDenylistMod time.Time       // mtime of last read
 }
 
 // PolicyRulesFile is the top-level JSON structure of the user rules file.
@@ -461,6 +469,11 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 				zap.String("file", pe.RulesFile), zap.Error(err))
 			pe.rules = nil
 		}
+
+		// Set up JTI denylist file path (same directory as rules file).
+		pe.denylistFile = filepath.Join(filepath.Dir(pe.RulesFile), "jti-denylist.json")
+		pe.loadDenylist() // initial load (may not exist yet)
+
 		// Start hot-reload polling.
 		pe.stopPoll = make(chan struct{})
 		go pe.pollForChanges()
@@ -3798,6 +3811,14 @@ func (pe *PolicyEngine) checkReload() {
 		} else if dErr != nil && !os.IsNotExist(dErr) {
 			pe.logger.Warn("default rules file stat error, skipping reload check",
 				zap.String("file", pe.DefaultRulesFile), zap.Error(dErr))
+		}
+	}
+
+	// Check JTI denylist file for changes (independent of rules reload).
+	if pe.denylistFile != "" {
+		dInfo, dErr := os.Stat(pe.denylistFile)
+		if dErr == nil && dInfo.ModTime().After(pe.lastDenylistMod) {
+			pe.loadDenylist()
 		}
 	}
 

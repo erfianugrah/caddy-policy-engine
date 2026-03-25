@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -615,7 +617,76 @@ func (pe *PolicyEngine) validateChallengeCookie(r *http.Request) bool {
 		}
 	}
 
+	// Check JTI denylist — retrospective invalidation from session tracking.
+	// If the session scored as suspicious, the JTI is added to the denylist
+	// by wafctl, and the client must re-solve the challenge.
+	if payload.Jti != "" && pe.jtiDenylist != nil {
+		pe.mu.RLock()
+		denied := pe.jtiDenylist[payload.Jti]
+		pe.mu.RUnlock()
+		if denied {
+			return false
+		}
+	}
+
 	return true
+}
+
+// ─── JTI Denylist ───────────────────────────────────────────────────
+
+// jtiDenylistFile is the JSON structure written by wafctl.
+type jtiDenylistFile struct {
+	JTIs      []string `json:"jtis"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+// loadDenylist reads the JTI denylist file and updates the in-memory map.
+func (pe *PolicyEngine) loadDenylist() {
+	f, err := os.Open(pe.denylistFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			pe.mu.Lock()
+			pe.jtiDenylist = nil
+			pe.lastDenylistMod = time.Time{}
+			pe.mu.Unlock()
+			return
+		}
+		pe.logger.Warn("denylist file open error", zap.Error(err))
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		pe.logger.Warn("denylist file stat error", zap.Error(err))
+		return
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		pe.logger.Warn("denylist file read error", zap.Error(err))
+		return
+	}
+
+	var dl jtiDenylistFile
+	if err := json.Unmarshal(data, &dl); err != nil {
+		pe.logger.Warn("denylist file parse error", zap.Error(err))
+		return
+	}
+
+	denyMap := make(map[string]bool, len(dl.JTIs))
+	for _, jti := range dl.JTIs {
+		denyMap[jti] = true
+	}
+
+	pe.mu.Lock()
+	pe.jtiDenylist = denyMap
+	pe.lastDenylistMod = info.ModTime()
+	pe.mu.Unlock()
+
+	pe.logger.Info("loaded JTI denylist",
+		zap.Int("count", len(denyMap)),
+		zap.String("file", pe.denylistFile))
 }
 
 // ─── Interstitial Serving ───────────────────────────────────────────
