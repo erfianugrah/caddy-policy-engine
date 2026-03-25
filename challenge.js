@@ -176,10 +176,12 @@
       dur: Date.now() - t0,
     }));
 
+    // POST without redirect:"manual" — the verify endpoint returns 200 JSON
+    // with {redirect: url}. This ensures the browser processes the Set-Cookie
+    // header (opaque redirect responses from redirect:"manual" suppress cookies).
     const resp = await fetch("/.well-known/policy-challenge/verify", {
       method: "POST",
       body: form,
-      redirect: "manual",
     });
 
     // Register session tracking service worker before redirecting.
@@ -193,11 +195,13 @@
       ).catch(() => {}); // best-effort — don't block redirect on failure
     }
 
-    if (resp.status === 302 || resp.status === 303 || resp.type === "opaqueredirect") {
-      window.location.replace(original_url || "/");
-    } else if (resp.ok) {
-      const loc = resp.headers.get("Location");
-      window.location.replace(loc || original_url || "/");
+    if (resp.ok) {
+      try {
+        const data = await resp.json();
+        window.location.replace(data.redirect || original_url || "/");
+      } catch {
+        window.location.replace(original_url || "/");
+      }
     } else {
       if (statusEl) statusEl.textContent = "Challenge failed. Please refresh the page.";
     }

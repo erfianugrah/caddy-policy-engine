@@ -696,8 +696,10 @@ func TestHandleChallengeVerifyValid(t *testing.T) {
 	}
 
 	resp := w.Result()
-	if resp.StatusCode != http.StatusFound {
-		t.Errorf("status = %d, want 302", resp.StatusCode)
+	// Verify endpoint now returns 200 JSON (not 302) so the browser
+	// processes Set-Cookie before the JS-initiated redirect.
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 
 	// Should have set a cookie.
@@ -716,6 +718,17 @@ func TestHandleChallengeVerifyValid(t *testing.T) {
 	}
 	if !found {
 		t.Error("no challenge cookie found in response")
+	}
+
+	// Should have JSON body with redirect URL.
+	var body struct {
+		Redirect string `json:"redirect"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode JSON body: %v", err)
+	}
+	if body.Redirect != "/page" {
+		t.Errorf("redirect = %q, want /page", body.Redirect)
 	}
 }
 

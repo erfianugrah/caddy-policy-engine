@@ -792,10 +792,12 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 	now := time.Now().UTC()
 
 	// Build the challenge payload that will be HMAC'd and embedded.
-	// When JA4 binding is enabled, include the TLS fingerprint in the
-	// HMAC so the challenge can only be verified from the same TLS stack.
+	// When JA4 binding is enabled AND the client connects directly (not via
+	// a trusted proxy/CDN), include the TLS fingerprint in the HMAC so the
+	// challenge can only be verified from the same TLS stack.
 	payloadStr := fmt.Sprintf("%s|%d|%d", randomData, difficulty, now.Unix())
-	if cfg.bindJA4 {
+	serveIsProxied := clientIP(r) != stripPort(r.RemoteAddr)
+	if cfg.bindJA4 && !serveIsProxied {
 		if ja4 := ja4Registry.Get(r.RemoteAddr); ja4 != "" {
 			payloadStr += "|" + ja4
 		}
@@ -917,11 +919,12 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	pe.mu.RUnlock()
 
 	// Verify HMAC of the challenge payload (prevents tampering).
-	// When JA4 binding is enabled, the JA4 fingerprint was included in
-	// the HMAC at interstitial-serve time, so we must include it here too.
+	// When JA4 binding is enabled AND the client connects directly (not via
+	// proxy), the JA4 fingerprint was included in the HMAC at serve time.
 	payloadStr := fmt.Sprintf("%s|%d|%d", randomData, difficulty, timestamp)
 	ja4 := ""
-	if bindJA4 {
+	verifyIsProxied := clientIP(r) != stripPort(r.RemoteAddr)
+	if bindJA4 && !verifyIsProxied {
 		ja4 = ja4Registry.Get(r.RemoteAddr)
 		if ja4 != "" {
 			payloadStr += "|" + ja4
@@ -1059,7 +1062,12 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	if bindIP {
 		cp.Sub = clientIP(r)
 	}
-	if bindJA4 && ja4 != "" {
+	// Only bind JA4 when the client terminates TLS directly with us.
+	// Behind a CDN/proxy, r.RemoteAddr is the proxy's IP and the JA4 is
+	// the proxy's TLS fingerprint, not the client's. Detect this by
+	// comparing the trusted-proxy-resolved client IP with r.RemoteAddr.
+	isProxied := clientIP(r) != stripPort(r.RemoteAddr)
+	if bindJA4 && ja4 != "" && !isProxied {
 		cp.Ja4 = ja4
 	}
 
@@ -1095,11 +1103,18 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
 	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_jti", jti)
 
-	// Redirect to original URL.
+	// Return JSON with redirect URL instead of a 302 redirect.
+	// The client-side JS does the redirect via window.location.replace().
+	// This is critical because the challenge.js uses fetch() with
+	// redirect:"manual", and opaque redirect responses suppress Set-Cookie
+	// processing in browsers. A 200 JSON response ensures the browser
+	// stores the cookie before the JS-initiated redirect.
 	redirectURL := originalURL
 	if redirectURL == "" {
 		redirectURL = "/"
 	}
-	http.Redirect(w, r, redirectURL, http.StatusFound)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"redirect": redirectURL})
 	return nil
 }
