@@ -46,7 +46,7 @@ All source lives in the repository root as a single flat Go package:
 
 | File | Lines | Purpose |
 |---|---|---|
-| `policyengine.go` | ~4164 | Core engine: types, compilation, 7-pass evaluation, ServeHTTP, hot-reload, field extraction, operators |
+| `policyengine.go` | ~4419 | Core engine: types, compilation, 7-pass evaluation, ServeHTTP, hot-reload, field extraction, operators, CRS protocol enforcement |
 | `challenge.go` | ~1120 | PoW challenge system: interstitial, verification, 6-layer bot scoring, adaptive difficulty, HMAC cookies, session tracking, JTI denylist |
 | `ratelimit.go` | ~606 | Sliding window rate limiting with 16-shard concurrent counters |
 | `transforms.go` | ~820 | CRS-compatible transform functions (21 transforms matching ModSecurity `t:xxx`) |
@@ -55,7 +55,7 @@ All source lives in the repository root as a single flat Go package:
 | `ja4_listener.go` | ~152 | `caddy.ListenerWrapper` module for JA4 — intercepts connections pre-TLS |
 | `ja4_registry.go` | ~28 | Thread-safe JA4 fingerprint store (`sync.Map`) keyed by remote address |
 | `ahocorasick.go` | ~172 | Aho-Corasick multi-pattern substring matcher for `phrase_match` operator |
-| `policyengine_test.go` | ~7498 | Core engine tests |
+| `policyengine_test.go` | ~7698 | Core engine tests |
 | `challenge_test.go` | ~1278 | Challenge system tests |
 | `ratelimit_test.go` | ~1217 | Rate limiter tests |
 | `transforms_test.go` | ~951 | Transform function tests |
@@ -89,6 +89,28 @@ All source lives in the repository root as a single flat Go package:
 
 Within each band, rules are sorted by priority (ascending), then by rule ID for
 deterministic tie-breaking.
+
+### CRS Protocol Enforcement
+
+`WafConfig` carries CRS extended settings for protocol enforcement. These are
+checked before the main rule loop in `ServeHTTP` via `enforceProtocolLimits()`.
+Violations produce synthetic detect rule matches with CRITICAL severity (+5 score)
+using original CRS rule IDs for event correlation.
+
+| Setting | CRS Rule | Description |
+|---------|----------|-------------|
+| `allowed_methods` | 911100 | Space-separated HTTP methods (e.g., "GET HEAD POST") |
+| `allowed_http_versions` | 920430 | Space-separated versions (e.g., "HTTP/1.1 HTTP/2.0") |
+| `max_num_args` | 920380 | Max argument count (0 = unlimited) |
+| `arg_name_length` | 920360 | Max argument name length (0 = unlimited) |
+| `arg_length` | 920370 | Max argument value length (0 = unlimited) |
+| `total_arg_length` | 920390 | Max combined query string length (0 = unlimited) |
+| `max_file_size` | 920400 | Max individual upload size (0 = unlimited, not yet enforced) |
+| `combined_file_sizes` | 920410 | Max combined upload size (0 = unlimited, not yet enforced) |
+
+All settings support per-service overrides via `WafServiceConfig`. Zero/empty = not
+enforced (permissive default). Settings flow from wafctl dashboard → `waf-config.json`
+→ `policy-rules.json` `waf_config` section → plugin `compileWafConfig()`.
 
 ## Dependencies
 
