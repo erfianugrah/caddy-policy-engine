@@ -156,6 +156,17 @@ type WafConfig struct {
 	OutboundThreshold  int                         `json:"outbound_threshold"`
 	DisabledCategories []string                    `json:"disabled_categories,omitempty"` // global: CRS rule ID prefixes to skip (e.g., "942" for SQLi)
 	PerService         map[string]WafServiceConfig `json:"per_service,omitempty"`
+
+	// CRS extended settings — protocol enforcement limits.
+	// Zero/empty values mean "not enforced" (permissive default).
+	AllowedMethods      string `json:"allowed_methods,omitempty"`       // space-separated: "GET HEAD POST OPTIONS"
+	AllowedHTTPVersions string `json:"allowed_http_versions,omitempty"` // space-separated: "HTTP/1.1 HTTP/2 HTTP/2.0 HTTP/3 HTTP/3.0"
+	MaxNumArgs          int    `json:"max_num_args,omitempty"`          // max number of request arguments (0 = unlimited)
+	ArgNameLength       int    `json:"arg_name_length,omitempty"`       // max length of any argument name (0 = unlimited)
+	ArgLength           int    `json:"arg_length,omitempty"`            // max length of any argument value (0 = unlimited)
+	TotalArgLength      int    `json:"total_arg_length,omitempty"`      // max combined length of all arguments (0 = unlimited)
+	MaxFileSize         int    `json:"max_file_size,omitempty"`         // max individual file upload size in bytes (0 = unlimited)
+	CombinedFileSizes   int    `json:"combined_file_sizes,omitempty"`   // max combined file upload size in bytes (0 = unlimited)
 }
 
 // WafServiceConfig allows per-service threshold, PL, and category overrides.
@@ -164,6 +175,16 @@ type WafServiceConfig struct {
 	InboundThreshold   int      `json:"inbound_threshold,omitempty"`
 	OutboundThreshold  int      `json:"outbound_threshold,omitempty"`
 	DisabledCategories []string `json:"disabled_categories,omitempty"` // per-service: CRS rule ID prefixes to skip
+
+	// Per-service CRS extended settings (override global defaults).
+	AllowedMethods      string `json:"allowed_methods,omitempty"`
+	AllowedHTTPVersions string `json:"allowed_http_versions,omitempty"`
+	MaxNumArgs          int    `json:"max_num_args,omitempty"`
+	ArgNameLength       int    `json:"arg_name_length,omitempty"`
+	ArgLength           int    `json:"arg_length,omitempty"`
+	TotalArgLength      int    `json:"total_arg_length,omitempty"`
+	MaxFileSize         int    `json:"max_file_size,omitempty"`
+	CombinedFileSizes   int    `json:"combined_file_sizes,omitempty"`
 }
 
 // compiledWafConfig is the pre-compiled WAF config for O(1) per-request lookup.
@@ -173,6 +194,16 @@ type compiledWafConfig struct {
 	defaultOutThreshold       int
 	defaultDisabledCategories map[string]bool // global disabled categories
 	services                  map[string]compiledWafServiceConfig
+
+	// CRS extended settings (compiled for O(1) lookup).
+	allowedMethods      map[string]bool // nil = all methods allowed
+	allowedHTTPVersions map[string]bool // nil = all versions allowed
+	maxNumArgs          int             // 0 = unlimited
+	argNameLength       int             // 0 = unlimited
+	argLength           int             // 0 = unlimited
+	totalArgLength      int             // 0 = unlimited
+	maxFileSize         int             // 0 = unlimited
+	combinedFileSizes   int             // 0 = unlimited
 }
 
 type compiledWafServiceConfig struct {
@@ -180,6 +211,16 @@ type compiledWafServiceConfig struct {
 	inboundThreshold   int
 	outboundThreshold  int
 	disabledCategories map[string]bool // rule ID prefix set for O(1) lookup
+
+	// Per-service overrides (nil/zero = use global default).
+	allowedMethods      map[string]bool
+	allowedHTTPVersions map[string]bool
+	maxNumArgs          int
+	argNameLength       int
+	argLength           int
+	totalArgLength      int
+	maxFileSize         int
+	combinedFileSizes   int
 }
 
 // scoreAccumulator tracks per-request anomaly scores during detect rule evaluation.
@@ -631,6 +672,16 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	host := stripPort(r.Host)
 	servicePL, serviceThreshold, serviceOutThreshold := resolveWafConfig(wafCfg, host)
 	disabledCats := resolveDisabledCategories(wafCfg, host)
+
+	// CRS protocol enforcement: check method, HTTP version, arg limits.
+	// Violations accumulate anomaly score like detect rules (CRITICAL = +5).
+	limits := resolveProtocolLimits(wafCfg, host)
+	if violations := enforceProtocolLimits(limits, r); len(violations) > 0 {
+		for _, v := range violations {
+			scorer.inbound += v.score
+			scorer.matched = append(scorer.matched, v)
+		}
+	}
 
 	for _, cr := range rules {
 		if !cr.rule.Enabled {
@@ -3336,6 +3387,17 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 	if c.defaultPL == 0 {
 		c.defaultPL = 1
 	}
+
+	// Compile CRS extended settings (protocol enforcement limits).
+	c.allowedMethods = compileSpaceList(cfg.AllowedMethods)
+	c.allowedHTTPVersions = compileSpaceList(cfg.AllowedHTTPVersions)
+	c.maxNumArgs = cfg.MaxNumArgs
+	c.argNameLength = cfg.ArgNameLength
+	c.argLength = cfg.ArgLength
+	c.totalArgLength = cfg.TotalArgLength
+	c.maxFileSize = cfg.MaxFileSize
+	c.combinedFileSizes = cfg.CombinedFileSizes
+
 	// Threshold 0 = blocking disabled (detect rules evaluate and log but
 	// never block). The operator must explicitly set a threshold > 0 to
 	// enable anomaly-based blocking.
@@ -3356,6 +3418,15 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 			} else {
 				cs.disabledCategories = c.defaultDisabledCategories
 			}
+			// Per-service CRS extended settings; zero/nil = inherit global.
+			cs.allowedMethods = compileSpaceList(svc.AllowedMethods)
+			cs.allowedHTTPVersions = compileSpaceList(svc.AllowedHTTPVersions)
+			cs.maxNumArgs = svc.MaxNumArgs
+			cs.argNameLength = svc.ArgNameLength
+			cs.argLength = svc.ArgLength
+			cs.totalArgLength = svc.TotalArgLength
+			cs.maxFileSize = svc.MaxFileSize
+			cs.combinedFileSizes = svc.CombinedFileSizes
 			// Zero means "inherit from defaults".
 			if cs.paranoiaLevel == 0 {
 				cs.paranoiaLevel = c.defaultPL
@@ -3370,6 +3441,21 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 		}
 	}
 	return c
+}
+
+// compileSpaceList converts a space-separated string into a set for O(1) lookup.
+// Returns nil if the input is empty (meaning "not enforced").
+func compileSpaceList(s string) map[string]bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Fields(s)
+	m := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		m[p] = true
+	}
+	return m
 }
 
 // resolveWafConfig returns the effective paranoia level and inbound threshold
@@ -3400,6 +3486,175 @@ func resolveDisabledCategories(cfg *compiledWafConfig, host string) map[string]b
 		}
 	}
 	return cfg.defaultDisabledCategories
+}
+
+// resolveProtocolLimits returns the effective protocol enforcement limits for a host.
+// Per-service values override global defaults. Zero/nil means "not enforced."
+type protocolLimits struct {
+	allowedMethods      map[string]bool
+	allowedHTTPVersions map[string]bool
+	maxNumArgs          int
+	argNameLength       int
+	argLength           int
+	totalArgLength      int
+	maxFileSize         int
+	combinedFileSizes   int
+}
+
+func resolveProtocolLimits(cfg *compiledWafConfig, host string) protocolLimits {
+	if cfg == nil {
+		return protocolLimits{}
+	}
+	pl := protocolLimits{
+		allowedMethods:      cfg.allowedMethods,
+		allowedHTTPVersions: cfg.allowedHTTPVersions,
+		maxNumArgs:          cfg.maxNumArgs,
+		argNameLength:       cfg.argNameLength,
+		argLength:           cfg.argLength,
+		totalArgLength:      cfg.totalArgLength,
+		maxFileSize:         cfg.maxFileSize,
+		combinedFileSizes:   cfg.combinedFileSizes,
+	}
+	if cfg.services != nil {
+		if svc, ok := cfg.services[strings.ToLower(host)]; ok {
+			// Per-service overrides (non-nil/non-zero = override).
+			if svc.allowedMethods != nil {
+				pl.allowedMethods = svc.allowedMethods
+			}
+			if svc.allowedHTTPVersions != nil {
+				pl.allowedHTTPVersions = svc.allowedHTTPVersions
+			}
+			if svc.maxNumArgs > 0 {
+				pl.maxNumArgs = svc.maxNumArgs
+			}
+			if svc.argNameLength > 0 {
+				pl.argNameLength = svc.argNameLength
+			}
+			if svc.argLength > 0 {
+				pl.argLength = svc.argLength
+			}
+			if svc.totalArgLength > 0 {
+				pl.totalArgLength = svc.totalArgLength
+			}
+			if svc.maxFileSize > 0 {
+				pl.maxFileSize = svc.maxFileSize
+			}
+			if svc.combinedFileSizes > 0 {
+				pl.combinedFileSizes = svc.combinedFileSizes
+			}
+		}
+	}
+	return pl
+}
+
+// enforceProtocolLimits checks CRS protocol enforcement limits against the request.
+// Returns matched violations as synthetic detect rule matches (CRS rule IDs 911100,
+// 920360-920410, 920430). Each violation adds CRITICAL severity (+5 anomaly score).
+// Returns nil if no limits are configured or no violations found.
+func enforceProtocolLimits(limits protocolLimits, r *http.Request) []matchedRule {
+	var violations []matchedRule
+	criticalScore := 5 // CRS CRITICAL severity
+
+	// 911100: Method enforcement
+	if limits.allowedMethods != nil && !limits.allowedMethods[r.Method] {
+		violations = append(violations, matchedRule{
+			ruleID: "911100", ruleName: "911100", severity: "CRITICAL", score: criticalScore,
+			matches: []matchDetail{{
+				Field: "method", VarName: "REQUEST_METHOD",
+				Value: r.Method, MatchedData: r.Method,
+				Operator: "not_in",
+			}},
+		})
+	}
+
+	// 920430: HTTP version enforcement
+	if limits.allowedHTTPVersions != nil {
+		version := r.Proto
+		if !limits.allowedHTTPVersions[version] {
+			violations = append(violations, matchedRule{
+				ruleID: "920430", ruleName: "920430", severity: "CRITICAL", score: criticalScore,
+				matches: []matchDetail{{
+					Field: "http_version", VarName: "REQUEST_PROTOCOL",
+					Value: version, MatchedData: version,
+					Operator: "not_in",
+				}},
+			})
+		}
+	}
+
+	// 920380: Max number of arguments
+	if limits.maxNumArgs > 0 {
+		argCount := len(r.URL.Query())
+		if r.PostForm != nil {
+			argCount += len(r.PostForm)
+		}
+		if argCount > limits.maxNumArgs {
+			violations = append(violations, matchedRule{
+				ruleID: "920380", ruleName: "920380", severity: "CRITICAL", score: criticalScore,
+				matches: []matchDetail{{
+					Field: "count:all_args", VarName: "&ARGS",
+					Value: fmt.Sprintf("%d", argCount), MatchedData: fmt.Sprintf("%d > %d", argCount, limits.maxNumArgs),
+					Operator: "gt",
+				}},
+			})
+		}
+	}
+
+	// 920360: Argument name length
+	if limits.argNameLength > 0 {
+		for name := range r.URL.Query() {
+			if len(name) > limits.argNameLength {
+				violations = append(violations, matchedRule{
+					ruleID: "920360", ruleName: "920360", severity: "CRITICAL", score: criticalScore,
+					matches: []matchDetail{{
+						Field: "all_args_names", VarName: "ARGS_NAMES:" + name,
+						Value: name, MatchedData: fmt.Sprintf("len %d > %d", len(name), limits.argNameLength),
+						Operator: "gt",
+					}},
+				})
+				break
+			}
+		}
+	}
+
+	// 920370: Argument value length
+	if limits.argLength > 0 {
+		for name, vals := range r.URL.Query() {
+			for _, v := range vals {
+				if len(v) > limits.argLength {
+					violations = append(violations, matchedRule{
+						ruleID: "920370", ruleName: "920370", severity: "CRITICAL", score: criticalScore,
+						matches: []matchDetail{{
+							Field: "all_args_values", VarName: "ARGS:" + name,
+							Value: v[:min(200, len(v))], MatchedData: fmt.Sprintf("len %d > %d", len(v), limits.argLength),
+							Operator: "gt",
+						}},
+					})
+					break
+				}
+			}
+			if len(violations) > 0 && violations[len(violations)-1].ruleID == "920370" {
+				break
+			}
+		}
+	}
+
+	// 920390: Total argument length
+	if limits.totalArgLength > 0 {
+		total := len(r.URL.RawQuery)
+		if total > limits.totalArgLength {
+			violations = append(violations, matchedRule{
+				ruleID: "920390", ruleName: "920390", severity: "CRITICAL", score: criticalScore,
+				matches: []matchDetail{{
+					Field: "query", VarName: "ARGS_COMBINED_SIZE",
+					Value: fmt.Sprintf("%d", total), MatchedData: fmt.Sprintf("%d > %d", total, limits.totalArgLength),
+					Operator: "gt",
+				}},
+			})
+		}
+	}
+
+	return violations
 }
 
 // isRuleDisabledByCategory checks if a rule's ID prefix matches any disabled category.

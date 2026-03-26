@@ -3693,6 +3693,206 @@ func TestResolveWafConfig_Nil(t *testing.T) {
 	}
 }
 
+// ─── Protocol Enforcement Tests ──────────────────────────────────────
+
+func TestEnforceProtocolLimits_AllowedMethods(t *testing.T) {
+	limits := protocolLimits{
+		allowedMethods: map[string]bool{"GET": true, "HEAD": true, "POST": true},
+	}
+
+	t.Run("allowed method", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations for allowed GET, got %d", len(violations))
+		}
+	})
+
+	t.Run("disallowed method", func(t *testing.T) {
+		r, _ := http.NewRequest("DELETE", "http://example.com/", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation for DELETE, got %d", len(violations))
+		}
+		if violations[0].ruleID != "911100" {
+			t.Errorf("expected rule 911100, got %s", violations[0].ruleID)
+		}
+		if violations[0].score != 5 {
+			t.Errorf("expected score 5, got %d", violations[0].score)
+		}
+	})
+
+	t.Run("nil allowed methods = no enforcement", func(t *testing.T) {
+		r, _ := http.NewRequest("DELETE", "http://example.com/", nil)
+		violations := enforceProtocolLimits(protocolLimits{}, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations when methods not configured, got %d", len(violations))
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_AllowedHTTPVersions(t *testing.T) {
+	limits := protocolLimits{
+		allowedHTTPVersions: map[string]bool{"HTTP/1.1": true, "HTTP/2.0": true},
+	}
+
+	t.Run("allowed version", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/", nil)
+		r.Proto = "HTTP/1.1"
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations for HTTP/1.1, got %d", len(violations))
+		}
+	})
+
+	t.Run("disallowed version", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/", nil)
+		r.Proto = "HTTP/1.0"
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation for HTTP/1.0, got %d", len(violations))
+		}
+		if violations[0].ruleID != "920430" {
+			t.Errorf("expected rule 920430, got %s", violations[0].ruleID)
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_MaxNumArgs(t *testing.T) {
+	limits := protocolLimits{maxNumArgs: 3}
+
+	t.Run("within limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?a=1&b=2", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations, got %d", len(violations))
+		}
+	})
+
+	t.Run("exceeds limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?a=1&b=2&c=3&d=4", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation, got %d", len(violations))
+		}
+		if violations[0].ruleID != "920380" {
+			t.Errorf("expected rule 920380, got %s", violations[0].ruleID)
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_ArgNameLength(t *testing.T) {
+	limits := protocolLimits{argNameLength: 5}
+
+	t.Run("within limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?name=val", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations, got %d", len(violations))
+		}
+	})
+
+	t.Run("exceeds limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?toolongname=val", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation, got %d", len(violations))
+		}
+		if violations[0].ruleID != "920360" {
+			t.Errorf("expected rule 920360, got %s", violations[0].ruleID)
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_ArgLength(t *testing.T) {
+	limits := protocolLimits{argLength: 10}
+
+	t.Run("within limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?x=short", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations, got %d", len(violations))
+		}
+	})
+
+	t.Run("exceeds limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?x=thisvalueistoolong", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation, got %d", len(violations))
+		}
+		if violations[0].ruleID != "920370" {
+			t.Errorf("expected rule 920370, got %s", violations[0].ruleID)
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_TotalArgLength(t *testing.T) {
+	limits := protocolLimits{totalArgLength: 20}
+
+	t.Run("within limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?a=1&b=2", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 0 {
+			t.Errorf("expected 0 violations, got %d", len(violations))
+		}
+	})
+
+	t.Run("exceeds limit", func(t *testing.T) {
+		r, _ := http.NewRequest("GET", "http://example.com/?longparam=longvalue&another=value1234", nil)
+		violations := enforceProtocolLimits(limits, r)
+		if len(violations) != 1 {
+			t.Fatalf("expected 1 violation, got %d", len(violations))
+		}
+		if violations[0].ruleID != "920390" {
+			t.Errorf("expected rule 920390, got %s", violations[0].ruleID)
+		}
+	})
+}
+
+func TestEnforceProtocolLimits_MultipleViolations(t *testing.T) {
+	limits := protocolLimits{
+		allowedMethods: map[string]bool{"GET": true},
+		maxNumArgs:     1,
+	}
+	r, _ := http.NewRequest("POST", "http://example.com/?a=1&b=2", nil)
+	violations := enforceProtocolLimits(limits, r)
+	if len(violations) != 2 {
+		t.Fatalf("expected 2 violations (method + args), got %d", len(violations))
+	}
+	// Should have both 911100 (method) and 920380 (max args)
+	ids := map[string]bool{}
+	for _, v := range violations {
+		ids[v.ruleID] = true
+	}
+	if !ids["911100"] {
+		t.Error("missing 911100 violation")
+	}
+	if !ids["920380"] {
+		t.Error("missing 920380 violation")
+	}
+}
+
+func TestCompileSpaceList(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		if m := compileSpaceList(""); m != nil {
+			t.Error("expected nil for empty string")
+		}
+	})
+	t.Run("single", func(t *testing.T) {
+		m := compileSpaceList("GET")
+		if !m["GET"] || len(m) != 1 {
+			t.Errorf("expected {GET}, got %v", m)
+		}
+	})
+	t.Run("multiple", func(t *testing.T) {
+		m := compileSpaceList("GET HEAD POST")
+		if len(m) != 3 || !m["GET"] || !m["HEAD"] || !m["POST"] {
+			t.Errorf("expected 3 methods, got %v", m)
+		}
+	})
+}
+
 func TestDetect_ServiceMatching(t *testing.T) {
 	path := writeTempRulesFileWithConfig(t, []PolicyRule{
 		{
