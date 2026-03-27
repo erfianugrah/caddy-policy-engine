@@ -1454,9 +1454,13 @@ func matchRule(cr compiledRule, r *http.Request, pb *parsedBody) bool {
 		return true
 	}
 
+	// TX capture context: populated by regex captures in condition evaluation,
+	// consumed by subsequent conditions with field="tx" (CRS chain semantics).
+	txVars := map[string]string{}
+
 	if cr.rule.GroupOp == "or" {
 		for _, cc := range cr.conditions {
-			if matchCondition(cc, r, pb) {
+			if matchCondition(cc, r, pb, txVars) {
 				return true
 			}
 		}
@@ -1464,20 +1468,22 @@ func matchRule(cr compiledRule, r *http.Request, pb *parsedBody) bool {
 	}
 
 	// Default: AND — all conditions must match.
+	// Conditions are evaluated left-to-right; earlier conditions populate txVars
+	// that later conditions can reference via field="tx" name="0", "1", etc.
 	for _, cc := range cr.conditions {
-		if !matchCondition(cc, r, pb) {
+		if !matchCondition(cc, r, pb, txVars) {
 			return false
 		}
 	}
 	return true
 }
 
-func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool {
+func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVars map[string]string) bool {
 	// Nested group: recursively evaluate sub-conditions.
 	if cc.isGroup {
 		isAnd := cc.subGroupOp == "and"
 		for _, sub := range cc.subConditions {
-			result := matchCondition(sub, r, pb)
+			result := matchCondition(sub, r, pb, txVars)
 			if isAnd && !result {
 				return false
 			}
@@ -1539,6 +1545,19 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 		return false
 	}
 
+	// TX field: read from per-request capture context instead of the request.
+	if cc.field == "tx" {
+		if cc.negate && txFieldAbsent(cc, txVars) {
+			return false
+		}
+		target := txExtract(cc, txVars)
+		result := evalMultiMatchOrPlain(cc, target)
+		if cc.negate {
+			return !result
+		}
+		return result
+	}
+
 	// Coraza semantics: when a negated condition targets a variable that doesn't
 	// exist (e.g., Content-Length header on GET), skip the condition. Without
 	// this, negated regex rules (like "!@rx ^\d+$") would fire on every request
@@ -1550,6 +1569,18 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody) bool 
 	}
 
 	target := extractField(cc, r, pb)
+
+	// Store regex submatches in txVars for subsequent conditions.
+	// This implements CRS capture semantics: head condition captures with (groups),
+	// chain conditions reference captures via field="tx" name="0", "1", etc.
+	if cc.regex != nil && txVars != nil {
+		submatches := cc.regex.FindStringSubmatch(target)
+		if len(submatches) > 1 {
+			for i, sm := range submatches[1:] {
+				txVars[strconv.Itoa(i)] = sm
+			}
+		}
+	}
 
 	result := evalMultiMatchOrPlain(cc, target)
 	if cc.negate {
@@ -1752,9 +1783,34 @@ func extractField(cc compiledCondition, r *http.Request, pb *parsedBody) string 
 			}
 		}
 		return ""
+	// tx: field — reads from per-request TX variable capture context.
+	// Populated by regex submatches from previous conditions in AND chains.
+	// cc.name is the TX variable key (e.g., "0", "1", "content_type").
+	// This field is handled specially in matchCondition since it needs the
+	// txVars map, which extractField doesn't have access to. See txExtract().
 	default:
 		return ""
 	}
+}
+
+// txExtract reads a TX variable from the capture context.
+// Called from matchCondition when cc.field == "tx".
+func txExtract(cc compiledCondition, txVars map[string]string) string {
+	if cc.name != "" {
+		if val, ok := txVars[cc.name]; ok {
+			return val
+		}
+	}
+	return ""
+}
+
+// txFieldAbsent returns true if the TX variable is not set.
+func txFieldAbsent(cc compiledCondition, txVars map[string]string) bool {
+	if cc.name != "" {
+		_, ok := txVars[cc.name]
+		return !ok
+	}
+	return true
 }
 
 // responseContext holds captured response data for outbound rule evaluation.
@@ -2770,13 +2826,13 @@ func evalOperatorDetailed(cc compiledCondition, target string) (bool, string) {
 // on success. Returns (matched bool, detail *matchDetail).
 // For multi-value fields, reports the FIRST matching value (same as Coraza's
 // MATCHED_VAR which captures the first matching variable).
-func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBody) (bool, *matchDetail) {
+func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBody, txVars map[string]string) (bool, *matchDetail) {
 	// Nested group: recursively evaluate sub-conditions, return first matching detail.
 	if cc.isGroup {
 		isAnd := cc.subGroupOp == "and"
 		var firstDetail *matchDetail
 		for _, sub := range cc.subConditions {
-			result, detail := matchConditionDetailed(sub, r, pb)
+			result, detail := matchConditionDetailed(sub, r, pb, txVars)
 			if result && firstDetail == nil {
 				firstDetail = detail
 			}
@@ -2869,6 +2925,28 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 		return false, nil
 	}
 
+	// TX field: read from per-request capture context.
+	if cc.field == "tx" {
+		if cc.negate && txFieldAbsent(cc, txVars) {
+			return false, nil
+		}
+		target := txExtract(cc, txVars)
+		matched, matchedData := evalMultiMatchOrPlainDetailed(cc, target)
+		if cc.negate {
+			matched = !matched
+		}
+		if matched {
+			return true, &matchDetail{
+				Field:       "tx",
+				VarName:     "TX:" + cc.name,
+				Value:       truncateForLog(target),
+				MatchedData: truncateForLog(matchedData),
+				Operator:    cc.operator,
+			}
+		}
+		return false, nil
+	}
+
 	// Coraza semantics: skip negated condition if the field variable doesn't exist.
 	if cc.negate && fieldAbsent(cc, r) {
 		return false, nil
@@ -2877,6 +2955,16 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	// Single-value field.
 	target := extractField(cc, r, pb)
 	origTarget := target
+
+	// Store regex submatches in txVars for subsequent conditions.
+	if cc.regex != nil && txVars != nil {
+		submatches := cc.regex.FindStringSubmatch(target)
+		if len(submatches) > 1 {
+			for i, sm := range submatches[1:] {
+				txVars[strconv.Itoa(i)] = sm
+			}
+		}
+	}
 
 	matched, matchedData := evalMultiMatchOrPlainDetailed(cc, target)
 	if cc.negate {
@@ -2901,10 +2989,12 @@ func matchRuleDetailed(cr compiledRule, r *http.Request, pb *parsedBody) (bool, 
 		return true, nil
 	}
 
+	txVars := map[string]string{}
+
 	if cr.rule.GroupOp == "or" {
 		// OR: return on first match.
 		for _, cc := range cr.conditions {
-			matched, detail := matchConditionDetailed(cc, r, pb)
+			matched, detail := matchConditionDetailed(cc, r, pb, txVars)
 			if matched {
 				if detail != nil {
 					return true, []matchDetail{*detail}
@@ -2918,7 +3008,7 @@ func matchRuleDetailed(cr compiledRule, r *http.Request, pb *parsedBody) (bool, 
 	// AND: all must match, collect all details.
 	var details []matchDetail
 	for _, cc := range cr.conditions {
-		matched, detail := matchConditionDetailed(cc, r, pb)
+		matched, detail := matchConditionDetailed(cc, r, pb, txVars)
 		if !matched {
 			return false, nil
 		}
@@ -3730,6 +3820,12 @@ func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, 
 	case strings.HasPrefix(cond.Field, "body_json:"):
 		cc.field = "body_json"
 		cc.name = cond.Field[len("body_json:"):]
+	case strings.HasPrefix(cond.Field, "tx:"):
+		cc.field = "tx"
+		cc.name = cond.Field[len("tx:"):]
+	case cond.Field == "tx":
+		cc.field = "tx"
+		// name will be parsed from value below if needed
 	}
 
 	// Parse named fields from value: "Name:value" format (wafctl convention).
@@ -3743,6 +3839,11 @@ func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, 
 				value = value[idx+1:]
 			}
 		case "body_json":
+			if idx := strings.IndexByte(value, ':'); idx >= 0 {
+				cc.name = value[:idx]
+				value = value[idx+1:]
+			}
+		case "tx":
 			if idx := strings.IndexByte(value, ':'); idx >= 0 {
 				cc.name = value[:idx]
 				value = value[idx+1:]

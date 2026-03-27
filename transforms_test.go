@@ -424,13 +424,13 @@ func TestMatchCondition_CmdLineTransform(t *testing.T) {
 
 	// Evasion via carets + URL encoding.
 	req := httptest.NewRequest("GET", "/api?cmd=C%5EA%5ET+/E%5ETC/PASSWD", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: c^a^t /e^tc/passwd should normalize to 'cat etc passwd'")
 	}
 
 	// Clean request.
 	req2 := httptest.NewRequest("GET", "/api?cmd=hello", nil)
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected no match on clean request")
 	}
 }
@@ -449,7 +449,7 @@ func TestMatchCondition_EscapeSeqDecodeTransform(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", `\x41`)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: \\x41 should decode to 'A'")
 	}
 }
@@ -469,7 +469,7 @@ func TestMatchCondition_RemoveCommentsCharTransform(t *testing.T) {
 
 	// Evasion via SQL comments: OR/**/1=1
 	req := httptest.NewRequest("GET", "/?id=1'+OR/**/1=1--", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: OR/**/1=1 should become OR1=1 after removeCommentsChar")
 	}
 }
@@ -592,19 +592,19 @@ func TestMatchCondition_URLDecodeTransform(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/page?q=%3Cscript%3Ealert(1)", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: URL-encoded <script> should be detected after urlDecode")
 	}
 
 	// Without encoding — should still match.
 	req2 := httptest.NewRequest("GET", "/page?q=<script>alert(1)", nil)
-	if !matchCondition(cc, req2, nil) {
+	if !matchCondition(cc, req2, nil, nil) {
 		t.Error("expected match: literal <script> should match")
 	}
 
 	// Clean request — should not match.
 	req3 := httptest.NewRequest("GET", "/page?q=hello", nil)
-	if matchCondition(cc, req3, nil) {
+	if matchCondition(cc, req3, nil, nil) {
 		t.Error("expected no match on clean request")
 	}
 }
@@ -623,13 +623,13 @@ func TestMatchCondition_LowercaseTransform(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", "SQLMAP/1.0")
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: SQLMAP should match 'sqlmap' after lowercase")
 	}
 
 	req2 := httptest.NewRequest("GET", "/", nil)
 	req2.Header.Set("User-Agent", "Mozilla/5.0")
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected no match on normal UA")
 	}
 }
@@ -649,7 +649,7 @@ func TestMatchCondition_TransformChain(t *testing.T) {
 
 	// URL-encoded HTML entities: %26lt%3B = &lt; → < after urlDecode + htmlEntityDecode
 	req := httptest.NewRequest("GET", "/page?q=%26lt%3BSCRIPT", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: double-encoded <SCRIPT should be detected")
 	}
 }
@@ -667,7 +667,7 @@ func TestMatchCondition_NormalizePathTransform(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/files/..%2F..%2Fetc%2Fpasswd", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: path traversal should be normalized")
 	}
 }
@@ -687,7 +687,7 @@ func TestMatchCondition_TransformWithRegex(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", "NIKTO/2.5.0")
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: NIKTO should match after lowercase")
 	}
 }
@@ -706,7 +706,7 @@ func TestMatchCondition_TransformWithEq(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected match: GET → get after lowercase")
 	}
 }
@@ -724,7 +724,7 @@ func TestMatchCondition_TransformNoMatch(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/innocent/page?q=hello", nil)
-	if matchCondition(cc, req, nil) {
+	if matchCondition(cc, req, nil, nil) {
 		t.Error("expected no match on clean request")
 	}
 }

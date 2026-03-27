@@ -100,7 +100,7 @@ func TestCondition_Eq_Match(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/admin", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected /admin to match eq /admin")
 	}
 }
@@ -111,7 +111,7 @@ func TestCondition_Eq_NoMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/administrator", "10.0.0.1:1234")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("expected /administrator to NOT match eq /admin")
 	}
 }
@@ -122,7 +122,7 @@ func TestCondition_Neq_Match(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected POST to match neq GET")
 	}
 }
@@ -133,7 +133,7 @@ func TestCondition_Neq_NoMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("expected GET to NOT match neq GET")
 	}
 }
@@ -148,7 +148,7 @@ func TestCondition_Contains_Match(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"User-Agent": "Mozilla/5.0 BadBot/1.0",
 	})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected match for UA containing BadBot")
 	}
 }
@@ -161,7 +161,7 @@ func TestCondition_Contains_NoMatch(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"User-Agent": "Mozilla/5.0",
 	})
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("expected no match for UA without BadBot")
 	}
 }
@@ -174,11 +174,11 @@ func TestCondition_BeginsWith(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/api/v3/queue", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected /api/v3/queue to match begins_with /api/")
 	}
 	r2 := makeRequest("GET", "/login", "10.0.0.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected /login to NOT match begins_with /api/")
 	}
 }
@@ -189,11 +189,11 @@ func TestCondition_EndsWith(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/wp-login.php", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected wp-login.php to match ends_with .php")
 	}
 	r2 := makeRequest("GET", "/index.html", "10.0.0.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected index.html to NOT match ends_with .php")
 	}
 }
@@ -207,12 +207,12 @@ func TestCondition_Regex_Match(t *testing.T) {
 	}
 	for _, path := range []string{"/wp-admin", "/wp-login.php", "/wp-content/uploads"} {
 		r := makeRequest("GET", path, "10.0.0.1:1234")
-		if !matchCondition(cc, r, nil) {
+		if !matchCondition(cc, r, nil, nil) {
 			t.Errorf("expected %s to match regex", path)
 		}
 	}
 	r := makeRequest("GET", "/about", "10.0.0.1:1234")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("expected /about to NOT match regex")
 	}
 }
@@ -232,11 +232,11 @@ func TestCondition_IPMatch_Single(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected 10.0.0.1 to match ip_match 10.0.0.1")
 	}
 	r2 := makeRequest("GET", "/", "10.0.0.2:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected 10.0.0.2 to NOT match ip_match 10.0.0.1")
 	}
 }
@@ -247,11 +247,11 @@ func TestCondition_IPMatch_CIDR(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "192.168.1.50:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected 192.168.1.50 to match ip_match 192.168.1.0/24")
 	}
 	r2 := makeRequest("GET", "/", "192.168.2.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected 192.168.2.1 to NOT match ip_match 192.168.1.0/24")
 	}
 }
@@ -263,12 +263,12 @@ func TestCondition_IPMatch_MultipleCIDRs(t *testing.T) {
 	}
 	for _, ip := range []string{"10.1.2.3", "192.168.100.50"} {
 		r := makeRequest("GET", "/", ip+":1234")
-		if !matchCondition(cc, r, nil) {
+		if !matchCondition(cc, r, nil, nil) {
 			t.Errorf("expected %s to match", ip)
 		}
 	}
 	r := makeRequest("GET", "/", "172.16.0.1:1234")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("expected 172.16.0.1 to NOT match")
 	}
 }
@@ -279,11 +279,11 @@ func TestCondition_NotIPMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "192.168.1.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected 192.168.1.1 to match not_ip_match 10.0.0.0/8")
 	}
 	r2 := makeRequest("GET", "/", "10.0.0.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected 10.0.0.1 to NOT match not_ip_match 10.0.0.0/8")
 	}
 }
@@ -298,7 +298,7 @@ func TestCondition_In_ExactMatch(t *testing.T) {
 	// Should match exact paths.
 	for _, path := range []string{"/admin", "/wp-login.php", "/xmlrpc.php"} {
 		r := makeRequest("GET", path, "10.0.0.1:1234")
-		if !matchCondition(cc, r, nil) {
+		if !matchCondition(cc, r, nil, nil) {
 			t.Errorf("expected %s to match in operator", path)
 		}
 	}
@@ -313,13 +313,13 @@ func TestCondition_In_PipeDelimited(t *testing.T) {
 	}
 	for _, path := range []string{"/trap", "/honeypot", "/wp-login.php"} {
 		r := makeRequest("GET", path, "10.0.0.1:1234")
-		if !matchCondition(cc, r, nil) {
+		if !matchCondition(cc, r, nil, nil) {
 			t.Errorf("expected pipe-delimited %s to match in operator", path)
 		}
 	}
 	// Must not match substrings.
 	r := makeRequest("GET", "/trap-extended", "10.0.0.1:1234")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("SECURITY: /trap-extended should NOT match pipe-delimited 'in /trap|/honeypot|/wp-login.php'")
 	}
 }
@@ -333,7 +333,7 @@ func TestCondition_In_NotSubstring(t *testing.T) {
 	}
 	for _, path := range []string{"/administrator", "/login-page", "/wp-admin", "/admin/"} {
 		r := makeRequest("GET", path, "10.0.0.1:1234")
-		if matchCondition(cc, r, nil) {
+		if matchCondition(cc, r, nil, nil) {
 			t.Errorf("SECURITY: %s should NOT match 'in /admin /login' (exact match, not substring)", path)
 		}
 	}
@@ -347,13 +347,13 @@ func TestCondition_In_Country(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"Cf-Ipcountry": "US",
 	})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected US to match in US GB DE")
 	}
 	r2 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"Cf-Ipcountry": "USA",
 	})
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("SECURITY: USA should NOT match in US GB DE (exact match)")
 	}
 }
@@ -367,7 +367,7 @@ func TestField_Host(t *testing.T) {
 	}
 	r := makeRequest("GET", "http://example.com/", "10.0.0.1:1234")
 	r.Host = "example.com"
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected host match")
 	}
 }
@@ -378,11 +378,11 @@ func TestField_Method(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected GET to match in GET POST")
 	}
 	r2 := makeRequest("DELETE", "/", "10.0.0.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected DELETE to NOT match in GET POST")
 	}
 }
@@ -395,13 +395,13 @@ func TestField_NamedHeader(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"X-Api-Key": "secret123",
 	})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected header match")
 	}
 	r2 := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"X-Api-Key": "wrong",
 	})
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected no header match for wrong value")
 	}
 }
@@ -413,7 +413,7 @@ func TestField_Cookie(t *testing.T) {
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
 	r.AddCookie(&http.Cookie{Name: "session", Value: "abc123"})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected cookie match")
 	}
 }
@@ -424,11 +424,11 @@ func TestField_Args(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/?action=delete", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected args match")
 	}
 	r2 := makeRequest("GET", "/?action=edit", "10.0.0.1:1234")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("expected no args match for action=edit")
 	}
 }
@@ -439,7 +439,7 @@ func TestField_Query(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/?foo=bar&debug=true", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected query match")
 	}
 }
@@ -452,7 +452,7 @@ func TestField_Referer(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"Referer": "https://evil.com/attack",
 	})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected referer match")
 	}
 }
@@ -464,7 +464,7 @@ func TestField_HTTPVersion(t *testing.T) {
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
 	r.Proto = "HTTP/1.1"
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("expected http_version match")
 	}
 }
@@ -477,7 +477,7 @@ func TestField_Path_IncludesQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/page?debug=true", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("path field should include query string")
 	}
 }
@@ -488,7 +488,7 @@ func TestField_URIPath_ExcludesQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/page?debug=true", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("uri_path should match just the path without query")
 	}
 }
@@ -502,13 +502,13 @@ func TestField_Body_Contains(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`some malicious payload here`)
-	if !matchCondition(cc, r, pbFrom(body)) {
+	if !matchCondition(cc, r, pbFrom(body), nil) {
 		t.Error("body contains should match")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`clean payload`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`clean payload`)), nil) {
 		t.Error("body contains should not match clean payload")
 	}
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("body contains should not match nil body")
 	}
 }
@@ -519,10 +519,10 @@ func TestField_Body_Regex(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`query: DROP TABLE users`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`query: DROP TABLE users`)), nil) {
 		t.Error("body regex should match SQL drop")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`normal query`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`normal query`)), nil) {
 		t.Error("body regex should not match normal content")
 	}
 }
@@ -534,11 +534,11 @@ func TestField_BodyJSON_DotPath(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`{"user":{"role":"admin","name":"test"}}`)
-	if !matchCondition(cc, r, pbFrom(body)) {
+	if !matchCondition(cc, r, pbFrom(body), nil) {
 		t.Error("body_json should match .user.role=admin")
 	}
 	body2 := []byte(`{"user":{"role":"viewer","name":"test"}}`)
-	if matchCondition(cc, r, pbFrom(body2)) {
+	if matchCondition(cc, r, pbFrom(body2), nil) {
 		t.Error("body_json should not match .user.role=viewer")
 	}
 }
@@ -550,7 +550,7 @@ func TestField_BodyJSON_NestedArray(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte(`{"items":[{"type":"secret"},{"type":"public"}]}`)
-	if !matchCondition(cc, r, pbFrom(body)) {
+	if !matchCondition(cc, r, pbFrom(body), nil) {
 		t.Error("body_json should match array index .items.0.type")
 	}
 }
@@ -561,10 +561,10 @@ func TestField_BodyJSON_NumericValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"count":42}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"count":42}`)), nil) {
 		t.Error("body_json should match numeric value 42")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`{"count":99}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"count":99}`)), nil) {
 		t.Error("body_json should not match numeric value 99")
 	}
 }
@@ -575,10 +575,10 @@ func TestField_BodyJSON_BoolValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"active":true}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"active":true}`)), nil) {
 		t.Error("body_json should match boolean true")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`{"active":false}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"active":false}`)), nil) {
 		t.Error("body_json should not match boolean false")
 	}
 }
@@ -589,7 +589,7 @@ func TestField_BodyJSON_Contains(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"message":"fatal error occurred"}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"message":"fatal error occurred"}`)), nil) {
 		t.Error("body_json contains should match substring")
 	}
 }
@@ -600,10 +600,10 @@ func TestField_BodyJSON_Regex(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"Bearer abc123"}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"Bearer abc123"}`)), nil) {
 		t.Error("body_json regex should match")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`{"token":"Basic abc123"}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"token":"Basic abc123"}`)), nil) {
 		t.Error("body_json regex should not match Basic")
 	}
 }
@@ -614,13 +614,13 @@ func TestField_BodyJSON_Exists(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"abc"}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"token":"abc"}`)), nil) {
 		t.Error("body_json exists should match when field present")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`{"other":"abc"}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"other":"abc"}`)), nil) {
 		t.Error("body_json exists should not match when field absent")
 	}
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("body_json exists should not match nil body")
 	}
 }
@@ -631,10 +631,10 @@ func TestField_BodyJSON_Exists_Nested(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte(`{"data":{"secret":"hidden"}}`))) {
+	if !matchCondition(cc, r, pbFrom([]byte(`{"data":{"secret":"hidden"}}`)), nil) {
 		t.Error("body_json exists should match nested field")
 	}
-	if matchCondition(cc, r, pbFrom([]byte(`{"data":{"public":"visible"}}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"data":{"public":"visible"}}`)), nil) {
 		t.Error("body_json exists should not match absent nested field")
 	}
 }
@@ -645,7 +645,7 @@ func TestField_BodyJSON_MissingPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, pbFrom([]byte(`{"other":"value"}`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`{"other":"value"}`)), nil) {
 		t.Error("body_json should not match when path doesn't exist")
 	}
 }
@@ -656,7 +656,7 @@ func TestField_BodyJSON_InvalidJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, pbFrom([]byte(`not json at all`))) {
+	if matchCondition(cc, r, pbFrom([]byte(`not json at all`)), nil) {
 		t.Error("body_json should not match invalid JSON")
 	}
 }
@@ -668,11 +668,11 @@ func TestField_BodyForm_Eq(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	body := []byte("action=login&user=test")
-	if !matchCondition(cc, r, pbFrom(body)) {
+	if !matchCondition(cc, r, pbFrom(body), nil) {
 		t.Error("body_form should match action=login")
 	}
 	body2 := []byte("action=logout&user=test")
-	if matchCondition(cc, r, pbFrom(body2)) {
+	if matchCondition(cc, r, pbFrom(body2), nil) {
 		t.Error("body_form should not match action=logout")
 	}
 }
@@ -683,7 +683,7 @@ func TestField_BodyForm_Contains(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if !matchCondition(cc, r, pbFrom([]byte("query=SELECT+*+FROM+users"))) {
+	if !matchCondition(cc, r, pbFrom([]byte("query=SELECT+*+FROM+users")), nil) {
 		t.Error("body_form contains should match")
 	}
 }
@@ -695,7 +695,7 @@ func TestField_BodyForm_URLEncoding(t *testing.T) {
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
 	// url.ParseQuery decodes %40 → @
-	if !matchCondition(cc, r, pbFrom([]byte("email=user%40test.com"))) {
+	if !matchCondition(cc, r, pbFrom([]byte("email=user%40test.com")), nil) {
 		t.Error("body_form should handle URL-encoded values")
 	}
 }
@@ -706,7 +706,7 @@ func TestField_BodyForm_MissingField(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("POST", "/api", "10.0.0.1:1234")
-	if matchCondition(cc, r, pbFrom([]byte("user=test"))) {
+	if matchCondition(cc, r, pbFrom([]byte("user=test")), nil) {
 		t.Error("body_form should not match when field is missing")
 	}
 }
@@ -718,7 +718,7 @@ func TestField_Body_NilBody(t *testing.T) {
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
 	// nil body → empty string, eq "" should match.
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("body eq empty string should match nil body")
 	}
 }
@@ -4432,7 +4432,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r = r.WithContext(ctx)
 	buf, _ := readBody(r, 1024*1024)
 	pb := &parsedBody{raw: buf}
-	if !matchCondition(cc, r, pb) {
+	if !matchCondition(cc, r, pb, nil) {
 		t.Error("phrase_match should detect java.lang.Runtime in form body param value")
 	}
 
@@ -4441,7 +4441,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r2.AddCookie(&http.Cookie{Name: "test", Value: "java.lang.ProcessBuilder"})
 	ctx2 := context.WithValue(r2.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
 	r2 = r2.WithContext(ctx2)
-	if !matchCondition(cc, r2, &parsedBody{}) {
+	if !matchCondition(cc, r2, &parsedBody{}, nil) {
 		t.Error("phrase_match should detect java.lang.ProcessBuilder in cookie value")
 	}
 
@@ -4450,7 +4450,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r3.Header.Set("X-Custom", "java.lang.Runtime")
 	ctx3 := context.WithValue(r3.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
 	r3 = r3.WithContext(ctx3)
-	if !matchCondition(cc, r3, &parsedBody{}) {
+	if !matchCondition(cc, r3, &parsedBody{}, nil) {
 		t.Error("phrase_match should detect java.lang.Runtime in header value")
 	}
 
@@ -4462,7 +4462,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r4 = r4.WithContext(ctx4)
 	buf4, _ := readBody(r4, 1024*1024)
 	pb4 := &parsedBody{raw: buf4}
-	if !matchCondition(cc, r4, pb4) {
+	if !matchCondition(cc, r4, pb4, nil) {
 		t.Error("phrase_match should detect java.lang.Runtime in JSON body value")
 	}
 
@@ -4473,7 +4473,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r5 = r5.WithContext(ctx5)
 	buf5, _ := readBody(r5, 1024*1024)
 	pb5 := &parsedBody{raw: buf5}
-	if !matchCondition(cc, r5, pb5) {
+	if !matchCondition(cc, r5, pb5, nil) {
 		t.Error("phrase_match should detect java.lang.Runtime in raw body (text/plain)")
 	}
 
@@ -4481,7 +4481,7 @@ func TestMatchCondition_RequestCombined_PhraseMatch(t *testing.T) {
 	r6 := httptest.NewRequest("GET", "/safe?q=hello", nil)
 	ctx6 := context.WithValue(r6.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
 	r6 = r6.WithContext(ctx6)
-	if matchCondition(cc, r6, &parsedBody{}) {
+	if matchCondition(cc, r6, &parsedBody{}, nil) {
 		t.Error("phrase_match should not match clean request")
 	}
 }
@@ -4501,7 +4501,7 @@ func TestMatchCondition_RequestCombined_Regex(t *testing.T) {
 	r := httptest.NewRequest("GET", "/page?q=1+UNION+SELECT+1", nil)
 	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
 	r = r.WithContext(ctx)
-	if !matchCondition(cc, r, &parsedBody{}) {
+	if !matchCondition(cc, r, &parsedBody{}, nil) {
 		t.Error("regex should detect SQL injection in query param value")
 	}
 }
@@ -4601,13 +4601,13 @@ func TestMatchCondition_MultiField_Contains(t *testing.T) {
 
 	// Request with SQL in a query param value.
 	r := makeRequest("GET", "/search?q=1+union+select+1", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("should match: 'select' is in query param value")
 	}
 
 	// Clean request.
 	r2 := makeRequest("GET", "/search?q=hello+world", "")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("should not match: no 'select' in any arg")
 	}
 }
@@ -4627,7 +4627,7 @@ func TestMatchCondition_MultiField_Negate(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "", map[string]string{
 		"X-Test": "bad-value",
 	})
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("neq on multi-field should return false when any value equals the target")
 	}
 
@@ -4635,7 +4635,7 @@ func TestMatchCondition_MultiField_Negate(t *testing.T) {
 	r2 := makeRequestWithHeaders("GET", "/", "", map[string]string{
 		"X-Test": "good-value",
 	})
-	if !matchCondition(cc, r2, nil) {
+	if !matchCondition(cc, r2, nil, nil) {
 		t.Error("neq on multi-field should return true when no value equals the target")
 	}
 }
@@ -4653,7 +4653,7 @@ func TestMatchCondition_MultiField_WithTransforms(t *testing.T) {
 
 	// URL-encoded uppercase.
 	r := makeRequest("GET", "/search?q=%53ELECT", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("transforms should decode %53 → S, then lowercase → select")
 	}
 }
@@ -4674,7 +4674,7 @@ func TestMultiMatch_MatchesBeforeTransform(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=SELECT+1", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("multiMatch should match raw value before transforms")
 	}
 }
@@ -4692,7 +4692,7 @@ func TestMultiMatch_MatchesAfterTransform(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=S%45LECT+1", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("multiMatch should match after urlDecode+lowercase")
 	}
 }
@@ -4710,7 +4710,7 @@ func TestMultiMatch_NoMatchAtAnyStage(t *testing.T) {
 	}
 	// "hello" → "hello" at every stage, never contains "DROP".
 	r := makeRequest("GET", "/search?q=hello", "")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("multiMatch should not match when no stage matches")
 	}
 }
@@ -4730,7 +4730,7 @@ func TestMultiMatch_MatchesAtIntermediateStage(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=s%45LECT", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("multiMatch should match at intermediate transform stage (after urlDecode)")
 	}
 }
@@ -4749,7 +4749,7 @@ func TestMultiMatch_DisabledBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=SELECT+1", "")
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("without multiMatch, lowercase should transform SELECT→select, no match for 'SELECT'")
 	}
 }
@@ -4767,7 +4767,7 @@ func TestMultiMatch_WithMultiField(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=SELECT+1&other=clean", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("multiMatch on multi-field should match raw value before transform")
 	}
 }
@@ -4785,7 +4785,7 @@ func TestMultiMatch_DetailedReportsMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/search?q=SELECT+1", "")
-	matched, detail := matchConditionDetailed(cc, r, nil)
+	matched, detail := matchConditionDetailed(cc, r, nil, nil)
 	if !matched {
 		t.Fatal("multiMatch detailed should match")
 	}
@@ -4812,7 +4812,7 @@ func TestMultiMatch_NoTransforms_Ignored(t *testing.T) {
 		t.Error("multiMatch should be false when no transforms are present")
 	}
 	r := makeRequest("GET", "/search?q=hello+world", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("should still match normally")
 	}
 }
@@ -4857,12 +4857,12 @@ func TestMatchCondition_PhraseMatch_SingleField(t *testing.T) {
 	}
 
 	r := makeRequest("GET", "/search?q=1+union+select+1,2,3", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("phrase_match should find 'union' or 'select' in query string")
 	}
 
 	r2 := makeRequest("GET", "/search?q=hello+world", "")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("phrase_match should not match clean query string")
 	}
 }
@@ -4878,12 +4878,12 @@ func TestMatchCondition_PhraseMatch_MultiField(t *testing.T) {
 	}
 
 	r := makeRequest("GET", "/page?name=normal&bio=<script>alert(1)</script>", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("phrase_match should find '<script' in bio arg value")
 	}
 
 	r2 := makeRequest("GET", "/page?name=normal&bio=hello", "")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("phrase_match should not match clean args")
 	}
 }
@@ -4901,7 +4901,7 @@ func TestMatchCondition_PhraseMatch_WithTransforms(t *testing.T) {
 
 	// URL-encoded uppercase: %53ELECT → SELECT → select
 	r := makeRequest("GET", "/search?q=%53ELECT", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("phrase_match with transforms should decode and lowercase")
 	}
 }
@@ -5051,7 +5051,7 @@ func TestMatchCondition_Count_ScalarPresent(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"User-Agent": "TestBrowser/1.0",
 	})
-	if matchCondition(cc, r, nil) {
+	if matchCondition(cc, r, nil, nil) {
 		t.Error("count:user_agent eq 0 should be false when UA is present")
 	}
 }
@@ -5068,7 +5068,7 @@ func TestMatchCondition_Count_ScalarMissing(t *testing.T) {
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
 	r.Header.Del("User-Agent") // Remove default Go UA
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("count:user_agent eq 0 should be true when UA is missing")
 	}
 }
@@ -5084,7 +5084,7 @@ func TestMatchCondition_Count_NamedHeaderMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := makeRequest("GET", "/", "10.0.0.1:1234")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("count:header:X-Custom eq 0 should be true when header is missing")
 	}
 }
@@ -5102,7 +5102,7 @@ func TestMatchCondition_Count_NamedHeaderPresent(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/", "10.0.0.1:1234", map[string]string{
 		"X-Custom": "value",
 	})
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("count:header:X-Custom gt 0 should be true when header is present")
 	}
 }
@@ -5119,13 +5119,13 @@ func TestMatchCondition_Count(t *testing.T) {
 
 	// 4 values (2 names + 2 values = 4 in all_args) > 3
 	r := makeRequest("GET", "/search?q=hello&sort=asc", "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("count:all_args should be > 3 (q, hello, sort, asc = 4)")
 	}
 
 	// 2 values (1 name + 1 value = 2) not > 3
 	r2 := makeRequest("GET", "/search?q=hello", "")
-	if matchCondition(cc, r2, nil) {
+	if matchCondition(cc, r2, nil, nil) {
 		t.Error("count:all_args should NOT be > 3 (q, hello = 2)")
 	}
 }
@@ -5147,7 +5147,7 @@ func TestMatchCondition_Count_ArgsNames(t *testing.T) {
 	}
 	path := "/?" + strings.Join(q, "&")
 	r := makeRequest("GET", path, "")
-	if !matchCondition(cc, r, nil) {
+	if !matchCondition(cc, r, nil, nil) {
 		t.Error("count:all_args_names should be > 255 with 256 params")
 	}
 }
@@ -6005,7 +6005,7 @@ func TestMatchConditionDetailed_SingleField(t *testing.T) {
 	r := makeRequestWithHeaders("GET", "/test", "1.2.3.4:1234", map[string]string{
 		"User-Agent": "curl/7.88.1",
 	})
-	matched, detail := matchConditionDetailed(cc, r, nil)
+	matched, detail := matchConditionDetailed(cc, r, nil, nil)
 	if !matched {
 		t.Fatal("expected match")
 	}
@@ -6042,7 +6042,7 @@ func TestMatchConditionDetailed_MultiField(t *testing.T) {
 		"User-Agent": "nikto/2.1.6",
 		"Accept":     "text/html",
 	})
-	matched, detail := matchConditionDetailed(cc, r, nil)
+	matched, detail := matchConditionDetailed(cc, r, nil, nil)
 	if !matched {
 		t.Fatal("expected match")
 	}
@@ -6068,7 +6068,7 @@ func TestMatchConditionDetailed_MultiField_AllArgs(t *testing.T) {
 		isMulti:  true,
 	}
 	r := makeRequest("GET", "/search?q=1+UNION+SELECT+*+FROM+users&page=1", "1.2.3.4:1234")
-	matched, detail := matchConditionDetailed(cc, r, nil)
+	matched, detail := matchConditionDetailed(cc, r, nil, nil)
 	if !matched {
 		t.Fatal("expected match")
 	}
@@ -6092,7 +6092,7 @@ func TestMatchConditionDetailed_Negate(t *testing.T) {
 		negate:   true,
 	}
 	r := makeRequest("GET", "/test", "1.2.3.4:1234")
-	matched, detail := matchConditionDetailed(cc, r, nil)
+	matched, detail := matchConditionDetailed(cc, r, nil, nil)
 	if !matched {
 		t.Fatal("expected match (GET != POST)")
 	}
@@ -6861,14 +6861,14 @@ func TestMatchCondition_ValidateByteRange(t *testing.T) {
 
 	// Clean args → no violation → eval returns false → no match (rule doesn't fire)
 	req := httptest.NewRequest("GET", "/?q=hello", nil)
-	if matchCondition(cc, req, nil) {
+	if matchCondition(cc, req, nil, nil) {
 		t.Error("expected false: 'hello' has all bytes in 1-255, no violation")
 	}
 
 	// Null byte → violation → eval returns true → match (rule fires)
 	req2 := httptest.NewRequest("GET", "/?q=test", nil)
 	req2.URL.RawQuery = "q=test%00injected"
-	if !matchCondition(cc, req2, nil) {
+	if !matchCondition(cc, req2, nil, nil) {
 		t.Error("expected true: null byte violates 1-255 range")
 	}
 }
@@ -6890,7 +6890,7 @@ func TestMatchCondition_ValidateByteRange_Negated(t *testing.T) {
 
 	// Clean URI → no violation → eval returns false → negate → true (match)
 	req := httptest.NewRequest("GET", "/normal-path", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected true: clean path has no violation, negate makes it match")
 	}
 
@@ -6898,7 +6898,7 @@ func TestMatchCondition_ValidateByteRange_Negated(t *testing.T) {
 	// → violation → eval returns true → negate → false (no match)
 	req2 := httptest.NewRequest("GET", "/path", nil)
 	req2.URL.Path = "/path\tinject" // tab (0x09) not in allowed set
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected false: tab violates range, negate makes it not match")
 	}
 }
@@ -6946,7 +6946,7 @@ func TestMatchCondition_ValidateURLEncoding(t *testing.T) {
 
 	// Valid URL encoding → no violation → false (rule doesn't fire)
 	req := httptest.NewRequest("GET", "/?q=hello%20world", nil)
-	if matchCondition(cc, req, nil) {
+	if matchCondition(cc, req, nil, nil) {
 		t.Error("expected false: valid URL encoding, no violation")
 	}
 
@@ -6954,7 +6954,7 @@ func TestMatchCondition_ValidateURLEncoding(t *testing.T) {
 	// Must set RawQuery directly since Go's URL parser rejects %ZZ.
 	req2 := httptest.NewRequest("GET", "/page", nil)
 	req2.URL.RawQuery = "q=hello%ZZworld"
-	if !matchCondition(cc, req2, nil) {
+	if !matchCondition(cc, req2, nil, nil) {
 		t.Error("expected true: %ZZ is invalid URL encoding, violation found")
 	}
 }
@@ -6974,13 +6974,13 @@ func TestMatchCondition_DetectSQLi(t *testing.T) {
 
 	// Classic SQL injection
 	req := httptest.NewRequest("GET", "/?id=1'+OR+1=1--", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected SQLi detection: 1' OR 1=1--")
 	}
 
 	// Clean query
 	req2 := httptest.NewRequest("GET", "/?id=42", nil)
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected no SQLi: clean query")
 	}
 }
@@ -6999,7 +6999,7 @@ func TestMatchCondition_DetectSQLi_UnionSelect(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", "1 UNION SELECT username,password FROM users--")
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected SQLi detection: UNION SELECT")
 	}
 }
@@ -7019,13 +7019,13 @@ func TestMatchCondition_DetectXSS(t *testing.T) {
 
 	// Classic XSS
 	req := httptest.NewRequest("GET", "/?q=<script>alert(1)</script>", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected XSS detection: <script>alert(1)</script>")
 	}
 
 	// Clean query
 	req2 := httptest.NewRequest("GET", "/?q=hello+world", nil)
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected no XSS: clean query")
 	}
 }
@@ -7044,7 +7044,7 @@ func TestMatchCondition_DetectXSS_ImgOnerror(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("User-Agent", "<img src=x onerror=alert(1)>")
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected XSS detection: <img onerror>")
 	}
 }
@@ -7070,14 +7070,14 @@ func TestCompileCondition_NegateField(t *testing.T) {
 
 	// Clean printable path → no violation → eval false → negate → true (match)
 	req := httptest.NewRequest("GET", "/normal", nil)
-	if !matchCondition(cc, req, nil) {
+	if !matchCondition(cc, req, nil, nil) {
 		t.Error("expected true: clean path has no violation, negate makes it match")
 	}
 
 	// Path with non-printable → violation → eval true → negate → false (no match)
 	req2 := httptest.NewRequest("GET", "/path", nil)
 	req2.URL.Path = "/path\x01inject"
-	if matchCondition(cc, req2, nil) {
+	if matchCondition(cc, req2, nil, nil) {
 		t.Error("expected false: violation found, negate makes it not match")
 	}
 }
@@ -7178,7 +7178,7 @@ func TestFieldAbsent_NegateSkipsAbsentHeader(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 	req := httptest.NewRequest("GET", "/test", nil) // no Content-Length
-	result := matchCondition(cc, req, nil)
+	result := matchCondition(cc, req, nil, nil)
 	if result {
 		t.Error("negated regex on absent Content-Length should return false")
 	}
@@ -7186,7 +7186,7 @@ func TestFieldAbsent_NegateSkipsAbsentHeader(t *testing.T) {
 	// Same condition with Content-Length present and invalid → should match.
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	req2.Header.Set("Content-Length", "abc")
-	result2 := matchCondition(cc, req2, nil)
+	result2 := matchCondition(cc, req2, nil, nil)
 	if !result2 {
 		t.Error("negated regex on invalid Content-Length should return true")
 	}
@@ -7196,7 +7196,7 @@ func TestFieldAbsent_NegateSkipsAbsentHeader(t *testing.T) {
 		Field: "header:Accept", Operator: "eq", Value: "",
 	})
 	req3 := httptest.NewRequest("GET", "/test", nil) // no Accept header
-	result3 := matchCondition(cc2, req3, nil)
+	result3 := matchCondition(cc2, req3, nil, nil)
 	if !result3 {
 		t.Error("non-negated eq '' on absent Accept should return true")
 	}
@@ -7211,14 +7211,14 @@ func TestFieldAbsent_NamedHeader(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 	req := httptest.NewRequest("GET", "/test", nil)
-	result := matchCondition(cc, req, nil)
+	result := matchCondition(cc, req, nil, nil)
 	if result {
 		t.Error("negated regex on absent X-Custom header should return false")
 	}
 
 	// With header present.
 	req.Header.Set("X-Custom", "value")
-	result2 := matchCondition(cc, req, nil)
+	result2 := matchCondition(cc, req, nil, nil)
 	if result2 {
 		t.Error("negated .* on present X-Custom should return false (regex matches)")
 	}
