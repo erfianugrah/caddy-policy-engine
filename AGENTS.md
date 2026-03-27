@@ -140,6 +140,32 @@ Three fields for multipart/form-data body inspection:
 Lazy parsing via `parsedBody.getMultipart()`. Uses `mime/multipart` stdlib.
 Capped at 1000 parts per request.
 
+### TX Capture Semantics (v0.38.0+)
+
+CRS convention for TX variable indexing:
+- `TX:0` = full regex match (submatches[0])
+- `TX:1` = first capture group (submatches[1])
+- `TX:2` = second capture group, etc.
+
+Multi-value field paths (all_args, all_cookies, etc.) store the matched value
+in `txVars["0"]` when the operator matches, plus any regex submatches. This
+enables MATCHED_VARS chain semantics where the chain re-examines the specific
+value that triggered the head rule.
+
+### Known Plugin Gaps (for 100% CRS fidelity)
+
+These features are needed to fix the remaining 84 CRS test failures:
+
+| Feature | Tests Fixed | Complexity |
+|---------|-------------|------------|
+| `not_ends_with_field` operator (compare TX capture to runtime field like Host) | 4 (943110) | Medium |
+| XML parser: exclude element/attribute NAMES from `xml` field (only text+attr values) | 4 (944100) | Medium |
+| `validateUrlEncoding` operator | 4 (920230/920240) | Medium |
+| `validateByteRange` operator (full range validation, not just regex) | 14 (920271-920275) | Medium |
+| `validateUtf8Encoding` operator | 4 (920250) | Hard |
+| Multipart FILES/FILES_NAMES extraction edge cases (smuggled boundaries) | 10 (920120/920121) | Medium |
+| `multiFieldAbsent()` for negated files/xml on non-matching Content-Type | 2 (920120 FP fix) | Easy (was reverted in v0.39.1 — needs targeted re-implementation) |
+
 ## Dependencies
 
 Three direct dependencies:
