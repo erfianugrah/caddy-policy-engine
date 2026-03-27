@@ -4336,7 +4336,8 @@ func TestExtractMultiField_RequestCombined_JSONBody(t *testing.T) {
 }
 
 func TestExtractMultiField_RequestCombined_XMLBody(t *testing.T) {
-	// XML bodies should at least be present as raw body string
+	// XML bodies should be parsed into structured values (text + attrs) and also
+	// present as raw body string.
 	body := `<?xml version="1.0"?><xml><element attr="java.lang.Runtime">payload</element></xml>`
 	r := httptest.NewRequest("POST", "/post", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/xml")
@@ -4354,12 +4355,358 @@ func TestExtractMultiField_RequestCombined_XMLBody(t *testing.T) {
 		have[v] = true
 	}
 
-	// XML is not parsed into structured values, but raw body should contain it
+	// Raw body should be present
 	if !have[body] {
 		t.Error("request_combined missing raw body (XML)")
 	}
-	// Since it's not form-encoded or JSON, getForm/getJSON won't extract structured data
-	// but raw body matching will catch attack patterns
+	// XML text content should be extracted (XML:/*)
+	if !have["payload"] {
+		t.Error("request_combined missing XML text content 'payload'")
+	}
+	// XML attribute values should be extracted (XML://@*)
+	if !have["java.lang.Runtime"] {
+		t.Error("request_combined missing XML attribute value 'java.lang.Runtime'")
+	}
+}
+
+func TestExtractMultiField_XML_TextAndAttrs(t *testing.T) {
+	body := `<?xml version="1.0"?><root><name lang="en">Alice</name><age>30</age></root>`
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	// Text nodes
+	if !have["Alice"] {
+		t.Error("xml field missing text 'Alice'")
+	}
+	if !have["30"] {
+		t.Error("xml field missing text '30'")
+	}
+	// Attribute values
+	if !have["en"] {
+		t.Error("xml field missing attribute 'en'")
+	}
+}
+
+func TestExtractMultiField_XML_EmptyElements(t *testing.T) {
+	// XML with only empty elements and whitespace should return nil (no text/attrs).
+	pb := &parsedBody{raw: []byte(`<root><empty/><also-empty></also-empty></root>`)}
+	r := httptest.NewRequest("POST", "/", nil)
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	vals := extractMultiField(cc, r, pb)
+	if vals != nil {
+		t.Errorf("expected nil for empty XML elements, got %v", vals)
+	}
+}
+
+func TestExtractMultiField_XML_NilBody(t *testing.T) {
+	r := httptest.NewRequest("POST", "/", nil)
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	vals := extractMultiField(cc, r, nil)
+	if vals != nil {
+		t.Errorf("expected nil for nil parsedBody, got %v", vals)
+	}
+}
+
+func TestExtractMultiFieldKeyed_XML(t *testing.T) {
+	body := `<root><item type="secret">payload</item></root>`
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	kvs := extractMultiFieldKeyed(cc, r, pb)
+
+	keyMap := make(map[string][]string)
+	for _, kv := range kvs {
+		keyMap[kv.key] = append(keyMap[kv.key], kv.val)
+	}
+
+	// Text nodes keyed as XML:/*
+	if texts, ok := keyMap["XML:/*"]; !ok || len(texts) == 0 {
+		t.Error("expected XML:/* keyed values for text nodes")
+	} else {
+		found := false
+		for _, v := range texts {
+			if v == "payload" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected 'payload' in XML:/* values, got %v", texts)
+		}
+	}
+
+	// Attribute values keyed as XML://@*
+	if attrs, ok := keyMap["XML://@*"]; !ok || len(attrs) == 0 {
+		t.Error("expected XML://@* keyed values for attributes")
+	} else {
+		found := false
+		for _, v := range attrs {
+			if v == "secret" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected 'secret' in XML://@* values, got %v", attrs)
+		}
+	}
+}
+
+func TestParsedBody_XMLCaching(t *testing.T) {
+	raw := []byte(`<root><item>hello</item></root>`)
+	pb := &parsedBody{raw: raw}
+
+	// First call parses.
+	texts1, attrs1, ok1 := pb.getXML()
+	if !ok1 {
+		t.Fatal("first getXML should succeed")
+	}
+	if len(texts1) != 1 || texts1[0] != "hello" {
+		t.Errorf("expected [hello], got %v", texts1)
+	}
+	if len(attrs1) != 0 {
+		t.Errorf("expected no attrs, got %v", attrs1)
+	}
+
+	// Second call returns cached result.
+	texts2, _, ok2 := pb.getXML()
+	if !ok2 {
+		t.Fatal("second getXML should succeed")
+	}
+	if len(texts2) != 1 || texts2[0] != "hello" {
+		t.Errorf("cached getXML returned different result: %v", texts2)
+	}
+	if !pb.xmlDone {
+		t.Error("xmlDone should be true after getXML")
+	}
+}
+
+func TestParsedBody_XMLNilAndEmpty(t *testing.T) {
+	// nil parsedBody.
+	var pb *parsedBody
+	_, _, ok := pb.getXML()
+	if ok {
+		t.Error("nil parsedBody getXML should return false")
+	}
+
+	// Empty raw.
+	pb2 := &parsedBody{raw: []byte{}}
+	_, _, ok2 := pb2.getXML()
+	if ok2 {
+		t.Error("empty raw getXML should return false")
+	}
+}
+
+func TestXMLField_MatchCondition_Regex(t *testing.T) {
+	// CRS-style pattern: xml field with regex operator matching attack payloads.
+	body := `<?xml version="1.0"?><root><cmd>java.lang.Runtime.exec("rm -rf /")</cmd></root>`
+	r := httptest.NewRequest("POST", "/api", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "xml",
+		Operator: "regex",
+		Value:    `java\.lang\.Runtime`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !matchCondition(cc, r, pb, nil) {
+		t.Error("xml regex should match java.lang.Runtime in XML text")
+	}
+}
+
+func TestXMLField_MatchCondition_AttrsRegex(t *testing.T) {
+	// Match against attribute values.
+	body := `<root><item class="java.lang.ProcessBuilder">safe text</item></root>`
+	r := httptest.NewRequest("POST", "/api", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "xml",
+		Operator: "regex",
+		Value:    `ProcessBuilder`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !matchCondition(cc, r, pb, nil) {
+		t.Error("xml regex should match ProcessBuilder in XML attribute")
+	}
+}
+
+func TestXMLField_MatchCondition_NoMatch(t *testing.T) {
+	body := `<root><item>safe content</item></root>`
+	r := httptest.NewRequest("POST", "/api", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "xml",
+		Operator: "regex",
+		Value:    `java\.lang\.Runtime`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if matchCondition(cc, r, pb, nil) {
+		t.Error("xml regex should NOT match safe content")
+	}
+}
+
+func TestXMLField_InGroupWithOtherFields(t *testing.T) {
+	// CRS-style OR group: all_args_values OR all_cookies OR xml.
+	body := `<root><data>malicious_payload</data></root>`
+	r := httptest.NewRequest("POST", "/api?safe=value", strings.NewReader(body))
+	r.AddCookie(&http.Cookie{Name: "sid", Value: "abc"})
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	// Build a group condition like CRS emits.
+	group, err := compileCondition(PolicyCondition{
+		Group: []PolicyCondition{
+			{Field: "all_args_values", Operator: "regex", Value: `malicious`},
+			{Field: "all_cookies", Operator: "regex", Value: `malicious`},
+			{Field: "xml", Operator: "regex", Value: `malicious_payload`},
+		},
+		GroupOp: "or",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should match via the xml field (args and cookies are clean).
+	if !matchCondition(group, r, pb, nil) {
+		t.Error("OR group should match via xml field")
+	}
+}
+
+func TestXMLField_NestedElements(t *testing.T) {
+	body := `<root><parent><child>deep_value</child></parent><sibling attr="deep_attr">other</sibling></root>`
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	if !have["deep_value"] {
+		t.Error("xml field missing nested text 'deep_value'")
+	}
+	if !have["other"] {
+		t.Error("xml field missing sibling text 'other'")
+	}
+	if !have["deep_attr"] {
+		t.Error("xml field missing nested attribute 'deep_attr'")
+	}
+}
+
+func TestXMLField_MultipleAttributes(t *testing.T) {
+	body := `<root><item id="1" class="danger" onclick="alert(1)">text</item></root>`
+	r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc := compiledCondition{field: "xml", isMulti: true}
+	vals := extractMultiField(cc, r, pb)
+
+	have := make(map[string]bool)
+	for _, v := range vals {
+		have[v] = true
+	}
+
+	if !have["text"] {
+		t.Error("xml field missing text 'text'")
+	}
+	if !have["1"] {
+		t.Error("xml field missing attribute '1'")
+	}
+	if !have["danger"] {
+		t.Error("xml field missing attribute 'danger'")
+	}
+	if !have["alert(1)"] {
+		t.Error("xml field missing attribute 'alert(1)'")
+	}
+}
+
+func TestXMLField_SOAPEnvelope(t *testing.T) {
+	// Real-world SOAP XML — CRS commonly inspects these.
+	body := `<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetUser xmlns="http://example.com/api">
+      <userId>java.lang.Runtime.exec("id")</userId>
+    </GetUser>
+  </soap:Body>
+</soap:Envelope>`
+	r := httptest.NewRequest("POST", "/soap", strings.NewReader(body))
+	ctx := context.WithValue(r.Context(), caddyhttp.VarsCtxKey, make(map[string]interface{}))
+	r = r.WithContext(ctx)
+
+	buf, _ := readBody(r, 1024*1024)
+	pb := &parsedBody{raw: buf}
+
+	cc, err := compileCondition(PolicyCondition{
+		Field:    "xml",
+		Operator: "regex",
+		Value:    `java\.lang\.Runtime`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !matchCondition(cc, r, pb, nil) {
+		t.Error("xml regex should match attack payload in SOAP envelope")
+	}
 }
 
 func TestExtractMultiFieldKeyed_RequestCombined(t *testing.T) {

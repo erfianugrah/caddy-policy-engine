@@ -13,8 +13,10 @@ package policyengine
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -52,6 +54,14 @@ const maxJSONDepth = 64
 // maxJSONValues is the maximum number of leaf values extracted from JSON.
 // Prevents memory exhaustion from extremely wide/deep JSON structures.
 const maxJSONValues = 10000
+
+// maxXMLDepth is the maximum nesting depth for XML parsing.
+// Prevents stack overflow from deeply nested XML payloads.
+const maxXMLDepth = 64
+
+// maxXMLValues is the maximum number of text/attribute values extracted from XML.
+// Prevents memory exhaustion from extremely wide/deep XML structures.
+const maxXMLValues = 10000
 
 // maxConditionDepth is the maximum nesting depth for condition groups.
 // Prevents unbounded recursion from deeply nested condition definitions.
@@ -375,9 +385,13 @@ type compiledCondition struct {
 
 // bodyFields lists condition fields that require reading the request body.
 var bodyFields = map[string]bool{
-	"body":      true,
-	"body_json": true,
-	"body_form": true,
+	"body":                   true,
+	"body_json":              true,
+	"body_form":              true,
+	"xml":                    true,
+	"files":                  true,
+	"files_names":            true,
+	"multipart_part_headers": true,
 }
 
 // needsBodyField returns true if a field requires reading the request body.
@@ -388,6 +402,10 @@ func needsBodyField(field string) bool {
 		return true // these include POST form params from the body
 	case "request_combined":
 		return true // includes raw body + form params + JSON values
+	case "xml":
+		return true // XML body parsing
+	case "files", "files_names", "multipart_part_headers":
+		return true // multipart body parsing
 	}
 	if strings.HasPrefix(field, countPrefix) {
 		underlying := field[len(countPrefix):]
@@ -395,6 +413,8 @@ func needsBodyField(field string) bool {
 		case "all_args", "all_args_values", "all_args_names":
 			return true
 		case "request_combined":
+			return true
+		case "xml":
 			return true
 		}
 	}
@@ -405,14 +425,18 @@ func needsBodyField(field string) bool {
 // When a condition uses one of these, matchCondition iterates all values
 // and returns true if ANY value matches (OR semantics).
 var multiFields = map[string]bool{
-	"all_args":          true,
-	"all_args_values":   true,
-	"all_args_names":    true,
-	"all_headers":       true,
-	"all_headers_names": true,
-	"all_cookies":       true,
-	"all_cookies_names": true,
-	"request_combined":  true,
+	"all_args":               true,
+	"all_args_values":        true,
+	"all_args_names":         true,
+	"all_headers":            true,
+	"all_headers_names":      true,
+	"all_cookies":            true,
+	"all_cookies_names":      true,
+	"request_combined":       true,
+	"xml":                    true,
+	"files":                  true,
+	"files_names":            true,
+	"multipart_part_headers": true,
 }
 
 // countPrefix is the prefix for count pseudo-fields (e.g., "count:all_args").
@@ -427,6 +451,20 @@ type parsedBody struct {
 	jsonDone bool        // true if JSON parsing was attempted
 	formVals url.Values  // lazily parsed on first body_form access
 	formDone bool        // true if form parsing was attempted
+
+	// XML cache — lazily parsed on first xml field access.
+	xmlTexts []string // all text node content from XML elements
+	xmlAttrs []string // all attribute values from XML elements
+	xmlOK    bool     // true if XML was successfully parsed
+	xmlDone  bool     // true if XML parsing was attempted
+
+	// Multipart cache — lazily parsed on first files/files_names/multipart access.
+	mpFiles       []string // form field names that had file uploads
+	mpFileNames   []string // original filenames from Content-Disposition
+	mpPartHeaders []string // raw header lines from all multipart parts
+	mpOK          bool     // true if multipart was successfully parsed
+	mpDone        bool     // true if multipart parsing was attempted
+	contentType   string   // original Content-Type header (for boundary extraction)
 
 	// Query string cache — avoids re-parsing r.URL.Query() per condition.
 	query     url.Values
@@ -479,6 +517,121 @@ func (pb *parsedBody) getForm() url.Values {
 		pb.formVals = vals // Go 1.17+ guarantees partial results are usable
 	}
 	return pb.formVals
+}
+
+// getXML returns pre-parsed XML text and attribute values, parsing lazily on
+// first call. Uses encoding/xml streaming tokenizer — no external deps.
+// Returns (textValues, attrValues, ok).
+func (pb *parsedBody) getXML() ([]string, []string, bool) {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil, nil, false
+	}
+	if !pb.xmlDone {
+		pb.xmlDone = true
+		pb.xmlTexts, pb.xmlAttrs, pb.xmlOK = parseXMLBody(pb.raw)
+	}
+	return pb.xmlTexts, pb.xmlAttrs, pb.xmlOK
+}
+
+// getMultipart returns pre-parsed multipart file info, parsing lazily on first call.
+// Returns (fieldNames, fileNames, partHeaders, ok).
+func (pb *parsedBody) getMultipart() ([]string, []string, []string, bool) {
+	if pb == nil || len(pb.raw) == 0 {
+		return nil, nil, nil, false
+	}
+	if !pb.mpDone {
+		pb.mpDone = true
+		pb.mpFiles, pb.mpFileNames, pb.mpPartHeaders, pb.mpOK = parseMultipartBody(pb.raw, pb.contentType)
+	}
+	return pb.mpFiles, pb.mpFileNames, pb.mpPartHeaders, pb.mpOK
+}
+
+// parseMultipartBody extracts file field names, original filenames, and part
+// headers from a multipart/form-data body. Uses mime/multipart from stdlib.
+func parseMultipartBody(data []byte, contentType string) ([]string, []string, []string, bool) {
+	// Extract boundary from Content-Type header.
+	if !strings.Contains(contentType, "multipart/") {
+		return nil, nil, nil, false
+	}
+	idx := strings.Index(contentType, "boundary=")
+	if idx < 0 {
+		return nil, nil, nil, false
+	}
+	boundary := contentType[idx+len("boundary="):]
+	// Strip quotes if present.
+	boundary = strings.Trim(boundary, `"`)
+	if boundary == "" {
+		return nil, nil, nil, false
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(data), boundary)
+	var files, fileNames, partHeaders []string
+	for i := 0; i < 1000; i++ { // cap parts to prevent abuse
+		part, err := reader.NextPart()
+		if err != nil {
+			break
+		}
+		// Collect part headers (all header lines concatenated).
+		for name, vals := range part.Header {
+			for _, v := range vals {
+				partHeaders = append(partHeaders, strings.ToLower(name)+": "+v)
+			}
+		}
+		// File uploads have a Filename in Content-Disposition.
+		if fn := part.FileName(); fn != "" {
+			fileNames = append(fileNames, fn)
+			files = append(files, part.FormName())
+		}
+		part.Close()
+	}
+	if len(files) == 0 && len(fileNames) == 0 && len(partHeaders) == 0 {
+		return nil, nil, nil, false
+	}
+	return files, fileNames, partHeaders, true
+}
+
+// parseXMLBody extracts all text node content and attribute values from an XML
+// body using the stdlib streaming tokenizer. Returns (texts, attrs, ok).
+// Caps output at maxXMLValues per category and maxXMLDepth nesting to bound
+// memory and CPU on adversarial payloads.
+func parseXMLBody(data []byte) ([]string, []string, bool) {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	// Lenient parsing: don't fail on undeclared entities.
+	dec.Strict = false
+	dec.AutoClose = xml.HTMLAutoClose
+	dec.Entity = xml.HTMLEntity
+
+	var texts, attrs []string
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break // EOF or parse error — return what we have
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if depth > maxXMLDepth {
+				continue
+			}
+			for _, a := range t.Attr {
+				if len(attrs) < maxXMLValues {
+					attrs = append(attrs, a.Value)
+				}
+			}
+		case xml.EndElement:
+			depth--
+		case xml.CharData:
+			s := strings.TrimSpace(string(t))
+			if s != "" && len(texts) < maxXMLValues {
+				texts = append(texts, s)
+			}
+		}
+	}
+	if len(texts) == 0 && len(attrs) == 0 {
+		return nil, nil, false
+	}
+	return texts, attrs, true
 }
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
@@ -745,9 +898,9 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				if err != nil {
 					pe.logger.Debug("failed to read request body", zap.Error(err))
 				}
-				pb = &parsedBody{raw: buf}
+				pb = &parsedBody{raw: buf, contentType: r.Header.Get("Content-Type")}
 			} else {
-				pb = &parsedBody{}
+				pb = &parsedBody{contentType: r.Header.Get("Content-Type")}
 			}
 			bodyRead = true
 		}
@@ -2109,7 +2262,64 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 			vals = append(vals, p)
 		}
 
+		// XML text and attribute values (XML:/* + XML://@*)
+		if pb != nil {
+			texts, attrs, ok := pb.getXML()
+			if ok {
+				vals = append(vals, texts...)
+				vals = append(vals, attrs...)
+			}
+		}
+
 		return vals
+
+	case "xml":
+		// XML body text content + attribute values (CRS XML:/* + XML://@*).
+		// Bare "xml" field combines all text nodes and all attribute values.
+		if pb == nil {
+			return nil
+		}
+		texts, attrs, ok := pb.getXML()
+		if !ok {
+			return nil
+		}
+		var vals []string
+		vals = append(vals, texts...)
+		vals = append(vals, attrs...)
+		return vals
+
+	case "files":
+		// CRS FILES: form field names for file uploads in multipart bodies.
+		if pb == nil {
+			return nil
+		}
+		files, _, _, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		return files
+
+	case "files_names":
+		// CRS FILES_NAMES: original filenames from Content-Disposition.
+		if pb == nil {
+			return nil
+		}
+		_, fileNames, _, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		return fileNames
+
+	case "multipart_part_headers":
+		// CRS MULTIPART_PART_HEADERS: raw header lines from all parts.
+		if pb == nil {
+			return nil
+		}
+		_, _, partHeaders, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		return partHeaders
 
 	default:
 		return nil
@@ -2300,6 +2510,79 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 			kvs = append(kvs, keyedValue{key: "REQUEST_FILENAME", val: p})
 		}
 
+		// XML text and attribute values (XML:/* + XML://@*)
+		if pb != nil {
+			texts, attrs, ok := pb.getXML()
+			if ok {
+				for _, t := range texts {
+					kvs = append(kvs, keyedValue{key: "XML:/*", val: t})
+				}
+				for _, a := range attrs {
+					kvs = append(kvs, keyedValue{key: "XML://@*", val: a})
+				}
+			}
+		}
+
+		return kvs
+
+	case "xml":
+		// XML body text content + attribute values with CRS-style keys.
+		if pb == nil {
+			return nil
+		}
+		texts, attrs, ok := pb.getXML()
+		if !ok {
+			return nil
+		}
+		var kvs []keyedValue
+		for _, t := range texts {
+			kvs = append(kvs, keyedValue{key: "XML:/*", val: t})
+		}
+		for _, a := range attrs {
+			kvs = append(kvs, keyedValue{key: "XML://@*", val: a})
+		}
+		return kvs
+
+	case "files":
+		if pb == nil {
+			return nil
+		}
+		files, _, _, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		var kvs []keyedValue
+		for _, f := range files {
+			kvs = append(kvs, keyedValue{key: "FILES:" + f, val: f})
+		}
+		return kvs
+
+	case "files_names":
+		if pb == nil {
+			return nil
+		}
+		_, fileNames, _, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		var kvs []keyedValue
+		for _, fn := range fileNames {
+			kvs = append(kvs, keyedValue{key: "FILES_NAMES:" + fn, val: fn})
+		}
+		return kvs
+
+	case "multipart_part_headers":
+		if pb == nil {
+			return nil
+		}
+		_, _, partHeaders, ok := pb.getMultipart()
+		if !ok {
+			return nil
+		}
+		var kvs []keyedValue
+		for _, h := range partHeaders {
+			kvs = append(kvs, keyedValue{key: "MULTIPART_PART_HEADERS", val: h})
+		}
 		return kvs
 
 	default:
@@ -2670,6 +2953,14 @@ func singleFieldVarName(field, name string) string {
 			return "ARGS_POST:" + name
 		}
 		return "ARGS_POST"
+	case "xml":
+		return "XML"
+	case "files":
+		return "FILES"
+	case "files_names":
+		return "FILES_NAMES"
+	case "multipart_part_headers":
+		return "MULTIPART_PART_HEADERS"
 	default:
 		return strings.ToUpper(field)
 	}
