@@ -1688,6 +1688,16 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVar
 				if cc.negate {
 					return false // negate + any match = fail (NOT-ANY = ALL-NOT)
 				}
+				// Store matched value + regex captures for MATCHED_VARS chain semantics.
+				if txVars != nil {
+					txVars["0"] = val // CRS MATCHED_VAR / TX:0 = full matched value
+					if cc.regex != nil {
+						submatches := cc.regex.FindStringSubmatch(val)
+						for i, sm := range submatches {
+							txVars[strconv.Itoa(i)] = sm
+						}
+					}
+				}
 				return true
 			}
 		}
@@ -1724,18 +1734,27 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVar
 	target := extractField(cc, r, pb)
 
 	// Store regex submatches in txVars for subsequent conditions.
-	// This implements CRS capture semantics: head condition captures with (groups),
-	// chain conditions reference captures via field="tx" name="0", "1", etc.
+	// CRS convention: TX:0 = full match, TX:1 = first capture group, etc.
+	// Also store the full matched value for MATCHED_VARS chain semantics.
 	if cc.regex != nil && txVars != nil {
 		submatches := cc.regex.FindStringSubmatch(target)
-		if len(submatches) > 1 {
-			for i, sm := range submatches[1:] {
+		if len(submatches) > 0 {
+			for i, sm := range submatches {
 				txVars[strconv.Itoa(i)] = sm
 			}
 		}
 	}
 
 	result := evalMultiMatchOrPlain(cc, target)
+
+	// For multi-value fields, when the operator matched, store the matched
+	// value as tx:0 even if the regex had no capture groups. This supports
+	// MATCHED_VARS chain semantics where the chain re-examines the specific
+	// value that triggered the head rule.
+	if result && cc.isMulti && txVars != nil && txVars["0"] == "" {
+		txVars["0"] = target
+	}
+
 	if cc.negate {
 		return !result
 	}
@@ -3196,6 +3215,16 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 				if cc.negate {
 					return false, nil // negate + any match = fail
 				}
+				// Store matched value + regex captures for MATCHED_VARS chain semantics.
+				if txVars != nil {
+					txVars["0"] = kv.val
+					if cc.regex != nil {
+						submatches := cc.regex.FindStringSubmatch(kv.val)
+						for i, sm := range submatches {
+							txVars[strconv.Itoa(i)] = sm
+						}
+					}
+				}
 				return true, &matchDetail{
 					Field:       cc.field,
 					VarName:     kv.key,
@@ -3248,16 +3277,23 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	origTarget := target
 
 	// Store regex submatches in txVars for subsequent conditions.
+	// CRS convention: TX:0 = full match, TX:1 = first capture group, etc.
 	if cc.regex != nil && txVars != nil {
 		submatches := cc.regex.FindStringSubmatch(target)
-		if len(submatches) > 1 {
-			for i, sm := range submatches[1:] {
+		if len(submatches) > 0 {
+			for i, sm := range submatches {
 				txVars[strconv.Itoa(i)] = sm
 			}
 		}
 	}
 
 	matched, matchedData := evalMultiMatchOrPlainDetailed(cc, target)
+
+	// For multi-value fields, store the matched value as tx:0 for MATCHED_VARS.
+	if matched && cc.isMulti && txVars != nil && txVars["0"] == "" {
+		txVars["0"] = target
+	}
+
 	if cc.negate {
 		matched = !matched
 	}
