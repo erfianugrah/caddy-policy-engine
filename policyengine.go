@@ -1683,14 +1683,6 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVar
 	// iterate all values, return true if ANY matches (OR semantics).
 	if cc.isMulti {
 		values := cachedExtractMultiField(cc, r, pb)
-
-		// Coraza/CRS semantics for negated multi-value fields: when the
-		// field is absent (e.g., files on a non-multipart request), skip
-		// the condition entirely — don't let negation fire on absent data.
-		if cc.negate && len(values) == 0 && multiFieldAbsent(cc, pb) {
-			return false
-		}
-
 		for _, val := range values {
 			if evalMultiMatchOrPlain(cc, val) {
 				if cc.negate {
@@ -1849,30 +1841,6 @@ func fieldAbsent(cc compiledCondition, r *http.Request) bool {
 		return len(r.Header.Values("Content-Length")) == 0
 	}
 	// All other fields are always present (ip, path, method, query, etc.)
-	return false
-}
-
-// multiFieldAbsent returns true if a multi-value field represents data that
-// is not present in the request. Used for Coraza/CRS semantics: negated
-// conditions on absent multi-value fields should not fire.
-// Example: files/files_names on a non-multipart request, xml on non-XML body.
-func multiFieldAbsent(cc compiledCondition, pb *parsedBody) bool {
-	switch cc.field {
-	case "files", "files_names", "multipart_part_headers":
-		// Multipart fields: absent when body is not multipart/form-data.
-		if pb == nil || !strings.Contains(pb.contentType, "multipart/") {
-			return true
-		}
-	case "xml":
-		// XML field: absent when body is not XML.
-		if pb == nil {
-			return true
-		}
-		ct := pb.contentType
-		if !strings.Contains(ct, "xml") && !strings.Contains(ct, "soap") {
-			return true
-		}
-	}
 	return false
 }
 
@@ -3241,12 +3209,6 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	// Multi-value fields — iterate all, report first match.
 	if cc.isMulti {
 		kvs := cachedExtractMultiFieldKeyed(cc, r, pb)
-
-		// Coraza/CRS semantics: negated multi-value on absent field → skip.
-		if cc.negate && len(kvs) == 0 && multiFieldAbsent(cc, pb) {
-			return false, nil
-		}
-
 		for _, kv := range kvs {
 			matched, matchedData := evalMultiMatchOrPlainDetailed(cc, kv.val)
 			if matched {
