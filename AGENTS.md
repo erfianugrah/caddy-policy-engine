@@ -46,7 +46,7 @@ All source lives in the repository root as a single flat Go package:
 
 | File | Lines | Purpose |
 |---|---|---|
-| `policyengine.go` | ~4419 | Core engine: types, compilation, 7-pass evaluation, ServeHTTP, hot-reload, field extraction, operators, CRS protocol enforcement |
+| `policyengine.go` | ~4811 | Core engine: types, compilation, 7-pass evaluation, ServeHTTP, hot-reload, field extraction, operators, CRS protocol enforcement, TX variable capture, XML/multipart parsing |
 | `challenge.go` | ~1120 | PoW challenge system: interstitial, verification, 6-layer bot scoring, adaptive difficulty, HMAC cookies, session tracking, JTI denylist |
 | `ratelimit.go` | ~606 | Sliding window rate limiting with 16-shard concurrent counters |
 | `transforms.go` | ~820 | CRS-compatible transform functions (21 transforms matching ModSecurity `t:xxx`) |
@@ -55,7 +55,7 @@ All source lives in the repository root as a single flat Go package:
 | `ja4_listener.go` | ~152 | `caddy.ListenerWrapper` module for JA4 — intercepts connections pre-TLS |
 | `ja4_registry.go` | ~28 | Thread-safe JA4 fingerprint store (`sync.Map`) keyed by remote address |
 | `ahocorasick.go` | ~172 | Aho-Corasick multi-pattern substring matcher for `phrase_match` operator |
-| `policyengine_test.go` | ~7698 | Core engine tests |
+| `policyengine_test.go` | ~8045 | Core engine tests |
 | `challenge_test.go` | ~1278 | Challenge system tests |
 | `ratelimit_test.go` | ~1217 | Rate limiter tests |
 | `transforms_test.go` | ~951 | Transform function tests |
@@ -111,6 +111,34 @@ using original CRS rule IDs for event correlation.
 All settings support per-service overrides via `WafServiceConfig`. Zero/empty = not
 enforced (permissive default). Settings flow from wafctl dashboard → `waf-config.json`
 → `policy-rules.json` `waf_config` section → plugin `compileWafConfig()`.
+
+### TX Variable Capture (v0.36.0)
+
+Per-request TX variable context for CRS chain rule semantics. When a condition's
+regex has capture groups, submatches are stored as `TX:0`, `TX:1`, etc. Subsequent
+AND conditions can reference these via `field="tx" name="0"` (or `field="tx:0"`).
+
+- `matchRule`/`matchRuleDetailed`: create `txVars map[string]string`, pass through chain
+- `matchCondition`/`matchConditionDetailed`: populate txVars on regex matches, extract for `tx` field
+- `compileConditionDepth`: parses `tx:` prefix in field names
+- Helpers: `txExtract()`, `txFieldAbsent()`
+
+### XML Body Parsing (v0.36.0)
+
+`xml` field extracts text nodes and attribute values from XML/SOAP request bodies.
+Uses `encoding/xml` streaming tokenizer. Lazy parsing via `parsedBody.getXML()`.
+Multi-value field (OR semantics). Bare `xml` combines `/*` (text) and `//@*` (attrs).
+Capped at `maxXMLDepth=64` and `maxXMLValues=10000`.
+
+### Multipart Inspection (v0.37.0)
+
+Three fields for multipart/form-data body inspection:
+- `files`: form field names that contain file uploads
+- `files_names`: original filenames from Content-Disposition headers
+- `multipart_part_headers`: raw header lines from all MIME parts
+
+Lazy parsing via `parsedBody.getMultipart()`. Uses `mime/multipart` stdlib.
+Capped at 1000 parts per request.
 
 ## Dependencies
 
