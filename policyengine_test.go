@@ -8043,3 +8043,61 @@ func TestResolveDisabledCategories(t *testing.T) {
 		t.Error("nil config should return nil disabled categories")
 	}
 }
+
+func TestMultiFieldAbsent_NegatedFilesOnGetRequest(t *testing.T) {
+	// Rule 920120: files field with negate=true should NOT fire on GET requests
+	// because the FILES variable is absent (no multipart data).
+	rule := PolicyRule{
+		ID:   "920120",
+		Name: "test-multipart-absent",
+		Type: "detect",
+		Conditions: []PolicyCondition{
+			{
+				Group: []PolicyCondition{
+					{Field: "files", Operator: "regex", Value: "^safe$", Negate: true},
+					{Field: "files_names", Operator: "regex", Value: "^safe$", Negate: true},
+				},
+				GroupOp: "or",
+			},
+		},
+		GroupOp:       "and",
+		ParanoiaLevel: 1,
+		Severity:      "CRITICAL",
+		Enabled:       true,
+		Priority:      400,
+	}
+
+	compiled, err := compileRule(rule)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Simulate GET request (no body)
+	r := httptest.NewRequest("GET", "/?test=hello", nil)
+	// pb with empty body (what the plugin creates for GET)
+	pb := &parsedBody{contentType: ""}
+
+	matched := matchRule(compiled, r, pb)
+	if matched {
+		t.Errorf("rule 920120 should NOT match on GET request (no multipart data), but it did")
+	}
+
+	// Also test with pb = nil (no body read at all)
+	matched2 := matchRule(compiled, r, nil)
+	if matched2 {
+		t.Errorf("rule 920120 should NOT match with nil parsedBody, but it did")
+	}
+
+	// Positive test: multipart POST SHOULD match (files field has data that doesn't match safe pattern)
+	body := "----------boundary\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"evil.php\"\r\nContent-Type: text/plain\r\n\r\ndata\r\n----------boundary--\r\n"
+	r2 := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	r2.Header.Set("Content-Type", "multipart/form-data; boundary=--------boundary")
+	buf, _ := io.ReadAll(r2.Body)
+	r2.Body = io.NopCloser(strings.NewReader(body))
+	pb2 := &parsedBody{raw: buf, contentType: r2.Header.Get("Content-Type")}
+
+	matched3 := matchRule(compiled, r2, pb2)
+	if !matched3 {
+		t.Errorf("rule 920120 SHOULD match on multipart POST with non-safe filename, but it didn't")
+	}
+}

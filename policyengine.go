@@ -3368,6 +3368,13 @@ func matchConditionDetailed(cc compiledCondition, r *http.Request, pb *parsedBod
 	// Multi-value fields — iterate all, report first match.
 	if cc.isMulti {
 		kvs := cachedExtractMultiFieldKeyed(cc, r, pb)
+
+		// Coraza/ModSecurity semantics: absent content-type-dependent fields
+		// with negated conditions return false (same guard as matchCondition).
+		if cc.negate && len(kvs) == 0 && multiFieldAbsent(cc.field, pb) {
+			return false, nil
+		}
+
 		for _, kv := range kvs {
 			matched, matchedData := evalMultiMatchOrPlainDetailed(cc, kv.val)
 			if matched {
