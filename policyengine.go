@@ -482,15 +482,54 @@ type parsedBody struct {
 }
 
 // getQuery returns the cached URL query parameters, parsing lazily on first call.
+// Uses a custom parser that only splits on '&' (not ';') — Go 1.17+ treats ';'
+// as an error in url.ParseQuery, but ModSecurity/CRS treats ';' as a literal
+// character in query values. Without this, payloads like "eval=while(!0);" lose
+// the semicolon and everything after it.
 func (pb *parsedBody) getQuery(r *http.Request) url.Values {
 	if pb == nil {
-		return r.URL.Query()
+		return parseQueryAmpOnly(r.URL.RawQuery)
 	}
 	if !pb.queryDone {
 		pb.queryDone = true
-		pb.query = r.URL.Query()
+		pb.query = parseQueryAmpOnly(r.URL.RawQuery)
 	}
 	return pb.query
+}
+
+// parseQueryAmpOnly parses a URL query string using only '&' as the separator.
+// Unlike url.ParseQuery, ';' is treated as a literal character (not a separator).
+// This matches ModSecurity's behavior where ';' in query values is preserved.
+func parseQueryAmpOnly(query string) url.Values {
+	m := make(url.Values)
+	for query != "" {
+		var part string
+		if idx := strings.IndexByte(query, '&'); idx >= 0 {
+			part = query[:idx]
+			query = query[idx+1:]
+		} else {
+			part = query
+			query = ""
+		}
+		if part == "" {
+			continue
+		}
+		key := part
+		value := ""
+		if idx := strings.IndexByte(part, '='); idx >= 0 {
+			key = part[:idx]
+			value = part[idx+1:]
+		}
+		// URL-decode key and value, matching Go's standard behavior.
+		if k, err := url.QueryUnescape(key); err == nil {
+			key = k
+		}
+		if v, err := url.QueryUnescape(value); err == nil {
+			value = v
+		}
+		m[key] = append(m[key], value)
+	}
+	return m
 }
 
 // getJSON returns the pre-parsed JSON root, parsing lazily on first call.
