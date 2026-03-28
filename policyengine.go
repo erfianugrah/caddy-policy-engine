@@ -165,6 +165,7 @@ type WafConfig struct {
 	InboundThreshold   int                         `json:"inbound_threshold"`
 	OutboundThreshold  int                         `json:"outbound_threshold"`
 	DisabledCategories []string                    `json:"disabled_categories,omitempty"` // global: CRS rule ID prefixes to skip (e.g., "942" for SQLi)
+	DetectionOnly      bool                        `json:"detection_only,omitempty"`      // when true, detect rules score but never block (403)
 	PerService         map[string]WafServiceConfig `json:"per_service,omitempty"`
 
 	// CRS extended settings — protocol enforcement limits.
@@ -185,6 +186,7 @@ type WafServiceConfig struct {
 	InboundThreshold   int      `json:"inbound_threshold,omitempty"`
 	OutboundThreshold  int      `json:"outbound_threshold,omitempty"`
 	DisabledCategories []string `json:"disabled_categories,omitempty"` // per-service: CRS rule ID prefixes to skip
+	DetectionOnly      bool     `json:"detection_only,omitempty"`
 
 	// Per-service CRS extended settings (override global defaults).
 	AllowedMethods      string `json:"allowed_methods,omitempty"`
@@ -202,6 +204,7 @@ type compiledWafConfig struct {
 	defaultPL                 int
 	defaultInThreshold        int
 	defaultOutThreshold       int
+	defaultDetectionOnly      bool
 	defaultDisabledCategories map[string]bool // global disabled categories
 	services                  map[string]compiledWafServiceConfig
 
@@ -220,6 +223,7 @@ type compiledWafServiceConfig struct {
 	paranoiaLevel      int
 	inboundThreshold   int
 	outboundThreshold  int
+	detectionOnly      bool
 	disabledCategories map[string]bool // rule ID prefix set for O(1) lookup
 
 	// Per-service overrides (nil/zero = use global default).
@@ -824,7 +828,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// Resolve per-service WAF config for this request.
 	host := stripPort(r.Host)
-	servicePL, serviceThreshold, serviceOutThreshold := resolveWafConfig(wafCfg, host)
+	servicePL, serviceThreshold, serviceOutThreshold, detectionOnly := resolveWafConfig(wafCfg, host)
 	disabledCats := resolveDisabledCategories(wafCfg, host)
 
 	// CRS protocol enforcement: check method, HTTP version, arg limits.
@@ -942,30 +946,47 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			allowMatched = true
 
 		case "block", "honeypot":
-			// Pass 2: deny list — hard terminate.
-			caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
-			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
-			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
-			if len(cr.rule.Tags) > 0 {
-				caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
-			}
-			// Capture full request context for investigation.
+			// Pass 2: deny list — hard terminate (unless detection_only).
 			captureRequestContext(r, pb)
-			if !pe.HideHeaders {
-				w.Header().Set("X-Blocked-By", "policy-engine")
-				w.Header().Set("X-Blocked-Rule", cr.rule.Name)
+			if detectionOnly {
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type+"_logged")
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
 				if len(cr.rule.Tags) > 0 {
-					w.Header().Set("X-Policy-Tags", strings.Join(cr.rule.Tags, ","))
+					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 				}
+				pe.logger.Info("policy block (detection_only — not blocking)",
+					zap.String("rule_id", cr.rule.ID),
+					zap.String("rule_name", cr.rule.Name),
+					zap.String("type", cr.rule.Type),
+					zap.Strings("tags", cr.rule.Tags),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				// Don't return 403 — fall through to continue evaluation.
+				// But we still break out of the block pass since the rule matched.
+			} else {
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", cr.rule.Type)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+				if len(cr.rule.Tags) > 0 {
+					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+				}
+				if !pe.HideHeaders {
+					w.Header().Set("X-Blocked-By", "policy-engine")
+					w.Header().Set("X-Blocked-Rule", cr.rule.Name)
+					if len(cr.rule.Tags) > 0 {
+						w.Header().Set("X-Policy-Tags", strings.Join(cr.rule.Tags, ","))
+					}
+				}
+				pe.logger.Info("policy block",
+					zap.String("rule_id", cr.rule.ID),
+					zap.String("rule_name", cr.rule.Name),
+					zap.String("type", cr.rule.Type),
+					zap.Strings("tags", cr.rule.Tags),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				return caddyhttp.Error(http.StatusForbidden, nil)
 			}
-			pe.logger.Info("policy block",
-				zap.String("rule_id", cr.rule.ID),
-				zap.String("rule_name", cr.rule.Name),
-				zap.String("type", cr.rule.Type),
-				zap.Strings("tags", cr.rule.Tags),
-				zap.String("client_ip", clientIP(r)),
-				zap.String("uri", r.RequestURI))
-			return caddyhttp.Error(http.StatusForbidden, nil)
 
 		case "challenge":
 			// Pass 3: proof-of-work challenge — serve interstitial or validate cookie.
@@ -1109,34 +1130,53 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			}
 
 			if !allowed {
-				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit")
-				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
-				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
-				if len(cr.rule.Tags) > 0 {
-					caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
-				}
-				rlHeaderName := cr.rule.Name
-				if pe.HideHeaders {
-					rlHeaderName = ""
-				}
-				setRateLimitHeaders(w, limit, 0, cr.rlConfig.parsedWindow, rlHeaderName)
+				if detectionOnly {
+					caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit_logged")
+					caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+					caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+					if len(cr.rule.Tags) > 0 {
+						caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+					}
+					pe.logger.Info("rate limited (detection_only — not blocking)",
+						zap.String("rule_id", cr.rule.ID),
+						zap.String("rule_name", cr.rule.Name),
+						zap.String("key", key),
+						zap.Int64("count", count),
+						zap.Int("limit", limit),
+						zap.Strings("tags", cr.rule.Tags),
+						zap.String("client_ip", clientIP(r)),
+						zap.String("uri", r.RequestURI))
+					// Don't return 429 — fall through.
+				} else {
+					caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit")
+					caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
+					caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+					if len(cr.rule.Tags) > 0 {
+						caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
+					}
+					rlHeaderName := cr.rule.Name
+					if pe.HideHeaders {
+						rlHeaderName = ""
+					}
+					setRateLimitHeaders(w, limit, 0, cr.rlConfig.parsedWindow, rlHeaderName)
 
-				jitter := float64(0)
-				if globalCfg != nil {
-					jitter = globalCfg.jitter
-				}
-				w.Header().Set("Retry-After", retryAfterSeconds(cr.rlConfig.parsedWindow, jitter))
+					jitter := float64(0)
+					if globalCfg != nil {
+						jitter = globalCfg.jitter
+					}
+					w.Header().Set("Retry-After", retryAfterSeconds(cr.rlConfig.parsedWindow, jitter))
 
-				pe.logger.Info("rate limited",
-					zap.String("rule_id", cr.rule.ID),
-					zap.String("rule_name", cr.rule.Name),
-					zap.String("key", key),
-					zap.Int64("count", count),
-					zap.Int("limit", limit),
-					zap.Strings("tags", cr.rule.Tags),
-					zap.String("client_ip", clientIP(r)),
-					zap.String("uri", r.RequestURI))
-				return caddyhttp.Error(http.StatusTooManyRequests, nil)
+					pe.logger.Info("rate limited",
+						zap.String("rule_id", cr.rule.ID),
+						zap.String("rule_name", cr.rule.Name),
+						zap.String("key", key),
+						zap.Int64("count", count),
+						zap.Int("limit", limit),
+						zap.Strings("tags", cr.rule.Tags),
+						zap.String("client_ip", clientIP(r)),
+						zap.String("uri", r.RequestURI))
+					return caddyhttp.Error(http.StatusTooManyRequests, nil)
+				}
 			}
 
 			if !pe.HideHeaders {
@@ -1200,29 +1240,44 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 
 		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
-			caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_block")
-			// Capture full request context for investigation.
-			captureRequestContext(r, pb)
-
-			// Set Caddy vars for access log capture (matches block/allow pattern).
-			summary := fmt.Sprintf("Detect Block (score %d/%d, %d rules)", scorer.inbound, serviceThreshold, len(scorer.matched))
-			caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", summary)
-			caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", strings.Join(ruleNames, ","))
-
-			if !pe.HideHeaders {
-				w.Header().Set("X-Blocked-By", "policy-engine")
-				w.Header().Set("X-Anomaly-Score", strconv.Itoa(scorer.inbound))
-				w.Header().Set("X-Blocked-Rule", summary)
-				w.Header().Set("X-Detect-Rules", strings.Join(ruleDetails, " "))
+			if detectionOnly {
+				// Detection-only mode: score exceeded threshold but we don't block.
+				// Set action to "detect_logged" (not "detect_block") so the event
+				// pipeline classifies it as a would-have-blocked detection.
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_logged")
+				captureRequestContext(r, pb)
+				summary := fmt.Sprintf("Detect Logged (score %d/%d, %d rules, detection_only)", scorer.inbound, serviceThreshold, len(scorer.matched))
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", summary)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", strings.Join(ruleNames, ","))
+				pe.logger.Info("anomaly threshold exceeded (detection_only — not blocking)",
+					zap.Int("score", scorer.inbound),
+					zap.Int("threshold", serviceThreshold),
+					zap.Int("rules_matched", len(scorer.matched)),
+					zap.Strings("rule_ids", ruleNames),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				// Fall through to next handler — no 403.
+			} else {
+				caddyhttp.SetVar(r.Context(), "policy_engine.action", "detect_block")
+				captureRequestContext(r, pb)
+				summary := fmt.Sprintf("Detect Block (score %d/%d, %d rules)", scorer.inbound, serviceThreshold, len(scorer.matched))
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", summary)
+				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", strings.Join(ruleNames, ","))
+				if !pe.HideHeaders {
+					w.Header().Set("X-Blocked-By", "policy-engine")
+					w.Header().Set("X-Anomaly-Score", strconv.Itoa(scorer.inbound))
+					w.Header().Set("X-Blocked-Rule", summary)
+					w.Header().Set("X-Detect-Rules", strings.Join(ruleDetails, " "))
+				}
+				pe.logger.Info("anomaly threshold exceeded",
+					zap.Int("score", scorer.inbound),
+					zap.Int("threshold", serviceThreshold),
+					zap.Int("rules_matched", len(scorer.matched)),
+					zap.Strings("rule_ids", ruleNames),
+					zap.String("client_ip", clientIP(r)),
+					zap.String("uri", r.RequestURI))
+				return caddyhttp.Error(http.StatusForbidden, nil)
 			}
-			pe.logger.Info("anomaly threshold exceeded",
-				zap.Int("score", scorer.inbound),
-				zap.Int("threshold", serviceThreshold),
-				zap.Int("rules_matched", len(scorer.matched)),
-				zap.Strings("rule_ids", ruleNames),
-				zap.String("client_ip", clientIP(r)),
-				zap.String("uri", r.RequestURI))
-			return caddyhttp.Error(http.StatusForbidden, nil)
 		}
 	}
 
@@ -1334,15 +1389,19 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			pe.logger.Warn("outbound anomaly threshold exceeded",
 				zap.Int("score", scorer.outbound),
 				zap.Int("threshold", serviceOutThreshold),
+				zap.Bool("detection_only", detectionOnly),
 				zap.String("host", host),
 				zap.String("uri", r.RequestURI),
 				zap.String("client_ip", clientIP(r)))
 			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_score", strconv.Itoa(scorer.outbound))
-			caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_block")
-			// Block the response — return 403 instead of the upstream response.
-			w.Header().Set("X-Blocked-By", "policy-engine-outbound")
-			w.WriteHeader(http.StatusForbidden)
-			return nil
+			if detectionOnly {
+				caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_logged")
+			} else {
+				caddyhttp.SetVar(r.Context(), "policy_engine.outbound_action", "detect_block")
+				w.Header().Set("X-Blocked-By", "policy-engine-outbound")
+				w.WriteHeader(http.StatusForbidden)
+				return nil
+			}
 		}
 
 		// Score below threshold — write the original buffered response to client.
@@ -3889,9 +3948,10 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 		return nil
 	}
 	c := &compiledWafConfig{
-		defaultPL:           cfg.ParanoiaLevel,
-		defaultInThreshold:  cfg.InboundThreshold,
-		defaultOutThreshold: cfg.OutboundThreshold,
+		defaultPL:            cfg.ParanoiaLevel,
+		defaultInThreshold:   cfg.InboundThreshold,
+		defaultOutThreshold:  cfg.OutboundThreshold,
+		defaultDetectionOnly: cfg.DetectionOnly,
 	}
 	// Compile global disabled categories into a set.
 	if len(cfg.DisabledCategories) > 0 {
@@ -3925,6 +3985,7 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 				paranoiaLevel:     svc.ParanoiaLevel,
 				inboundThreshold:  svc.InboundThreshold,
 				outboundThreshold: svc.OutboundThreshold,
+				detectionOnly:     svc.DetectionOnly,
 			}
 			// Compile per-service disabled categories; inherit global if empty.
 			if len(svc.DisabledCategories) > 0 {
@@ -3954,6 +4015,11 @@ func compileWafConfig(cfg *WafConfig) *compiledWafConfig {
 			if cs.outboundThreshold == 0 {
 				cs.outboundThreshold = c.defaultOutThreshold
 			}
+			// Per-service detection_only: when not explicitly set (false),
+			// inherit from global default. Only explicit true overrides.
+			if !cs.detectionOnly {
+				cs.detectionOnly = c.defaultDetectionOnly
+			}
 			c.services[strings.ToLower(host)] = cs
 		}
 	}
@@ -3975,20 +4041,19 @@ func compileSpaceList(s string) map[string]bool {
 	return m
 }
 
-// resolveWafConfig returns the effective paranoia level and inbound threshold
-// for a given host. Falls back to defaults if no per-service override exists.
-// Returns (1, 0, 0) if wafConfig is nil (scoring disabled — PL 1, thresholds 0
-// meaning no blocking).
-func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inboundThreshold, outboundThreshold int) {
+// resolveWafConfig returns the effective paranoia level, thresholds, and
+// detection_only flag for a given host. Falls back to defaults if no per-service
+// override exists. Returns (1, 0, 0, false) if wafConfig is nil (scoring disabled).
+func resolveWafConfig(cfg *compiledWafConfig, host string) (paranoiaLevel, inboundThreshold, outboundThreshold int, detectionOnly bool) {
 	if cfg == nil {
-		return 1, 0, 0
+		return 1, 0, 0, false
 	}
 	if cfg.services != nil {
 		if svc, ok := cfg.services[strings.ToLower(host)]; ok {
-			return svc.paranoiaLevel, svc.inboundThreshold, svc.outboundThreshold
+			return svc.paranoiaLevel, svc.inboundThreshold, svc.outboundThreshold, svc.detectionOnly
 		}
 	}
-	return cfg.defaultPL, cfg.defaultInThreshold, cfg.defaultOutThreshold
+	return cfg.defaultPL, cfg.defaultInThreshold, cfg.defaultOutThreshold, cfg.defaultDetectionOnly
 }
 
 // resolveDisabledCategories returns the disabled category set for a host.

@@ -3667,7 +3667,7 @@ func TestCompileWafConfig_PerService(t *testing.T) {
 		t.Fatal("expected non-nil")
 	}
 	// Default lookup.
-	pl, th, oth := resolveWafConfig(c, "unknown.example.com")
+	pl, th, oth, _ := resolveWafConfig(c, "unknown.example.com")
 	if pl != 2 || th != 10 {
 		t.Errorf("default: expected PL=2 threshold=10, got PL=%d threshold=%d", pl, th)
 	}
@@ -3675,19 +3675,19 @@ func TestCompileWafConfig_PerService(t *testing.T) {
 		t.Errorf("default: expected outbound threshold=10, got %d", oth)
 	}
 	// Strict override.
-	pl, th, _ = resolveWafConfig(c, "strict.example.com")
+	pl, th, _, _ = resolveWafConfig(c, "strict.example.com")
 	if pl != 1 || th != 5 {
 		t.Errorf("strict: expected PL=1 threshold=5, got PL=%d threshold=%d", pl, th)
 	}
 	// Relaxed override (PL inherits, threshold overridden).
-	pl, th, _ = resolveWafConfig(c, "relaxed.example.com")
+	pl, th, _, _ = resolveWafConfig(c, "relaxed.example.com")
 	if pl != 2 || th != 20 {
 		t.Errorf("relaxed: expected PL=2 threshold=20, got PL=%d threshold=%d", pl, th)
 	}
 }
 
 func TestResolveWafConfig_Nil(t *testing.T) {
-	pl, th, oth := resolveWafConfig(nil, "example.com")
+	pl, th, oth, _ := resolveWafConfig(nil, "example.com")
 	if pl != 1 || th != 0 || oth != 0 {
 		t.Errorf("nil config: expected PL=1 in=0 out=0, got PL=%d in=%d out=%d", pl, th, oth)
 	}
@@ -7814,11 +7814,11 @@ func TestResolveWafConfig_OutboundThreshold(t *testing.T) {
 			"strict.example.com": {ParanoiaLevel: 1, InboundThreshold: 5, OutboundThreshold: 4},
 		},
 	})
-	_, _, oth := resolveWafConfig(c, "unknown.example.com")
+	_, _, oth, _ := resolveWafConfig(c, "unknown.example.com")
 	if oth != 8 {
 		t.Errorf("default: expected outbound threshold=8, got %d", oth)
 	}
-	_, _, oth = resolveWafConfig(c, "strict.example.com")
+	_, _, oth, _ = resolveWafConfig(c, "strict.example.com")
 	if oth != 4 {
 		t.Errorf("strict: expected outbound threshold=4, got %d", oth)
 	}
@@ -7833,7 +7833,7 @@ func TestResolveWafConfig_OutboundThresholdInheritsDefault(t *testing.T) {
 			"svc.example.com": {ParanoiaLevel: 2, InboundThreshold: 20},
 		},
 	})
-	_, _, oth := resolveWafConfig(c, "svc.example.com")
+	_, _, oth, _ := resolveWafConfig(c, "svc.example.com")
 	if oth != 15 {
 		t.Errorf("expected outbound threshold=15 (inherited), got %d", oth)
 	}
