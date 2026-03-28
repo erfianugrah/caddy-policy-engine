@@ -4282,7 +4282,8 @@ func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, 
 	switch cond.Operator {
 	case "neq", "not_ip_match", "not_in_list",
 		"not_contains", "not_begins_with", "not_ends_with",
-		"not_regex", "not_in", "not_phrase_match":
+		"not_regex", "not_in", "not_phrase_match",
+		"not_ends_with_field":
 		cc.negate = true
 	}
 	// CRS !@ prefix: explicit negate field from converter output.
