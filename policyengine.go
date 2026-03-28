@@ -1683,6 +1683,23 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVar
 	// iterate all values, return true if ANY matches (OR semantics).
 	if cc.isMulti {
 		values := cachedExtractMultiField(cc, r, pb)
+
+		// Coraza/ModSecurity semantics: when a negated condition targets a
+		// content-type-dependent variable that is absent (e.g., FILES on a
+		// non-multipart request, XML on a non-XML request), skip the
+		// condition — return false. Without this, negated regex rules like
+		// 920120 ("!@rx ^safe_pattern$" on FILES) fire on every request
+		// that has no multipart data, because the empty value set yields
+		// "no match" which negate flips to true.
+		//
+		// This is scoped to fields whose presence depends on Content-Type
+		// (files, files_names, multipart_part_headers, xml). General
+		// aggregate fields (all_args, all_headers, all_cookies) always
+		// "exist" even when empty — their absence semantics are different.
+		if cc.negate && len(values) == 0 && multiFieldAbsent(cc.field, pb) {
+			return false
+		}
+
 		for _, val := range values {
 			if evalMultiMatchOrPlain(cc, val) {
 				if cc.negate {
@@ -1841,6 +1858,34 @@ func fieldAbsent(cc compiledCondition, r *http.Request) bool {
 		return len(r.Header.Values("Content-Length")) == 0
 	}
 	// All other fields are always present (ip, path, method, query, etc.)
+	return false
+}
+
+// multiFieldAbsent returns true if a multi-value field is absent due to
+// content-type mismatch. This applies only to body-dependent multi-fields
+// whose presence depends on the request Content-Type:
+//   - files, files_names, multipart_part_headers → absent when not multipart/
+//   - xml → absent when not application/xml, text/xml, or +xml
+//
+// General aggregate fields (all_args, all_headers, all_cookies) are always
+// "present" even when empty — a request always has headers and can always
+// have args, so returning an empty set is valid (not absent).
+func multiFieldAbsent(field string, pb *parsedBody) bool {
+	switch field {
+	case "files", "files_names", "multipart_part_headers":
+		// These require multipart/ content type.
+		if pb == nil || len(pb.raw) == 0 {
+			return true
+		}
+		return !strings.Contains(pb.contentType, "multipart/")
+	case "xml":
+		// XML requires application/xml, text/xml, or +xml content type.
+		if pb == nil || len(pb.raw) == 0 {
+			return true
+		}
+		ct := strings.ToLower(pb.contentType)
+		return !strings.Contains(ct, "/xml") && !strings.Contains(ct, "+xml")
+	}
 	return false
 }
 
