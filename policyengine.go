@@ -377,6 +377,7 @@ type compiledCondition struct {
 	numericVal    float64         // pre-parsed numeric value for gt/ge/lt/le operators
 	byteRangeSet  *[256]bool      // allowed byte values for validate_byte_range
 	excludes      map[string]bool // patterns to exclude from multi-field extraction (e.g., "cookie:__utm")
+	compareField  string          // for _field operators (ends_with_field): name of field to compare against at runtime
 	// Nested group support
 	isGroup       bool                // true when this is a group, not a simple condition
 	subConditions []compiledCondition // compiled sub-conditions (when isGroup)
@@ -1738,6 +1739,38 @@ func matchCondition(cc compiledCondition, r *http.Request, pb *parsedBody, txVar
 		return result
 	}
 
+	// Field-comparison operators: compare the target against another request
+	// field's value at runtime. Used for CRS chains like:
+	//   TX:1 !@endsWith %{request_headers.host}
+	// where a captured value is compared against the Host header dynamically.
+	if cc.compareField != "" {
+		var target string
+		if cc.field == "tx" {
+			target = txExtract(cc, txVars)
+		} else {
+			target = extractField(cc, r, pb)
+		}
+		// Extract the comparison field value.
+		compareTo := extractField(compiledCondition{field: cc.compareField}, r, pb)
+		var result bool
+		switch cc.operator {
+		case "ends_with_field":
+			result = strings.HasSuffix(strings.ToLower(target), strings.ToLower(compareTo))
+		case "not_ends_with_field":
+			result = strings.HasSuffix(strings.ToLower(target), strings.ToLower(compareTo))
+		case "begins_with_field":
+			result = strings.HasPrefix(strings.ToLower(target), strings.ToLower(compareTo))
+		case "contains_field":
+			result = strings.Contains(strings.ToLower(target), strings.ToLower(compareTo))
+		case "eq_field":
+			result = strings.EqualFold(target, compareTo)
+		}
+		if cc.negate {
+			return !result
+		}
+		return result
+	}
+
 	// Coraza semantics: when a negated condition targets a variable that doesn't
 	// exist (e.g., Content-Length header on GET), skip the condition. Without
 	// this, negated regex rules (like "!@rx ^\d+$") would fire on every request
@@ -2233,17 +2266,27 @@ func extractMultiField(cc compiledCondition, r *http.Request, pb *parsedBody) []
 		return vals
 
 	case "all_headers":
-		// All request header values (matches CRS REQUEST_HEADERS)
+		// All request header values (matches CRS REQUEST_HEADERS).
+		// Supports excludes (e.g., "header:Cookie") for CRS rules that use
+		// REQUEST_HEADERS|!REQUEST_HEADERS:Cookie to exclude cookie values
+		// from header scanning.
 		var vals []string
-		for _, vs := range r.Header {
+		for k, vs := range r.Header {
+			if cc.excludes != nil && isExcluded(cc.excludes, "header", k) {
+				continue
+			}
 			vals = append(vals, vs...)
 		}
 		return vals
 
 	case "all_headers_names":
-		// All request header names (matches CRS REQUEST_HEADERS_NAMES)
+		// All request header names (matches CRS REQUEST_HEADERS_NAMES).
+		// Supports excludes for symmetry with all_headers.
 		var vals []string
 		for k := range r.Header {
+			if cc.excludes != nil && isExcluded(cc.excludes, "header", k) {
+				continue
+			}
 			vals = append(vals, k)
 		}
 		return vals
@@ -2495,6 +2538,9 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 	case "all_headers":
 		var kvs []keyedValue
 		for k, vs := range r.Header {
+			if cc.excludes != nil && isExcluded(cc.excludes, "header", k) {
+				continue
+			}
 			for _, v := range vs {
 				kvs = append(kvs, keyedValue{key: "REQUEST_HEADERS:" + k, val: v})
 			}
@@ -2504,6 +2550,9 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 	case "all_headers_names":
 		var kvs []keyedValue
 		for k := range r.Header {
+			if cc.excludes != nil && isExcluded(cc.excludes, "header", k) {
+				continue
+			}
 			kvs = append(kvs, keyedValue{key: "REQUEST_HEADERS_NAMES", val: k})
 		}
 		return kvs
@@ -2511,6 +2560,9 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 	case "all_cookies":
 		var kvs []keyedValue
 		for _, c := range r.Cookies() {
+			if cc.excludes != nil && isExcluded(cc.excludes, "cookie", c.Name) {
+				continue
+			}
 			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES:" + c.Name, val: c.Value})
 		}
 		return kvs
@@ -2518,6 +2570,9 @@ func extractMultiFieldKeyed(cc compiledCondition, r *http.Request, pb *parsedBod
 	case "all_cookies_names":
 		var kvs []keyedValue
 		for _, c := range r.Cookies() {
+			if cc.excludes != nil && isExcluded(cc.excludes, "cookie", c.Name) {
+				continue
+			}
 			kvs = append(kvs, keyedValue{key: "REQUEST_COOKIES_NAMES", val: c.Name})
 		}
 		return kvs
@@ -4248,6 +4303,12 @@ func compileConditionDepth(cond PolicyCondition, depth int) (compiledCondition, 
 
 	case "ends_with", "not_ends_with":
 		cc.suffix = value
+
+	case "ends_with_field", "not_ends_with_field",
+		"begins_with_field", "contains_field", "eq_field":
+		// Field-comparison operators: value names the field to compare against
+		// at runtime (e.g., "host" → compare target against request Host header).
+		cc.compareField = value
 
 	case "regex", "not_regex":
 		if len(value) > maxRegexLen {
