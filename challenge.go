@@ -101,6 +101,9 @@ type challengePending struct {
 	Service    string `json:"service"`
 	JA4        string `json:"ja4,omitempty"`
 	Difficulty int    `json:"difficulty"`
+	Method     string `json:"method,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	UserAgent  string `json:"user_agent,omitempty"`
 	IssuedAt   int64  `json:"issued_at"` // unix timestamp
 }
 
@@ -110,6 +113,9 @@ type challengeAbandonedEvent struct {
 	Service    string `json:"service"`
 	JA4        string `json:"ja4,omitempty"`
 	Difficulty int    `json:"difficulty"`
+	Method     string `json:"method,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	UserAgent  string `json:"user_agent,omitempty"`
 	IssuedAt   int64  `json:"issued_at"`
 	ExpiredAt  int64  `json:"expired_at"`
 }
@@ -135,6 +141,9 @@ func (pe *PolicyEngine) trackChallengeIssued(randomData string, r *http.Request,
 		Service:    host,
 		JA4:        ja4,
 		Difficulty: difficulty,
+		Method:     r.Method,
+		URI:        r.URL.RequestURI(),
+		UserAgent:  r.Header.Get("User-Agent"),
 		IssuedAt:   time.Now().Unix(),
 	}
 	pe.pendingMu.Unlock()
@@ -174,6 +183,9 @@ func (pe *PolicyEngine) sweepAbandonedChallenges() {
 				Service:    p.Service,
 				JA4:        p.JA4,
 				Difficulty: p.Difficulty,
+				Method:     p.Method,
+				URI:        p.URI,
+				UserAgent:  p.UserAgent,
 				IssuedAt:   p.IssuedAt,
 				ExpiredAt:  now.Unix(),
 			})
