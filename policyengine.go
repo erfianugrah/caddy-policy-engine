@@ -134,12 +134,6 @@ type PolicyEngine struct {
 	denylistFile    string          // path to jti-denylist.json
 	lastDenylistMod time.Time       // mtime of last read
 
-	// Abandoned challenge tracking: in-memory map of issued challenges
-	// awaiting verification. Background sweep writes expired entries to
-	// a JSONL file for wafctl to ingest.
-	pendingChallenges map[string]challengePending // nonce[:32] → pending
-	pendingMu         sync.Mutex
-	abandonedFile     string // path to challenge-abandoned.jsonl
 }
 
 // PolicyRulesFile is the top-level JSON structure of the user rules file.
@@ -718,10 +712,6 @@ func (pe *PolicyEngine) Provision(ctx caddy.Context) error {
 		// Set up JTI denylist file path (same directory as rules file).
 		pe.denylistFile = filepath.Join(filepath.Dir(pe.RulesFile), "jti-denylist.json")
 		pe.loadDenylist() // initial load (may not exist yet)
-
-		// Set up abandoned challenge tracking file path.
-		pe.abandonedFile = filepath.Join(filepath.Dir(pe.RulesFile), "challenge-abandoned.jsonl")
-		pe.pendingChallenges = make(map[string]challengePending)
 
 		// Start hot-reload polling.
 		pe.stopPoll = make(chan struct{})
@@ -4760,10 +4750,6 @@ func (pe *PolicyEngine) checkReload() {
 			pe.loadDenylist()
 		}
 	}
-
-	// Sweep abandoned challenges (every poll cycle — timeout is 5 min
-	// so checking every 5s is fine; the sweep only writes when entries expire).
-	pe.sweepAbandonedChallenges()
 
 	if !rulesChanged {
 		return

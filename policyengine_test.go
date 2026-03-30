@@ -7085,7 +7085,7 @@ func TestAllowAction_DoesNotCaptureHeaders(t *testing.T) {
 	}
 }
 
-func TestBelowThresholdDetect_DoesNotCaptureHeaders(t *testing.T) {
+func TestBelowThresholdDetect_CapturesHeaders(t *testing.T) {
 	path := writeTempRulesFileWithConfig(t, []PolicyRule{
 		{
 			ID: "d-low", Name: "Low Detect", Type: "detect", Enabled: true,
@@ -7108,13 +7108,14 @@ func TestBelowThresholdDetect_DoesNotCaptureHeaders(t *testing.T) {
 
 	_ = pe.ServeHTTP(w, r, next)
 
-	// Below threshold → should NOT capture headers (only blocking events get full context).
+	// Below threshold detect events now capture request headers so the
+	// event detail panel shows full request context for logged events.
 	hdrsRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.request_headers").(string)
-	if hdrsRaw != "" {
-		t.Errorf("expected no request_headers for below-threshold detect, got headers")
+	if hdrsRaw == "" {
+		t.Error("expected request_headers for below-threshold detect (logged events need context)")
 	}
 
-	// But detect_matches should still be set (observability for logged events).
+	// detect_matches should also be set.
 	matchesRaw, _ := caddyhttp.GetVar(r.Context(), "policy_engine.detect_matches").(string)
 	if matchesRaw == "" {
 		t.Error("expected detect_matches to still be set for below-threshold detect")

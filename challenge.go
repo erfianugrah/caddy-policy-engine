@@ -93,130 +93,6 @@ type challengeCookiePayload struct {
 	Ja4   string `json:"ja4,omitempty"` // JA4 TLS fingerprint (if bind_ja4)
 }
 
-// ─── Challenge Abandoned Tracking ────────────────────────────────────
-
-// challengePending tracks an issued challenge awaiting resolution.
-type challengePending struct {
-	ClientIP   string `json:"client_ip"`
-	Service    string `json:"service"`
-	JA4        string `json:"ja4,omitempty"`
-	Difficulty int    `json:"difficulty"`
-	Method     string `json:"method,omitempty"`
-	URI        string `json:"uri,omitempty"`
-	UserAgent  string `json:"user_agent,omitempty"`
-	IssuedAt   int64  `json:"issued_at"` // unix timestamp
-}
-
-// challengeAbandonedEvent is written to the abandoned events file.
-type challengeAbandonedEvent struct {
-	ClientIP   string `json:"client_ip"`
-	Service    string `json:"service"`
-	JA4        string `json:"ja4,omitempty"`
-	Difficulty int    `json:"difficulty"`
-	Method     string `json:"method,omitempty"`
-	URI        string `json:"uri,omitempty"`
-	UserAgent  string `json:"user_agent,omitempty"`
-	IssuedAt   int64  `json:"issued_at"`
-	ExpiredAt  int64  `json:"expired_at"`
-}
-
-const challengeAbandonTimeout = 5 * time.Minute
-
-// trackChallengeIssued records a pending challenge. Called when the
-// interstitial is served. The nonce (first 32 chars of random_data)
-// is used as the key.
-func (pe *PolicyEngine) trackChallengeIssued(randomData string, r *http.Request, difficulty int) {
-	if pe.pendingChallenges == nil {
-		return
-	}
-	key := randomData
-	if len(key) > 32 {
-		key = key[:32]
-	}
-	host := stripPort(r.Host)
-	ja4 := ja4Registry.Get(r.RemoteAddr)
-	pe.pendingMu.Lock()
-	pe.pendingChallenges[key] = challengePending{
-		ClientIP:   clientIP(r),
-		Service:    host,
-		JA4:        ja4,
-		Difficulty: difficulty,
-		Method:     r.Method,
-		URI:        r.URL.RequestURI(),
-		UserAgent:  r.Header.Get("User-Agent"),
-		IssuedAt:   time.Now().Unix(),
-	}
-	pe.pendingMu.Unlock()
-}
-
-// resolveChallengeIssued removes a pending challenge (client submitted
-// to the verify endpoint, regardless of pass/fail outcome).
-func (pe *PolicyEngine) resolveChallengeIssued(randomData string) {
-	if pe.pendingChallenges == nil {
-		return
-	}
-	key := randomData
-	if len(key) > 32 {
-		key = key[:32]
-	}
-	pe.pendingMu.Lock()
-	delete(pe.pendingChallenges, key)
-	pe.pendingMu.Unlock()
-}
-
-// sweepAbandonedChallenges checks for expired pending challenges and writes
-// them to the abandoned events file. Called periodically from the poll loop.
-func (pe *PolicyEngine) sweepAbandonedChallenges() {
-	if pe.pendingChallenges == nil || pe.abandonedFile == "" {
-		return
-	}
-
-	now := time.Now()
-	cutoff := now.Add(-challengeAbandonTimeout).Unix()
-
-	pe.pendingMu.Lock()
-	var abandoned []challengeAbandonedEvent
-	for key, p := range pe.pendingChallenges {
-		if p.IssuedAt <= cutoff {
-			abandoned = append(abandoned, challengeAbandonedEvent{
-				ClientIP:   p.ClientIP,
-				Service:    p.Service,
-				JA4:        p.JA4,
-				Difficulty: p.Difficulty,
-				Method:     p.Method,
-				URI:        p.URI,
-				UserAgent:  p.UserAgent,
-				IssuedAt:   p.IssuedAt,
-				ExpiredAt:  now.Unix(),
-			})
-			delete(pe.pendingChallenges, key)
-		}
-	}
-	pe.pendingMu.Unlock()
-
-	if len(abandoned) == 0 {
-		return
-	}
-
-	// Append to JSONL file (one JSON object per line).
-	f, err := os.OpenFile(pe.abandonedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		pe.logger.Warn("failed to open abandoned challenges file", zap.Error(err))
-		return
-	}
-	defer f.Close()
-
-	for _, ev := range abandoned {
-		line, _ := json.Marshal(ev)
-		f.Write(line)
-		f.Write([]byte("\n"))
-	}
-
-	pe.logger.Info("swept abandoned challenges",
-		zap.Int("count", len(abandoned)),
-		zap.String("file", pe.abandonedFile))
-}
-
 // ─── Signal Obfuscation (P1) ────────────────────────────────────────
 
 // signalFieldNames are the real signal field names that must be randomized.
@@ -1269,9 +1145,6 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 	page = strings.Replace(page, "{{CHALLENGE_DATA}}", string(dataJSON), 1)
 	page = strings.Replace(page, "{{CHALLENGE_JS}}", mutatedJS, 1)
 
-	// Track this issued challenge for abandoned detection.
-	pe.trackChallengeIssued(randomData, r, difficulty)
-
 	// Serve — return 200 to fool status-checking bots (same as Anubis).
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -1302,13 +1175,6 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 	difficultyStr := r.FormValue("difficulty")
 	timestampStr := r.FormValue("timestamp")
 	originalURL := r.FormValue("original_url")
-
-	// Resolve the pending challenge tracker — the client attempted verification.
-	// This prevents the challenge from being counted as abandoned regardless of
-	// whether the verify succeeds or fails.
-	if randomData != "" {
-		pe.resolveChallengeIssued(randomData)
-	}
 
 	if randomData == "" || nonceStr == "" || response == "" || submittedHMAC == "" || difficultyStr == "" || timestampStr == "" {
 		pe.logger.Info("challenge verify: missing fields",

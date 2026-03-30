@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1724,87 +1723,6 @@ func TestCompileChallengeRuleAppChecks(t *testing.T) {
 	if cr.challengeConfig.appChecks[0].Path != "__NEXT_DATA__" {
 		t.Errorf("first check path = %q, want __NEXT_DATA__", cr.challengeConfig.appChecks[0].Path)
 	}
-}
-
-// ─── Abandoned Challenge Tracking ────────────────────────────────────
-
-func TestTrackAndResolveChallengeIssued(t *testing.T) {
-	pe := &PolicyEngine{
-		pendingChallenges: make(map[string]challengePending),
-		logger:            zap.NewNop(),
-	}
-
-	r := makeRequest("GET", "https://httpbun.erfi.io/test", "1.2.3.4:5678")
-	r.Host = "httpbun.erfi.io"
-
-	pe.trackChallengeIssued("aabbccdd11223344", r, 4)
-
-	pe.pendingMu.Lock()
-	if len(pe.pendingChallenges) != 1 {
-		t.Errorf("pending count = %d, want 1", len(pe.pendingChallenges))
-	}
-	pe.pendingMu.Unlock()
-
-	pe.resolveChallengeIssued("aabbccdd11223344")
-
-	pe.pendingMu.Lock()
-	if len(pe.pendingChallenges) != 0 {
-		t.Errorf("pending count after resolve = %d, want 0", len(pe.pendingChallenges))
-	}
-	pe.pendingMu.Unlock()
-}
-
-func TestSweepAbandonedChallenges(t *testing.T) {
-	tmpFile := t.TempDir() + "/challenge-abandoned.jsonl"
-	pe := &PolicyEngine{
-		pendingChallenges: make(map[string]challengePending),
-		abandonedFile:     tmpFile,
-		logger:            zap.NewNop(),
-	}
-
-	// Expired challenge (10 min ago).
-	pe.pendingMu.Lock()
-	pe.pendingChallenges["expired123456789012"] = challengePending{
-		ClientIP:   "10.0.0.1",
-		Service:    "httpbun.erfi.io",
-		Difficulty: 4,
-		IssuedAt:   time.Now().Add(-10 * time.Minute).Unix(),
-	}
-	// Fresh challenge (1 min ago — should NOT be swept).
-	pe.pendingChallenges["fresh1234567890123"] = challengePending{
-		ClientIP:   "10.0.0.2",
-		Service:    "httpbun.erfi.io",
-		Difficulty: 4,
-		IssuedAt:   time.Now().Add(-1 * time.Minute).Unix(),
-	}
-	pe.pendingMu.Unlock()
-
-	pe.sweepAbandonedChallenges()
-
-	pe.pendingMu.Lock()
-	if len(pe.pendingChallenges) != 1 {
-		t.Errorf("pending after sweep = %d, want 1", len(pe.pendingChallenges))
-	}
-	if _, ok := pe.pendingChallenges["fresh1234567890123"]; !ok {
-		t.Error("fresh challenge was incorrectly swept")
-	}
-	pe.pendingMu.Unlock()
-
-	data, err := os.ReadFile(tmpFile)
-	if err != nil {
-		t.Fatalf("read abandoned file: %v", err)
-	}
-	if !strings.Contains(string(data), "10.0.0.1") {
-		t.Error("abandoned file should contain expired client IP")
-	}
-	if strings.Contains(string(data), "10.0.0.2") {
-		t.Error("abandoned file should NOT contain fresh client IP")
-	}
-}
-
-func TestSweepAbandonedNilMap(t *testing.T) {
-	pe := &PolicyEngine{pendingChallenges: nil, logger: zap.NewNop()}
-	pe.sweepAbandonedChallenges() // should not panic
 }
 
 func TestSignalKeyDerivation_DifferentRandomData(t *testing.T) {
