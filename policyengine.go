@@ -1166,6 +1166,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				caddyhttp.SetVar(r.Context(), "policy_engine.action", "rate_limit_monitor")
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_id", cr.rule.ID)
 				caddyhttp.SetVar(r.Context(), "policy_engine.rule_name", cr.rule.Name)
+				captureRequestContext(r, pb)
 				continue
 			}
 
@@ -1177,6 +1178,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 					if len(cr.rule.Tags) > 0 {
 						caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 					}
+					captureRequestContext(r, pb)
 					pe.logger.Info("rate limited (detection_only — not blocking)",
 						zap.String("rule_id", cr.rule.ID),
 						zap.String("rule_name", cr.rule.Name),
@@ -1194,6 +1196,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 					if len(cr.rule.Tags) > 0 {
 						caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(cr.rule.Tags, ","))
 					}
+					captureRequestContext(r, pb)
 					rlHeaderName := cr.rule.Name
 					if pe.HideHeaders {
 						rlHeaderName = ""
@@ -1410,6 +1413,7 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		if outAction != nil {
 			switch outAction.action {
 			case "block", "rate_limit_block":
+				captureRequestContext(r, nil)
 				pe.logger.Warn("outbound rule blocked response",
 					zap.String("action", outAction.action),
 					zap.String("rule_id", outAction.rule.ID),
