@@ -1276,3 +1276,470 @@ func TestJTIDenylistNilAllowsAll(t *testing.T) {
 		t.Error("cookie should pass when denylist is nil")
 	}
 }
+
+// ─── P3: Fingerprint Expansion Scoring ──────────────────────────────
+
+func TestScoreBotSignals_P3_FontCanvasInconsistency(t *testing.T) {
+	// Canvas works but font fails — inconsistent headless environment.
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345,"fontHash":0,"canvasHash":123456,"connType":"4g"}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, "", r, zap.NewNop(), -1, 0)
+
+	// fontHash=0 with canvasHash!=0 → +10
+	// No other new signals trigger.
+	// Build the same request without fontHash=0 to compare.
+	signalsNormal := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345,"fontHash":999,"canvasHash":123456,"connType":"4g"}`
+	scoreNormal := scoreBotSignals(signalsNormal, "", r, zap.NewNop(), -1, 0)
+	if score-scoreNormal != 10 {
+		t.Errorf("font/canvas inconsistency: score=%d normal=%d diff=%d want 10", score, scoreNormal, score-scoreNormal)
+	}
+}
+
+func TestScoreBotSignals_P3_CanvasFailsWebGLWorks(t *testing.T) {
+	// Canvas fails but WebGL and font work — inconsistent.
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345,"fontHash":999,"canvasHash":0,"connType":"4g"}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, "", r, zap.NewNop(), -1, 0)
+
+	signalsNormal := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345,"fontHash":999,"canvasHash":123456,"connType":"4g"}`
+	scoreNormal := scoreBotSignals(signalsNormal, "", r, zap.NewNop(), -1, 0)
+	if score-scoreNormal != 20 {
+		t.Errorf("canvas/webgl inconsistency: score=%d normal=%d diff=%d want 20", score, scoreNormal, score-scoreNormal)
+	}
+}
+
+func TestScoreBotSignals_P3_ChromeNoConnType(t *testing.T) {
+	// Chrome UA but no NetworkInformation API (connType empty).
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"fontHash":999,"canvasHash":123456,"connType":""}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, "", r, zap.NewNop(), -1, 0)
+
+	signalsWithConn := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"fontHash":999,"canvasHash":123456,"connType":"4g"}`
+	scoreWithConn := scoreBotSignals(signalsWithConn, "", r, zap.NewNop(), -1, 0)
+	if score-scoreWithConn != 10 {
+		t.Errorf("chrome no connType: score=%d withConn=%d diff=%d want 10", score, scoreWithConn, score-scoreWithConn)
+	}
+}
+
+func TestScoreBotSignals_P3_OldClientNoNewFields(t *testing.T) {
+	// Old client that doesn't submit any P3 fields — no new scoring should trigger.
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE (Intel)","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384,"audioHash":-12345}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, "", r, zap.NewNop(), -1, 0)
+	// All new P3 fields are zero → none of the new scoring rules should fire
+	// because they require at least one new probe to have reported.
+	if score > 5 {
+		t.Errorf("old client with no P3 fields scored %d, want <= 5", score)
+	}
+}
+
+// ─── P5: Behavioral Expansion Scoring ───────────────────────────────
+
+func TestScoreBotSignals_P5_MonotonicVelocity(t *testing.T) {
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384}`
+	// All velocity in one bucket (slow only), 15+ events.
+	behavior := `{"me":20,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"mvs":20,"mvm":0,"mvf":0,"ment":-1,"rafv":-1,"ft":0,"has":0}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, behavior, r, zap.NewNop(), -1, 0)
+
+	// Same but with mixed velocities.
+	behaviorMixed := `{"me":20,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"mvs":8,"mvm":7,"mvf":5,"ment":-1,"rafv":-1,"ft":0,"has":0}`
+	scoreMixed := scoreBotSignals(signals, behaviorMixed, r, zap.NewNop(), -1, 0)
+
+	diff := score - scoreMixed
+	if diff != 15 {
+		t.Errorf("monotonic velocity penalty: score=%d mixed=%d diff=%d want 15", score, scoreMixed, diff)
+	}
+}
+
+func TestScoreBotSignals_P5_LowEntropy(t *testing.T) {
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384}`
+	// ment=0.5 (very low entropy, scripted movement).
+	behavior := `{"me":20,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"mvs":8,"mvm":7,"mvf":5,"ment":0.5,"rafv":-1,"ft":0,"has":0}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, behavior, r, zap.NewNop(), -1, 0)
+
+	// Same with high entropy (human-like).
+	behaviorHigh := `{"me":20,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"mvs":8,"mvm":7,"mvf":5,"ment":2.5,"rafv":-1,"ft":0,"has":0}`
+	scoreHigh := scoreBotSignals(signals, behaviorHigh, r, zap.NewNop(), -1, 0)
+
+	diff := score - scoreHigh
+	if diff != 20 {
+		t.Errorf("low entropy penalty: score=%d high=%d diff=%d want 20", score, scoreHigh, diff)
+	}
+}
+
+func TestScoreBotSignals_P5_HiddenAtStart(t *testing.T) {
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384}`
+	behaviorHidden := `{"me":15,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"has":1}`
+	behaviorVisible := `{"me":15,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"has":0}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	scoreH := scoreBotSignals(signals, behaviorHidden, r, zap.NewNop(), -1, 0)
+	scoreV := scoreBotSignals(signals, behaviorVisible, r, zap.NewNop(), -1, 0)
+	if scoreH-scoreV != 10 {
+		t.Errorf("hidden at start: hidden=%d visible=%d diff=%d want 10", scoreH, scoreV, scoreH-scoreV)
+	}
+}
+
+func TestScoreBotSignals_P5_FakeTouch(t *testing.T) {
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384}`
+	behaviorFake := `{"me":5,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"ft":1}`
+	behaviorNormal := `{"me":5,"ke":0,"fc":0,"se":0,"fi":500,"wtv":5,"dur":3000,"ft":0}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	scoreF := scoreBotSignals(signals, behaviorFake, r, zap.NewNop(), -1, 0)
+	scoreN := scoreBotSignals(signals, behaviorNormal, r, zap.NewNop(), -1, 0)
+	if scoreF-scoreN != 25 {
+		t.Errorf("fake touch: fake=%d normal=%d diff=%d want 25", scoreF, scoreN, scoreF-scoreN)
+	}
+}
+
+func TestScoreBotSignals_P5_OldBehaviorNoNewFields(t *testing.T) {
+	// Old client that doesn't submit any P5 fields — no new scoring.
+	signals := `{"wd":0,"cdc":0,"cr":1,"plg":5,"lang":3,"sv":22,"wglr":"ANGLE","cores":8,"mem":8,"touch":0,"plt":"Win32","sw":1920,"sh":1080,"pt":12.5,"wglMaxTex":16384}`
+	behavior := `{"me":15,"ke":0,"fc":1,"se":2,"fi":850,"wtv":8.3,"dur":3000}`
+	r := makeRequestWithHeaders("POST", "/verify", "1.2.3.4:5678", map[string]string{
+		"User-Agent":      "Mozilla/5.0 Chrome/120.0.0.0",
+		"Sec-Fetch-Site":  "same-origin",
+		"Sec-Fetch-Mode":  "navigate",
+		"Accept-Language": "en-US",
+		"Sec-CH-UA":       `"Chrome";v="120"`,
+	})
+	score := scoreBotSignals(signals, behavior, r, zap.NewNop(), -1, 0)
+	// With organic signal applied: mouse >= 5, fi < 2000 → -10.
+	// No new P5 signals should fire (all zero/default).
+	if score > 5 {
+		t.Errorf("old client with no P5 fields scored %d, want <= 5 (organic bonus applied)", score)
+	}
+}
+
+// ─── P4: Signal Encryption ──────────────────────────────────────────
+
+func TestXorDecrypt_Roundtrip(t *testing.T) {
+	key := "abcdef0123456789abcdef0123456789"
+	plaintext := `{"wd":0,"cdc":0,"cr":1,"plg":5}`
+
+	// Encrypt (same logic as challenge.js).
+	enc := make([]byte, len(plaintext))
+	for i := range plaintext {
+		enc[i] = plaintext[i] ^ key[i%len(key)]
+	}
+	encoded := base64.StdEncoding.EncodeToString(enc)
+
+	// Decrypt.
+	decrypted, err := xorDecrypt(encoded, key)
+	if err != nil {
+		t.Fatalf("xorDecrypt error: %v", err)
+	}
+	if decrypted != plaintext {
+		t.Errorf("roundtrip failed: got %q, want %q", decrypted, plaintext)
+	}
+}
+
+func TestXorDecrypt_InvalidBase64(t *testing.T) {
+	_, err := xorDecrypt("not-valid-base64!!!", "key")
+	if err == nil {
+		t.Error("expected error for invalid base64")
+	}
+}
+
+func TestXorDecrypt_EmptyKey(t *testing.T) {
+	_, err := xorDecrypt("aGVsbG8=", "")
+	if err == nil {
+		t.Error("expected error for empty key")
+	}
+}
+
+func TestSignalKeyDerivation_Deterministic(t *testing.T) {
+	// Verify that the same HMAC key + randomData always produces the same signal key.
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	randomData := "aabbccddeeff00112233445566778899"
+
+	derive := func() string {
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte("signal_key:" + randomData))
+		return hex.EncodeToString(mac.Sum(nil)[:16])
+	}
+
+	k1 := derive()
+	k2 := derive()
+	if k1 != k2 {
+		t.Errorf("signal key not deterministic: %q != %q", k1, k2)
+	}
+	if len(k1) != 32 {
+		t.Errorf("signal key length = %d, want 32 hex chars", len(k1))
+	}
+}
+
+// ─── P1: Signal Obfuscation ─────────────────────────────────────────
+
+func TestMutateJS_FieldNamesRandomized(t *testing.T) {
+	seed := sha256.Sum256([]byte("test-seed-1"))
+	mutated, fieldMap := mutateJS(challengeJS, seed[:])
+
+	// Verify that real field names are no longer present as signals.FIELD.
+	for _, name := range signalFieldNames {
+		if strings.Contains(mutated, "signals."+name+" ") || strings.Contains(mutated, "signals."+name+"=") {
+			t.Errorf("real field name %q still present in mutated JS", name)
+		}
+	}
+
+	// Verify field map has entries for all signal fields.
+	if len(fieldMap) != len(signalFieldNames) {
+		t.Errorf("fieldMap has %d entries, want %d", len(fieldMap), len(signalFieldNames))
+	}
+
+	// Verify field map values are the real names.
+	realNames := make(map[string]bool)
+	for _, v := range fieldMap {
+		realNames[v] = true
+	}
+	for _, name := range signalFieldNames {
+		if !realNames[name] {
+			t.Errorf("real field name %q not found in fieldMap values", name)
+		}
+	}
+}
+
+func TestMutateJS_UniqueOutputPerSeed(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		seed := sha256.Sum256([]byte(fmt.Sprintf("seed-%d", i)))
+		mutated, _ := mutateJS(challengeJS, seed[:])
+		if seen[mutated] {
+			t.Fatalf("duplicate JS output at iteration %d", i)
+		}
+		seen[mutated] = true
+	}
+}
+
+func TestMutateJS_DeadCodePresent(t *testing.T) {
+	seed := sha256.Sum256([]byte("test-seed-dead"))
+	mutated, _ := mutateJS(challengeJS, seed[:])
+
+	// Should contain "Additional environment probes" comment.
+	if !strings.Contains(mutated, "Additional environment probes") {
+		t.Error("dead code probes not inserted")
+	}
+}
+
+func TestMutateJS_StringObfuscation(t *testing.T) {
+	seed := sha256.Sum256([]byte("test-seed-obf"))
+	mutated, _ := mutateJS(challengeJS, seed[:])
+
+	// The regex /^cdc_|^__puppeteer/ should be replaced.
+	if strings.Contains(mutated, `/^cdc_|^__puppeteer/`) {
+		t.Error("regex pattern /^cdc_|^__puppeteer/ still present in mutated JS")
+	}
+	// Should contain the XOR decoding pattern.
+	if !strings.Contains(mutated, "String.fromCharCode(c^") {
+		t.Error("XOR char-code obfuscation pattern not found in mutated JS")
+	}
+}
+
+func TestMutateJS_FieldMapRoundtrip(t *testing.T) {
+	seed := sha256.Sum256([]byte("test-seed-roundtrip"))
+
+	// Generate field map.
+	_, fieldMap := mutateJS(challengeJS, seed[:])
+
+	// Build a signal JSON with randomized field names.
+	randomSignals := make(map[string]interface{})
+	for randomName, realName := range fieldMap {
+		switch realName {
+		case "wd":
+			randomSignals[randomName] = 0
+		case "wglr":
+			randomSignals[randomName] = "ANGLE (Intel)"
+		case "plt":
+			randomSignals[randomName] = "Win32"
+		default:
+			randomSignals[randomName] = 42
+		}
+	}
+	// Add a dead-code field that should be dropped.
+	randomSignals["dead_field_xyz"] = 999
+
+	jsonBytes, _ := json.Marshal(randomSignals)
+	remapped := remapSignalFields(string(jsonBytes), fieldMap)
+
+	// Parse the remapped JSON and verify real field names.
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(remapped), &result); err != nil {
+		t.Fatalf("failed to parse remapped JSON: %v", err)
+	}
+
+	// Should have real field names.
+	if _, ok := result["wd"]; !ok {
+		t.Error("remapped JSON missing 'wd' field")
+	}
+	if _, ok := result["wglr"]; !ok {
+		t.Error("remapped JSON missing 'wglr' field")
+	}
+
+	// Dead-code field should be dropped.
+	if _, ok := result["dead_field_xyz"]; ok {
+		t.Error("dead-code field should be dropped during remapping")
+	}
+}
+
+func TestMutateJS_DeterministicSameSeed(t *testing.T) {
+	seed := sha256.Sum256([]byte("deterministic-test"))
+
+	js1, map1 := mutateJS(challengeJS, seed[:])
+	js2, map2 := mutateJS(challengeJS, seed[:])
+
+	if js1 != js2 {
+		t.Error("same seed should produce same JS output")
+	}
+
+	// Field maps should be identical.
+	for k, v := range map1 {
+		if map2[k] != v {
+			t.Errorf("field map mismatch for %q: %q vs %q", k, v, map2[k])
+		}
+	}
+}
+
+// ─── P2: Application-State Verification ─────────────────────────────
+
+func TestSessionCollectorTag_NoAppChecks(t *testing.T) {
+	tag := sessionCollectorTag(nil)
+	tagStr := string(tag)
+	// Without app checks, the tag should NOT contain the var assignment.
+	if strings.Contains(tagStr, "var __pc_app_checks=") {
+		t.Error("no app checks should produce tag without var __pc_app_checks assignment")
+	}
+	if !strings.Contains(tagStr, "<script>") {
+		t.Error("tag should contain <script>")
+	}
+}
+
+func TestSessionCollectorTag_WithAppChecks(t *testing.T) {
+	checks := []AppCheck{
+		{Type: "window_prop", Path: "__nuxt"},
+		{Type: "dom_selector", Selector: "#app"},
+	}
+	tag := sessionCollectorTag(checks)
+	tagStr := string(tag)
+	if !strings.Contains(tagStr, "__pc_app_checks") {
+		t.Error("tag should contain __pc_app_checks variable")
+	}
+	if !strings.Contains(tagStr, `"window_prop"`) {
+		t.Error("tag should contain window_prop check type")
+	}
+	if !strings.Contains(tagStr, `"__nuxt"`) {
+		t.Error("tag should contain __nuxt path")
+	}
+	if !strings.Contains(tagStr, `"#app"`) {
+		t.Error("tag should contain #app selector")
+	}
+}
+
+func TestCompileChallengeRuleAppChecks(t *testing.T) {
+	rule := PolicyRule{
+		ID:   "c-app",
+		Name: "Challenge with app checks",
+		Type: "challenge",
+		Conditions: []PolicyCondition{
+			{Field: "path", Operator: "eq", Value: "/"},
+		},
+		GroupOp: "and",
+		Enabled: true,
+		Challenge: &ChallengeConfig{
+			Difficulty: 4,
+			Algorithm:  "fast",
+			TTLSeconds: 3600,
+			BindIP:     true,
+			AppChecks: []AppCheck{
+				{Type: "window_prop", Path: "__NEXT_DATA__"},
+				{Type: "dom_selector", Selector: "[data-reactroot]"},
+				{Type: "meta_content", Name: "csrf-token"},
+			},
+		},
+		Priority: 150,
+	}
+
+	cr, err := compileRule(rule)
+	if err != nil {
+		t.Fatalf("compileRule failed: %v", err)
+	}
+	if len(cr.challengeConfig.appChecks) != 3 {
+		t.Errorf("appChecks count = %d, want 3", len(cr.challengeConfig.appChecks))
+	}
+	if cr.challengeConfig.appChecks[0].Type != "window_prop" {
+		t.Errorf("first check type = %q, want window_prop", cr.challengeConfig.appChecks[0].Type)
+	}
+	if cr.challengeConfig.appChecks[0].Path != "__NEXT_DATA__" {
+		t.Errorf("first check path = %q, want __NEXT_DATA__", cr.challengeConfig.appChecks[0].Path)
+	}
+}
+
+func TestSignalKeyDerivation_DifferentRandomData(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+
+	derive := func(rd string) string {
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte("signal_key:" + rd))
+		return hex.EncodeToString(mac.Sum(nil)[:16])
+	}
+
+	k1 := derive("random1")
+	k2 := derive("random2")
+	if k1 == k2 {
+		t.Error("different random data should produce different signal keys")
+	}
+}

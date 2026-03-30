@@ -1461,9 +1461,23 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// valid challenge cookie is present. This inserts the page-level
 	// behavioral collector script before </body>.
 	if challengePassed {
+		// Look up app checks from the matching challenge rule for this service.
+		var appChecks []AppCheck
+		host := stripPort(r.Host)
+		cookieName := challengeCookieName(host)
+		pe.mu.RLock()
+		for _, cr := range pe.rules {
+			if cr.rule.Type == "challenge" && cr.challengeConfig != nil &&
+				cr.challengeConfig.cookieName == cookieName && len(cr.challengeConfig.appChecks) > 0 {
+				appChecks = cr.challengeConfig.appChecks
+				break
+			}
+		}
+		pe.mu.RUnlock()
+
 		w = &sessionCollectorWriter{
 			ResponseWriter: w,
-			inject:         sessionCollectorTag(),
+			inject:         sessionCollectorTag(appChecks),
 		}
 	}
 
@@ -3905,6 +3919,7 @@ func compileRule(rule PolicyRule) (compiledRule, error) {
 			bindIP:        rule.Challenge.BindIP,
 			bindJA4:       rule.Challenge.BindJA4,
 			cookieName:    challengeCookieName(svc),
+			appChecks:     rule.Challenge.AppChecks,
 		}
 	}
 

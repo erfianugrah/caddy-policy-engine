@@ -123,21 +123,136 @@
     signals.pt = Math.round((performance.now() - pt0) * 100) / 100;
   } catch {}
 
+  // 3f. Font measurement — render text in multiple fonts, hash bounding rects.
+  // Different OS/GPU/font configs produce different metrics. Headless Chrome
+  // with --no-sandbox has different font rasterization than desktop Chrome.
+  signals.fontHash = (() => {
+    try {
+      const el = document.createElement("span");
+      el.style.cssText = "position:absolute;visibility:hidden;font-size:72px";
+      el.textContent = "mmmmmmmmmmlli";
+      document.body.appendChild(el);
+      const fonts = ["monospace", "serif", "sans-serif", "Arial", "Courier New"];
+      let hash = 0;
+      for (const f of fonts) {
+        el.style.fontFamily = f;
+        const r = el.getBoundingClientRect();
+        hash = ((hash << 5) - hash + Math.round(r.width * 100) + Math.round(r.height * 100)) | 0;
+      }
+      document.body.removeChild(el);
+      return hash;
+    } catch { return 0; }
+  })();
+
+  // 3g. Canvas fingerprint — draw text + shapes, hash pixel data.
+  // GPU/driver-dependent rendering produces per-platform unique hashes.
+  signals.canvasHash = (() => {
+    try {
+      const c = document.createElement("canvas");
+      c.width = 200; c.height = 50;
+      const ctx = c.getContext("2d");
+      ctx.textBaseline = "top";
+      ctx.font = "14px Arial";
+      ctx.fillStyle = "#f60";
+      ctx.fillRect(125, 1, 62, 20);
+      ctx.fillStyle = "#069";
+      ctx.fillText("Cwm fjord veg", 2, 15);
+      ctx.fillStyle = "rgba(102,204,0,0.7)";
+      ctx.fillText("bank glyphs", 4, 35);
+      const data = ctx.getImageData(0, 0, 200, 50).data;
+      let hash = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        hash = ((hash << 5) - hash + data[i] + data[i+1] + data[i+2]) | 0;
+      }
+      return hash;
+    } catch { return 0; }
+  })();
+
+  // 3h. Storage quota — headless/incognito environments report 0 or restricted quota.
+  signals.storageQuota = await (async () => {
+    try {
+      const est = await navigator.storage.estimate();
+      return est.quota || 0;
+    } catch { return -1; }
+  })();
+
+  // 3i. Media queries — display capabilities hard to fake without real display.
+  signals.colorGamut = (() => {
+    try {
+      if (matchMedia("(color-gamut: p3)").matches) return "p3";
+      if (matchMedia("(color-gamut: srgb)").matches) return "srgb";
+    } catch {}
+    return "none";
+  })();
+  signals.prefersRM = (() => {
+    try { return matchMedia("(prefers-reduced-motion: reduce)").matches ? 1 : 0; }
+    catch { return -1; }
+  })();
+  signals.dynRange = (() => {
+    try { return matchMedia("(dynamic-range: high)").matches ? 1 : 0; }
+    catch { return -1; }
+  })();
+
+  // 3j. Network connection info — real Chrome always has NetworkInformation API.
+  signals.connType = (() => {
+    try { return navigator.connection ? navigator.connection.effectiveType || "" : ""; }
+    catch { return ""; }
+  })();
+
   // ── Layer 4: Behavioral Signals ─────────────────────────────────
   // Collected during PoW computation.
-  const behavior = { me: 0, ke: 0, fc: 0, se: 0, fi: -1 };
+  const behavior = { me: 0, ke: 0, fc: 0, se: 0, fi: -1, has: document.hidden ? 1 : 0 };
   const progressTimings = [];
   let lastProgressTs = Date.now();
 
-  const onMouse = () => { behavior.me++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
+  // 4a. Mouse velocity tracking — bots either don't move or move at constant velocity.
+  let lastMX = 0, lastMY = 0, lastMT = 0;
+  const velocities = [];
+  // 4b. Mouse direction tracking — for movement entropy calculation.
+  const directions = [];
+
+  const onMouse = (e) => {
+    behavior.me++;
+    if (behavior.fi < 0) behavior.fi = Date.now() - t0;
+    // Track velocity
+    const now = Date.now();
+    if (lastMT > 0) {
+      const dt = now - lastMT;
+      if (dt > 0 && dt < 500) {
+        const dx = e.clientX - lastMX;
+        const dy = e.clientY - lastMY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        velocities.push(dist / dt);
+        // Quantize direction to 8 compass points for entropy
+        const angle = Math.atan2(dy, dx);
+        directions.push(Math.round((angle + Math.PI) / (Math.PI / 4)) % 8);
+      }
+    }
+    lastMX = e.clientX; lastMY = e.clientY; lastMT = now;
+  };
   const onKey = () => { behavior.ke++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
   const onFocus = () => behavior.fc++;
   const onScroll = () => { behavior.se++; if (behavior.fi < 0) behavior.fi = Date.now() - t0; };
+
+  // 4e. Fake touch detection — touchstart on non-touch device.
+  let fakeTouch = 0;
+  const onTouch = () => { if (navigator.maxTouchPoints === 0) fakeTouch = 1; };
+
+  // 4d. requestAnimationFrame timing probe — headless browsers have
+  // suspiciously uniform rAF intervals due to no real display vsync.
+  const rafTimes = [];
+  let rafCount = 0;
+  function rafProbe(ts) {
+    rafTimes.push(ts);
+    if (++rafCount < 30) requestAnimationFrame(rafProbe);
+  }
+  requestAnimationFrame(rafProbe);
 
   document.addEventListener("mousemove", onMouse);
   document.addEventListener("keydown", onKey);
   document.addEventListener("visibilitychange", onFocus);
   document.addEventListener("scroll", onScroll);
+  document.addEventListener("touchstart", onTouch, { once: true });
 
   // ── Submit solution to verify endpoint ──────────────────────────
   const submitSolution = async (hash, nonce) => {
@@ -146,6 +261,7 @@
     document.removeEventListener("keydown", onKey);
     document.removeEventListener("visibilitychange", onFocus);
     document.removeEventListener("scroll", onScroll);
+    document.removeEventListener("touchstart", onTouch);
 
     if (statusEl) statusEl.textContent = "Verified! Redirecting...";
     if (progressEl) progressEl.style.width = "100%";
@@ -168,13 +284,69 @@
     form.set("original_url", original_url);
     form.set("elapsed_ms", String(Date.now() - t0));
 
-    // Signals (compact JSON to minimize form size)
-    form.set("signals", JSON.stringify(signals));
-    form.set("behavior", JSON.stringify({
+    // Compute mouse velocity histogram (3 buckets: slow/medium/fast).
+    let mvs = 0, mvm = 0, mvf = 0;
+    for (const v of velocities) {
+      if (v < 0.5) mvs++;
+      else if (v <= 2.0) mvm++;
+      else mvf++;
+    }
+
+    // Compute mouse movement entropy (Shannon entropy of 8 compass directions).
+    let ment = 0;
+    if (directions.length >= 10) {
+      const counts = new Array(8).fill(0);
+      for (const d of directions) counts[d]++;
+      const total = directions.length;
+      for (const c of counts) {
+        if (c > 0) {
+          const p = c / total;
+          ment -= p * Math.log2(p);
+        }
+      }
+      ment = Math.round(ment * 100) / 100;
+    } else {
+      ment = -1; // insufficient data
+    }
+
+    // Compute rAF timing variance — headless has suspiciously uniform intervals.
+    let rafv = -1;
+    if (rafTimes.length >= 10) {
+      const intervals = [];
+      for (let i = 1; i < rafTimes.length; i++) intervals.push(rafTimes[i] - rafTimes[i - 1]);
+      const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      const variance = intervals.reduce((a, b) => a + (b - mean) ** 2, 0) / intervals.length;
+      rafv = Math.round(Math.sqrt(variance) * 100) / 100;
+    }
+
+    // Signals — XOR-encrypted with per-request key to prevent casual inspection.
+    // Falls back to plaintext if signal_key is not present (shouldn't happen).
+    const sigJSON = JSON.stringify(signals);
+    const behJSON = JSON.stringify({
       ...behavior,
       wtv: wtv,
       dur: Date.now() - t0,
-    }));
+      mvs: mvs,
+      mvm: mvm,
+      mvf: mvf,
+      ment: ment,
+      rafv: rafv,
+      ft: fakeTouch,
+    });
+    if (config.signal_key) {
+      const xorEnc = (str, key) => {
+        const enc = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) {
+          enc[i] = str.charCodeAt(i) ^ key.charCodeAt(i % key.length);
+        }
+        return btoa(String.fromCharCode(...enc));
+      };
+      form.set("signals_enc", xorEnc(sigJSON, config.signal_key));
+      form.set("behavior_enc", xorEnc(behJSON, config.signal_key));
+    } else {
+      form.set("signals", sigJSON);
+      form.set("behavior", behJSON);
+    }
 
     // POST without redirect:"manual" — the verify endpoint returns 200 JSON
     // with {redirect: url}. This ensures the browser processes the Set-Cookie

@@ -41,13 +41,14 @@ var sessionCollectorJS string
 
 // ChallengeConfig is the per-rule challenge configuration in policy-rules.json.
 type ChallengeConfig struct {
-	Difficulty    int    `json:"difficulty"`               // Leading hex zeros in SHA-256 (1-16)
-	MinDifficulty int    `json:"min_difficulty,omitempty"` // Adaptive: minimum difficulty (1-16)
-	MaxDifficulty int    `json:"max_difficulty,omitempty"` // Adaptive: maximum difficulty (1-16)
-	Algorithm     string `json:"algorithm"`                // "fast" or "slow"
-	TTLSeconds    int    `json:"ttl_seconds"`              // Cookie lifetime in seconds
-	BindIP        bool   `json:"bind_ip"`                  // Bind cookie to client IP
-	BindJA4       bool   `json:"bind_ja4,omitempty"`       // Bind cookie to JA4 TLS fingerprint
+	Difficulty    int        `json:"difficulty"`               // Leading hex zeros in SHA-256 (1-16)
+	MinDifficulty int        `json:"min_difficulty,omitempty"` // Adaptive: minimum difficulty (1-16)
+	MaxDifficulty int        `json:"max_difficulty,omitempty"` // Adaptive: maximum difficulty (1-16)
+	Algorithm     string     `json:"algorithm"`                // "fast" or "slow"
+	TTLSeconds    int        `json:"ttl_seconds"`              // Cookie lifetime in seconds
+	BindIP        bool       `json:"bind_ip"`                  // Bind cookie to client IP
+	BindJA4       bool       `json:"bind_ja4,omitempty"`       // Bind cookie to JA4 TLS fingerprint
+	AppChecks     []AppCheck `json:"app_checks,omitempty"`     // Application-state verification checks
 }
 
 // ChallengeGlobalConfig holds global challenge settings in policy-rules.json.
@@ -65,6 +66,7 @@ type compiledChallengeConfig struct {
 	bindIP        bool
 	bindJA4       bool
 	cookieName    string
+	appChecks     []AppCheck // application-state verification checks
 }
 
 // challengePayload is the JSON payload embedded in the interstitial page
@@ -76,6 +78,7 @@ type challengePayload struct {
 	HMAC        string `json:"hmac"`
 	OriginalURL string `json:"original_url"`
 	Timestamp   string `json:"timestamp"`
+	SignalKey   string `json:"signal_key,omitempty"` // Hex-encoded per-request XOR key for signal encryption
 }
 
 // challengeCookiePayload is the signed cookie content.
@@ -88,6 +91,207 @@ type challengeCookiePayload struct {
 	Dif   int    `json:"dif"`           // Difficulty solved at
 	Score int    `json:"scr"`           // Bot score at time of issuance (0-100)
 	Ja4   string `json:"ja4,omitempty"` // JA4 TLS fingerprint (if bind_ja4)
+}
+
+// ─── Signal Obfuscation (P1) ────────────────────────────────────────
+
+// signalFieldNames are the real signal field names that must be randomized.
+var signalFieldNames = []string{
+	"wd", "cdc", "cr", "plg", "lang", "sv", "wglr", "wglMaxTex",
+	"audioHash", "cores", "mem", "touch", "plt", "sw", "sh", "pt",
+	"fontHash", "canvasHash", "storageQuota", "colorGamut", "prefersRM",
+	"dynRange", "connType",
+}
+
+// deadCodeProbes is a pool of fake signal assignments that contribute nothing
+// to scoring. 5-10 are randomly selected per request to force bot authors to
+// determine which signals matter through trial-and-error.
+var deadCodeProbes = []string{
+	`signals.{{NAME}} = navigator.buildID || "";`,
+	`signals.{{NAME}} = window.__selenium_unwrapped ? 1 : 0;`,
+	`signals.{{NAME}} = navigator.brave ? 1 : 0;`,
+	`signals.{{NAME}} = window.domAutomation ? 1 : 0;`,
+	`signals.{{NAME}} = document.hasFocus() ? 1 : 0;`,
+	`signals.{{NAME}} = window.cdc_adoQpoasnfa76pfcZLmcfl_Array ? 1 : 0;`,
+	`signals.{{NAME}} = window._phantom ? 1 : 0;`,
+	`signals.{{NAME}} = window.callPhantom ? 1 : 0;`,
+	`signals.{{NAME}} = window.__nightmare ? 1 : 0;`,
+	`signals.{{NAME}} = navigator.cpuClass || "";`,
+	`signals.{{NAME}} = navigator.oscpu || "";`,
+	`signals.{{NAME}} = navigator.doNotTrack || "";`,
+	`signals.{{NAME}} = navigator.vendorSub || "";`,
+	`signals.{{NAME}} = navigator.productSub || "";`,
+	`signals.{{NAME}} = window.chrome ? 1 : 0;`,
+	`signals.{{NAME}} = window.opera ? 1 : 0;`,
+	`signals.{{NAME}} = navigator.msMaxTouchPoints || 0;`,
+	`signals.{{NAME}} = screen.colorDepth || 0;`,
+	`signals.{{NAME}} = screen.pixelDepth || 0;`,
+	`signals.{{NAME}} = screen.orientation ? screen.orientation.angle : -1;`,
+	`signals.{{NAME}} = (() => { try { return window.indexedDB ? 1 : 0; } catch { return -1; } })();`,
+	`signals.{{NAME}} = navigator.cookieEnabled ? 1 : 0;`,
+	`signals.{{NAME}} = navigator.pdfViewerEnabled ? 1 : 0;`,
+	`signals.{{NAME}} = window.SharedArrayBuffer ? 1 : 0;`,
+	`signals.{{NAME}} = window.crossOriginIsolated ? 1 : 0;`,
+}
+
+// obfuscationPairs maps literal JS code patterns to their char-code obfuscated
+// replacements. The key is the exact string in the JS source, the value is a
+// function that generates the replacement given an XOR byte.
+type obfuscationPair struct {
+	pattern string // exact string to find in JS
+	builder func(xorByte byte) string
+}
+
+// buildCharCodeCheck builds a JS expression that reconstructs a string from
+// XOR'd char codes and tests it, replacing a regex pattern like /^cdc_|^__puppeteer/.
+func buildCharCodeCheck(patterns []string, xorByte byte) string {
+	// Build individual startsWith checks.
+	var checks []string
+	for _, p := range patterns {
+		codes := make([]string, len(p))
+		for i, ch := range p {
+			codes[i] = strconv.Itoa(int(byte(ch) ^ xorByte))
+		}
+		checks = append(checks, fmt.Sprintf(
+			`key.startsWith([%s].map(c=>String.fromCharCode(c^%d)).join(""))`,
+			strings.Join(codes, ","), xorByte,
+		))
+	}
+	return strings.Join(checks, " || ")
+}
+
+// mutateJS applies per-request obfuscation to the challenge JS:
+// - Randomizes signal field names (signals.wd → signals.x7f3)
+// - Inserts dead-code probes with random field names
+// - Obfuscates detection string literals with per-request XOR byte
+//
+// The fieldMap maps randomized names back to real names for server-side decoding.
+// The seed must be deterministic per-request so the server can reconstruct the
+// mapping at verify time: seed = HMAC(key, "obfuscation:" + randomData).
+func mutateJS(js string, seed []byte) (mutatedJS string, fieldMap map[string]string) {
+	// Use seed bytes as a simple PRNG (xorshift-like from seed hash).
+	// We need enough randomness for ~30 field names + shuffle + dead code.
+	seedHash := sha256.Sum256(seed)
+	pos := 0
+	nextByte := func() byte {
+		if pos >= len(seedHash) {
+			// Re-hash to get more bytes.
+			seedHash = sha256.Sum256(seedHash[:])
+			pos = 0
+		}
+		b := seedHash[pos]
+		pos++
+		return b
+	}
+	nextInt := func(n int) int {
+		if n <= 0 {
+			return 0
+		}
+		return int(nextByte()) % n
+	}
+
+	// Generate random 4-char alphanum field names.
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	randName := func() string {
+		buf := make([]byte, 4)
+		for i := range buf {
+			buf[i] = charset[nextByte()%byte(len(charset))]
+		}
+		return string(buf)
+	}
+
+	// Build field name mapping: real name → random name.
+	fieldMap = make(map[string]string)
+	reverseMap := make(map[string]string) // random → real (for dedup)
+	for _, name := range signalFieldNames {
+		for {
+			rn := randName()
+			if _, exists := reverseMap[rn]; !exists {
+				fieldMap[rn] = name // random → real (server needs this direction)
+				reverseMap[rn] = name
+				// Replace in JS: signals.FIELD → signals.RANDOM
+				js = strings.ReplaceAll(js, "signals."+name, "signals."+rn)
+				break
+			}
+		}
+	}
+
+	// Insert dead-code probes (5-10 random ones).
+	numDead := 5 + nextInt(6) // 5-10
+	deadInsert := "\n  // Additional environment probes\n"
+	usedDead := make(map[int]bool)
+	for i := 0; i < numDead && i < len(deadCodeProbes); i++ {
+		idx := nextInt(len(deadCodeProbes))
+		for usedDead[idx] {
+			idx = (idx + 1) % len(deadCodeProbes)
+		}
+		usedDead[idx] = true
+		name := randName()
+		probe := strings.Replace(deadCodeProbes[idx], "{{NAME}}", name, 1)
+		deadInsert += "  " + probe + "\n"
+	}
+
+	// Insert dead-code probes after "const signals = {};" line.
+	js = strings.Replace(js, "const signals = {};", "const signals = {};"+deadInsert, 1)
+
+	// Obfuscate detection strings with per-request XOR byte.
+	// Replace the regex /^cdc_|^__puppeteer/ with char-code startsWith checks.
+	xorByte := nextByte()
+	if xorByte == 0 {
+		xorByte = 42 // avoid no-op XOR
+	}
+	regexPattern := `/^cdc_|^__puppeteer/`
+	replacement := buildCharCodeCheck([]string{"cdc_", "__puppeteer"}, xorByte)
+	js = strings.Replace(js, regexPattern+`.test(key)`, "("+replacement+")", 1)
+
+	return js, fieldMap
+}
+
+// remapSignalFields takes a signal JSON string with randomized field names
+// and remaps them back to real names using the field map.
+func remapSignalFields(signalsJSON string, fieldMap map[string]string) string {
+	if len(fieldMap) == 0 {
+		return signalsJSON
+	}
+
+	// Parse into generic map, remap keys, re-serialize.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(signalsJSON), &raw); err != nil {
+		return signalsJSON // fail open — can't remap
+	}
+
+	remapped := make(map[string]json.RawMessage, len(raw))
+	for k, v := range raw {
+		if realName, ok := fieldMap[k]; ok {
+			remapped[realName] = v
+		}
+		// Drop unknown keys (dead-code probes) — they don't get remapped.
+	}
+
+	out, err := json.Marshal(remapped)
+	if err != nil {
+		return signalsJSON
+	}
+	return string(out)
+}
+
+// ─── Signal Encryption ──────────────────────────────────────────────
+
+// xorDecrypt decodes a base64 string and XOR's it with the given key string.
+// Returns the decrypted plaintext. Used for signal transport obfuscation.
+func xorDecrypt(encoded, key string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	if len(key) == 0 {
+		return "", fmt.Errorf("empty key")
+	}
+	result := make([]byte, len(data))
+	for i := range data {
+		result[i] = data[i] ^ key[i%len(key)]
+	}
+	return string(result), nil
 }
 
 // ─── Worker JS Serving ──────────────────────────────────────────────
@@ -253,6 +457,14 @@ type botSignals struct {
 	ScreenWidth    int     `json:"sw"`
 	ScreenHeight   int     `json:"sh"`
 	PermissionTime float64 `json:"pt"` // ms for permissions.query
+	// P3 fingerprint expansion signals.
+	FontHash     int    `json:"fontHash,omitempty"`     // Hash of font rendering bounding rects
+	CanvasHash   int    `json:"canvasHash,omitempty"`   // Hash of canvas 2D drawing output
+	StorageQuota int64  `json:"storageQuota,omitempty"` // navigator.storage.estimate().quota
+	ColorGamut   string `json:"colorGamut,omitempty"`   // "p3", "srgb", or "none"
+	PrefersRM    int    `json:"prefersRM,omitempty"`    // prefers-reduced-motion: reduce
+	DynRange     int    `json:"dynRange,omitempty"`     // dynamic-range: high
+	ConnType     string `json:"connType,omitempty"`     // navigator.connection.effectiveType
 }
 
 // botBehavior is the parsed behavioral data collected during PoW.
@@ -264,6 +476,14 @@ type botBehavior struct {
 	FirstInteraction int     `json:"fi"`  // ms from page load, -1 = none
 	WorkerVariance   float64 `json:"wtv"` // stddev of worker progress intervals
 	Duration         int     `json:"dur"` // total challenge duration ms
+	// P5 behavioral expansion signals.
+	MouseVelSlow  int     `json:"mvs,omitempty"`  // velocity < 0.5 px/ms count
+	MouseVelMed   int     `json:"mvm,omitempty"`  // velocity 0.5-2.0 px/ms count
+	MouseVelFast  int     `json:"mvf,omitempty"`  // velocity > 2.0 px/ms count
+	MouseEntropy  float64 `json:"ment,omitempty"` // Shannon entropy of movement directions (-1 = insufficient)
+	HiddenAtStart int     `json:"has,omitempty"`  // 1 = page was hidden when challenge loaded
+	RAFVariance   float64 `json:"rafv,omitempty"` // stddev of requestAnimationFrame intervals (-1 = insufficient)
+	FakeTouch     int     `json:"ft,omitempty"`   // 1 = touchstart fired on non-touch device
 }
 
 // preSignalScore computes a bot score from signals available before the
@@ -416,6 +636,29 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 	if sig.Memory >= 32 {
 		score += 15
 	}
+	// P3 fingerprint expansion scoring.
+	// These fields are omitempty — only score when the probe was actually
+	// submitted (indicated by a sentinel or non-default value). StorageQuota
+	// uses -1 as "not submitted" vs 0 as "headless/incognito".
+	//
+	// Font measurement: fontHash is always non-zero in a real browser (the
+	// hash of multiple font bounding rects). Zero means the probe failed
+	// or wasn't submitted. Only score if other probes indicate submission.
+	if sig.FontHash == 0 && sig.CanvasHash != 0 {
+		score += 10 // font probe failed but canvas worked — inconsistent
+	}
+	// Canvas API blocked/failed but WebGL works — inconsistent environment.
+	if sig.CanvasHash == 0 && sig.FontHash != 0 && sig.WebGLRenderer != "" {
+		score += 20
+	}
+	// Chrome UA but no NetworkInformation API — headless Chrome omits it.
+	// Only check if connType was explicitly submitted (empty string from the
+	// probe indicates absent API; the field itself being omitted means the
+	// probe wasn't run, e.g., old client).
+	isChromeLike := strings.Contains(ua, "Chrome/") || strings.Contains(ua, "Chromium/")
+	if isChromeLike && sig.ConnType == "" && (sig.FontHash != 0 || sig.CanvasHash != 0) {
+		score += 10
+	}
 
 	// ── Layer 4: Behavioral signals ───────────────────────────────
 	if beh.Duration > 2000 && beh.MouseEvents == 0 && beh.KeyEvents == 0 && beh.ScrollEvents == 0 {
@@ -435,6 +678,46 @@ func scoreBotSignals(signalsJSON, behaviorJSON string, r *http.Request, logger *
 		if score < 0 {
 			score = 0
 		}
+	}
+	// Mouse velocity all in one bucket — scripted movement has constant speed.
+	totalVel := beh.MouseVelSlow + beh.MouseVelMed + beh.MouseVelFast
+	if totalVel >= 10 {
+		nonzero := 0
+		if beh.MouseVelSlow > 0 {
+			nonzero++
+		}
+		if beh.MouseVelMed > 0 {
+			nonzero++
+		}
+		if beh.MouseVelFast > 0 {
+			nonzero++
+		}
+		if nonzero <= 1 {
+			score += 15 // all velocities in one bucket — robotic movement
+		}
+	}
+	// Low mouse movement entropy — scripted jiggling produces low-entropy patterns.
+	// Only score when sufficient data was collected (ment >= 0 means 10+ events).
+	// ment == -1 means insufficient data, ment == 0 is the Go zero value for
+	// old clients that don't submit this field — both are skipped.
+	if beh.MouseEntropy > 0 && beh.MouseEntropy < 1.0 {
+		score += 20
+	}
+	// Challenge page loaded in background tab — bot farm pattern.
+	if beh.HiddenAtStart == 1 {
+		score += 10
+	}
+	// requestAnimationFrame timing too uniform — no OS scheduling jitter.
+	// RAFVariance == -1 means insufficient data (not submitted or < 10 frames).
+	// RAFVariance == 0 is the Go zero value for old clients — skip.
+	// Only score when the probe ran and produced a meaningful (> 0) result
+	// that is suspiciously low.
+	if beh.RAFVariance > 0 && beh.RAFVariance < 0.1 && beh.Duration > 500 {
+		score += 15
+	}
+	// Touch event on non-touch device — spoofed touch input.
+	if beh.FakeTouch == 1 {
+		score += 25
 	}
 
 	// ── Layer 5 (full): Spatial inconsistency with JS signals ─────
@@ -709,9 +992,26 @@ func (w *sessionCollectorWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+// AppCheck defines a single application-state verification check.
+type AppCheck struct {
+	Type     string `json:"type"`               // "window_prop", "dom_selector", "meta_content"
+	Path     string `json:"path,omitempty"`     // dot-separated window property path
+	Selector string `json:"selector,omitempty"` // CSS selector
+	Name     string `json:"name,omitempty"`     // meta tag name attribute
+}
+
 // sessionCollectorTag builds the <script> tag for the session collector.
-func sessionCollectorTag() []byte {
-	return []byte("\n<script>" + sessionCollectorJS + "</script>\n")
+// If appChecks is non-empty, the checks config is embedded as an inline
+// JSON variable that the collector reads to verify application state.
+func sessionCollectorTag(appChecks []AppCheck) []byte {
+	if len(appChecks) == 0 {
+		return []byte("\n<script>" + sessionCollectorJS + "</script>\n")
+	}
+	checksJSON, _ := json.Marshal(appChecks)
+	return []byte(fmt.Sprintf(
+		"\n<script>var __pc_app_checks=%s;%s</script>\n",
+		string(checksJSON), sessionCollectorJS,
+	))
 }
 
 // ─── JTI Denylist ───────────────────────────────────────────────────
@@ -808,6 +1108,15 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 
 	originalURL := r.URL.String()
 
+	// Derive per-request XOR key for signal encryption from HMAC(key, randomData).
+	// The key is deterministic — the server can recompute it at verify time from
+	// the same HMAC key + randomData (which is HMAC-verified). No need to send
+	// the signal key back. This prevents casual inspection of signal data in
+	// browser devtools while the HMAC prevents tampering with randomData.
+	sigKeyMAC := hmac.New(sha256.New, pe.challengeHMACKey)
+	sigKeyMAC.Write([]byte("signal_key:" + randomData))
+	signalKey := hex.EncodeToString(sigKeyMAC.Sum(nil)[:16])
+
 	challengeData := challengePayload{
 		RandomData:  randomData,
 		Difficulty:  difficulty,
@@ -815,6 +1124,7 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 		HMAC:        payloadHMAC,
 		OriginalURL: originalURL,
 		Timestamp:   strconv.FormatInt(now.Unix(), 10),
+		SignalKey:   signalKey,
 	}
 
 	dataJSON, err := json.Marshal(challengeData)
@@ -822,10 +1132,18 @@ func (pe *PolicyEngine) serveChallengeInterstitial(w http.ResponseWriter, r *htt
 		return caddyhttp.Error(http.StatusInternalServerError, nil)
 	}
 
+	// Apply per-request JS obfuscation (P1) — randomize field names,
+	// insert dead-code probes, obfuscate detection strings.
+	// The obfuscation seed is deterministic: HMAC(key, "obfuscation:" + randomData).
+	// The server reconstructs the same field map at verify time.
+	obfSeedMAC := hmac.New(sha256.New, pe.challengeHMACKey)
+	obfSeedMAC.Write([]byte("obfuscation:" + randomData))
+	mutatedJS, _ := mutateJS(challengeJS, obfSeedMAC.Sum(nil))
+
 	// Build the page by replacing template placeholders.
 	page := challengeHTMLTemplate
 	page = strings.Replace(page, "{{CHALLENGE_DATA}}", string(dataJSON), 1)
-	page = strings.Replace(page, "{{CHALLENGE_JS}}", challengeJS, 1)
+	page = strings.Replace(page, "{{CHALLENGE_JS}}", mutatedJS, 1)
 
 	// Serve — return 200 to fool status-checking bots (same as Anubis).
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1019,11 +1337,43 @@ func (pe *PolicyEngine) handleChallengeVerify(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// ── Signal decryption + field name remapping ────────────────────
+	// Signals may be XOR-encrypted with a per-request key derived from
+	// HMAC(key, "signal_key:"+randomData). Try encrypted form first,
+	// fall back to plaintext for backward compatibility.
+	signalsJSON := r.FormValue("signals")
+	behaviorJSON := r.FormValue("behavior")
+	if encSignals := r.FormValue("signals_enc"); encSignals != "" {
+		sigKeyMAC := hmac.New(sha256.New, pe.challengeHMACKey)
+		sigKeyMAC.Write([]byte("signal_key:" + randomData))
+		sigKey := hex.EncodeToString(sigKeyMAC.Sum(nil)[:16])
+
+		if dec, err := xorDecrypt(encSignals, sigKey); err == nil {
+			signalsJSON = dec
+		}
+	}
+	if encBehavior := r.FormValue("behavior_enc"); encBehavior != "" {
+		sigKeyMAC := hmac.New(sha256.New, pe.challengeHMACKey)
+		sigKeyMAC.Write([]byte("signal_key:" + randomData))
+		sigKey := hex.EncodeToString(sigKeyMAC.Sum(nil)[:16])
+
+		if dec, err := xorDecrypt(encBehavior, sigKey); err == nil {
+			behaviorJSON = dec
+		}
+	}
+
+	// Reconstruct the obfuscation field map (P1) from the same deterministic
+	// seed used at serve time, then remap randomized field names back to real names.
+	obfSeedMAC := hmac.New(sha256.New, pe.challengeHMACKey)
+	obfSeedMAC.Write([]byte("obfuscation:" + randomData))
+	_, fieldMap := mutateJS(challengeJS, obfSeedMAC.Sum(nil))
+	signalsJSON = remapSignalFields(signalsJSON, fieldMap)
+
 	// ── Bot signal scoring ──────────────────────────────────────────
 	// Parse client-side environment probes and behavioral signals.
 	// Compute a weighted bot score (0-100). High score = likely bot.
 	// Timing params (elapsedMs, difficulty) feed into L6 soft penalty.
-	botScore := scoreBotSignals(r.FormValue("signals"), r.FormValue("behavior"), r, pe.logger, elapsedMs, difficulty)
+	botScore := scoreBotSignals(signalsJSON, behaviorJSON, r, pe.logger, elapsedMs, difficulty)
 
 	caddyhttp.SetVar(r.Context(), "policy_engine.challenge_bot_score", strconv.Itoa(botScore))
 
