@@ -1289,6 +1289,10 @@ func (pe *PolicyEngine) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			caddyhttp.SetVar(r.Context(), "policy_engine.tags", strings.Join(tags, ","))
 		}
 
+		// Capture request context for ALL detect events (including below-threshold).
+		// This ensures logged events have request headers in the event detail panel.
+		captureRequestContext(r, pb)
+
 		if scorer.inbound >= serviceThreshold && serviceThreshold > 0 {
 			if detectionOnly {
 				// Detection-only mode: score exceeded threshold but we don't block.
