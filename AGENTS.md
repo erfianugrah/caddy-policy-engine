@@ -52,7 +52,7 @@ All source lives in the repository root as a single flat Go package:
 | `transforms.go` | ~820 | CRS-compatible transform functions (21 transforms matching ModSecurity `t:xxx`) |
 | `responseheaders.go` | ~804 | CSP, security headers, CORS, ResponseWriter wrapper |
 | `ja4.go` | ~431 | JA4 TLS fingerprint computation: ClientHello parser, hash computation |
-| `ja4_listener.go` | ~152 | `caddy.ListenerWrapper` module for JA4 — intercepts connections pre-TLS |
+| `ja4_listener.go` | ~152 | `caddy.ListenerWrapper` module for JA4 — intercepts connections pre-TLS. The Accept() ClientHello peek MUST stay read-deadlined (2s) - an unbounded peek parks the serial accept loop and hangs all TLS on the listener (2026-08-08 edge outage). Gate: test/ja4-accept-deadline.sh |
 | `ja4_registry.go` | ~28 | Thread-safe JA4 fingerprint store (`sync.Map`) keyed by remote address |
 | `ahocorasick.go` | ~172 | Aho-Corasick multi-pattern substring matcher for `phrase_match` operator |
 | `policyengine_test.go` | ~8045 | Core engine tests |
