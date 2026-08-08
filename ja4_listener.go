@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -58,6 +59,9 @@ func (w *JA4ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // ─── ja4Listener ────────────────────────────────────────────────────
 
+// clientHelloPeekTimeout bounds the ClientHello peek in Accept.
+const clientHelloPeekTimeout = 2 * time.Second
+
 type ja4Listener struct {
 	net.Listener
 	logger *zap.Logger
@@ -69,8 +73,16 @@ func (l *ja4Listener) Accept() (net.Conn, error) {
 		return conn, err
 	}
 
-	// Read the raw ClientHello bytes from the TCP stream.
+	// Read the raw ClientHello bytes from the TCP stream. The peek carries
+	// its own read deadline because upstream wrappers (caddy-l4) clear the
+	// conn deadline after their route matches - without it a silent or
+	// drip-feeding client parks the serial accept loop. The deadline is
+	// cleared before the conn is passed on so slow-but-legitimate TLS
+	// handshakes are unaffected; a timeout takes the same fail-open path
+	// as any other read error (rewind bytes read, pass the conn through).
+	_ = conn.SetReadDeadline(time.Now().Add(clientHelloPeekTimeout))
 	raw, err := readClientHello(conn)
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		// Not TLS or malformed — rewind whatever was read and pass through.
 		if len(raw) > 0 {

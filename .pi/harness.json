@@ -1,0 +1,24 @@
+{
+  "task": "ja4_listener.go: ja4Listener.Accept() calls readClientHello(conn) synchronously in the accept path with no read deadline. Upstream caddy-l4 clears the conn read deadline after its route matches, so a client that opens TCP and sends nothing (or drip-feeds bytes) parks net/http's serial accept loop indefinitely - every TLS connection on the listener hangs behind it. This caused a full edge TLS outage on 2026-08-08 (353 goroutines piled in caddy-l4 pipeConnection, one stuck in readClientHello at ja4.go:61, total :443 outage until restart).\n\nFix: bound the ClientHello peek with an explicit read deadline that ja4Listener.Accept sets itself (never rely on deadline state leaking from other layers), cleared immediately after readClientHello returns and before the conn is passed on - a lingering deadline would kill slow-but-legitimate handshakes later. On timeout, behave exactly like the existing error path (fail open: pass the conn through, rewinding any bytes already read). 2 seconds is the intended budget.\n\nAdd a regression test (name it TestJA4Listener_SilentConnDeadline or similar): a connection that sends nothing must not block Accept beyond ~3s, and a connection sending a valid ClientHello must still be fingerprinted and passed through normally.\n\nConstraints: stdlib only, no new dependencies, gofmt clean, minimal diff, do not modify test/ja4-accept-deadline.sh (it is the independent gate), no git commits or other ref mutations.",
+  "maxIterations": 6,
+  "writeScope": ["ja4_listener.go", "ja4.go", "ja4_test.go"],
+  "guide": ["AGENTS.md"],
+  "rules": [
+    "Run Go with GOCACHE=/tmp/gocache - the default build cache dir is read-only in this environment.",
+    "Do not weaken, rename, or delete existing tests.",
+    "Do not modify test/ja4-accept-deadline.sh - it is the independent runtime gate.",
+    "Never run git commit, git reset, git stash, or any other ref mutation.",
+    "If you need a paragraph-long comment to justify a workaround, the code is wrong - fix the code."
+  ],
+  "sensors": [
+    { "name": "build", "cmd": "go build ./...", "canary": "printf '\\nfunc zzBroken( {' >> ja4.go" },
+    { "name": "vet", "cmd": "go vet ./..." },
+    { "name": "test", "cmd": "go test -race -count=1 ./...", "timeoutMs": 1200000 },
+    { "name": "feature-silent-conn-unit", "expect": "fail",
+      "cmd": "grep -q 'TestJA4Listener_SilentConn' ja4_test.go && go test -race -count=1 -run 'TestJA4Listener' ./...",
+      "hint": "add a regression test proving a connection that sends nothing cannot park Accept beyond the peek deadline, and that a valid ClientHello still fingerprints normally" },
+    { "name": "feature-runtime-wedge", "expect": "fail", "after": ["build", "vet", "test"],
+      "cmd": "bash test/ja4-accept-deadline.sh", "timeoutMs": 600000,
+      "hint": "runtime repro of the outage: a parked silent connection must not hang TLS handshakes. Only a self-imposed read deadline around readClientHello in ja4Listener.Accept fixes this - the caddy-l4 route clears its own deadline after matching, so the peek is unbounded today." }
+  ]
+}

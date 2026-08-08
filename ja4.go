@@ -57,9 +57,12 @@ type parsedClientHello struct {
 // The caller must rewind these bytes before passing the conn to the TLS handler.
 func readClientHello(conn net.Conn) ([]byte, error) {
 	// TLS record header: 1 byte content_type + 2 byte version + 2 byte length
+	// Error returns carry only the bytes actually read, so the caller's
+	// fail-open rewind never injects zero padding into a live stream.
 	hdr := make([]byte, 5)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return hdr, err
+	n, err := io.ReadFull(conn, hdr)
+	if err != nil {
+		return hdr[:n], err
 	}
 
 	// content_type must be 0x16 (Handshake)
@@ -73,8 +76,9 @@ func readClientHello(conn net.Conn) ([]byte, error) {
 	}
 
 	payload := make([]byte, length)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return append(hdr, payload...), err
+	m, err := io.ReadFull(conn, payload)
+	if err != nil {
+		return append(hdr, payload[:m]...), err
 	}
 
 	return append(hdr, payload...), nil

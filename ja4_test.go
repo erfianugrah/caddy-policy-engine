@@ -1,8 +1,14 @@
 package policyengine
 
 import (
+	"bytes"
+	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 )
 
 // ─── GREASE Filtering ───────────────────────────────────────────────
@@ -395,4 +401,121 @@ func appendExt(buf []byte, extType uint16, data []byte) []byte {
 	buf = append(buf, byte(len(data)>>8), byte(len(data)))
 	buf = append(buf, data...)
 	return buf
+}
+
+// ─── Listener Accept Deadline ───────────────────────────────────────
+
+// chanListener is a net.Listener fed from a channel, for testing ja4Listener.
+type chanListener struct {
+	conns chan net.Conn
+}
+
+func (l *chanListener) Accept() (net.Conn, error) { return <-l.conns, nil }
+func (l *chanListener) Close() error              { return nil }
+func (l *chanListener) Addr() net.Addr            { return testAddr("listener") }
+
+type testAddr string
+
+func (a testAddr) Network() string { return "pipe" }
+func (a testAddr) String() string  { return string(a) }
+
+// minimalClientHello returns a minimal valid TLS ClientHello record
+// (same layout as TestParseClientHello_Minimal).
+func minimalClientHello() []byte {
+	var b []byte
+	b = append(b, 0x16)       // handshake
+	b = append(b, 0x03, 0x01) // TLS 1.0 compat
+	recordLen := 4 + 2 + 32 + 1 + 2 + 4 + 1 + 1 + 2
+	b = append(b, byte(recordLen>>8), byte(recordLen))
+	b = append(b, 0x01) // ClientHello
+	bodyLen := recordLen - 4
+	b = append(b, 0, byte(bodyLen>>8), byte(bodyLen))
+	b = append(b, 0x03, 0x03) // TLS 1.2
+	b = append(b, make([]byte, 32)...)
+	b = append(b, 0)
+	b = append(b, 0, 4)
+	b = append(b, 0x13, 0x01)
+	b = append(b, 0x00, 0x2f)
+	b = append(b, 1, 0)
+	b = append(b, 0, 0)
+	return b
+}
+
+func TestJA4Listener_SilentConnDeadline(t *testing.T) {
+	logger := zap.NewNop()
+
+	// A connection that sends nothing must time out of the ClientHello peek
+	// (2s) and be passed through, never parking Accept.
+	t.Run("SilentConn", func(t *testing.T) {
+		ln := &chanListener{conns: make(chan net.Conn, 1)}
+		l := &ja4Listener{Listener: ln, logger: logger}
+
+		server, client := net.Pipe()
+		defer client.Close()
+		ln.conns <- server
+
+		start := time.Now()
+		conn, err := l.Accept()
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Accept returned error for silent conn: %v", err)
+		}
+		if conn == nil {
+			t.Fatal("Accept returned nil conn for silent conn")
+		}
+		defer conn.Close()
+		if elapsed > 3*time.Second {
+			t.Fatalf("Accept blocked %v on a silent conn, want < 3s", elapsed)
+		}
+
+		// Fail-open: bytes sent after the peek timeout must arrive intact
+		// (no phantom bytes injected by the rewind).
+		ch := minimalClientHello()
+		go func() { _, _ = client.Write(ch) }()
+		got := make([]byte, len(ch))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("reading post-timeout bytes: %v", err)
+		}
+		if !bytes.Equal(got, ch) {
+			t.Fatal("passed-through stream corrupted after peek timeout")
+		}
+	})
+
+	// A valid ClientHello must still be fingerprinted and rewound intact.
+	t.Run("ValidClientHello", func(t *testing.T) {
+		ln := &chanListener{conns: make(chan net.Conn, 1)}
+		l := &ja4Listener{Listener: ln, logger: logger}
+
+		server, client := net.Pipe()
+		defer client.Close()
+		ln.conns <- server
+
+		ch := minimalClientHello()
+		go func() { _, _ = client.Write(ch) }()
+
+		start := time.Now()
+		conn, err := l.Accept()
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Accept returned error: %v", err)
+		}
+		defer conn.Close()
+		if elapsed > 3*time.Second {
+			t.Fatalf("Accept blocked %v on a valid ClientHello, want < 3s", elapsed)
+		}
+
+		addr := server.RemoteAddr().String()
+		defer ja4Registry.Delete(addr)
+		if ja4 := ja4Registry.Get(addr); ja4 == "" {
+			t.Fatal("no JA4 fingerprint registered for valid ClientHello")
+		}
+
+		got := make([]byte, len(ch))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("reading rewound ClientHello: %v", err)
+		}
+		if !bytes.Equal(got, ch) {
+			t.Fatal("rewound ClientHello bytes differ from what was sent")
+		}
+	})
 }
